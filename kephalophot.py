@@ -393,7 +393,7 @@ def kephalophot(infile,outfile,plotfile,plottype,filter,function,cutoff,clobber,
         cols.append(Column(name='TIMECORR',format='E',unit='d',disp='E13.6',array=timecorr))
         cols.append(Column(name='CADENCENO',format='J',disp='I10',array=cadenceno))
         cols.append(Column(name='QUALITY',format='J',array=quality))
-    cols.append(Column(name='ORGFLUX',format='E',disp='E13.6',array=originalflux))
+        cols.append(Column(name='ORGFLUX',format='E',disp='E13.6',array=originalflux))
         cols.append(Column(name='FLUX',format='E',disp='E13.6',array=finalflux))
         # for i in range(ydim):
         #     for j in range(xdim):
@@ -613,7 +613,7 @@ def kephalophot(infile,outfile,plotfile,plottype,filter,function,cutoff,clobber,
     fmin = 1.0e33
     fmax = -1.033
     if status == 0:
-    pylab.figure(num=None,figsize=[12,12])
+        pylab.figure(num=None,figsize=[12,12])
         pylab.clf()
         dx = 0.93 #/ xdim
         dy = 0.94 #/ ydim
