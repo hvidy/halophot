@@ -7,10 +7,26 @@ import fitsio
 from time import time as clock
 from os.path import join, exists, abspath, basename
 
-
 from halophot.halo_tools import *
 
 from argparse import ArgumentParser
+
+
+import matplotlib as mpl
+
+mpl.style.use('seaborn-colorblind')
+
+#To make sure we have always the same matplotlib settings
+#(the ones in comments are the ipython notebook settings)
+
+mpl.rcParams['figure.figsize']=(8.0,6.0)    #(6.0,4.0)
+mpl.rcParams['font.size']=18               #10 
+mpl.rcParams['savefig.dpi']= 200             #72 
+mpl.rcParams['axes.labelsize'] = 16
+mpl.rcParams['axes.labelsize'] = 16
+mpl.rcParams['xtick.labelsize'] = 12
+mpl.rcParams['ytick.labelsize'] = 12
+
 
 '''-----------------------------------------------------------------
 halo
@@ -26,12 +42,12 @@ halo ktwo200007768-c04_lpd-targ.fits --data-dir /home/ben/Data/kepler/halo/ --na
 
 if __name__ == '__main__':
 	ap = ArgumentParser(description='halophot: K2 halo photometry with total variation.')
-	ap.add_argument('fname', metavar = 'F', type=str, help='Input target pixel file name.')
+	ap.add_argument('fname', type=str, help='Input target pixel file name.')
 	ap.add_argument('--data-dir', default=None, type=str)
 	ap.add_argument('--name', default='test',type=str,help='Target name')
 	ap.add_argument('-c', '--campaign', metavar='C', type=int, help='Campaign number')
 	ap.add_argument('-o', '--order', metavar='O', type=int,default=1, help='TV Order: \1 for gradient, 2 for concavity')
-	ap.add_argument('-sub', metavar='O', type=int,default=1, help='Subsampling parameter')
+	ap.add_argument('-sub',  type=int,default=1, help='Subsampling parameter')
 	ap.add_argument('--splits', default=None, type=lambda s:fromstring(s.strip('[]'), sep=','), help='List of time values for kernel splits')
 	ap.add_argument('--quiet', action='store_true', default=False, help='suppress messages')
 	ap.add_argument('--save-dir', default='.', help='The directory to save the output file in')
@@ -50,29 +66,44 @@ if __name__ == '__main__':
 		exit(errno.ENOENT)
 
 	### first load your data
-
-	tpf, ts = read_tpf(str(args.data_dir + args.fname))
+	fname = args.data_dir + args.fname
+	tpf, ts = read_tpf(fname)
+	print 'Data loaded!'
 
 	### get a slice corresponding to the splits you want
-
-	# tpf, ts = get_slice(tpf,ts,splits[0],splits[1])
+	tpf, ts = get_slice(tpf,ts,splits[0],splits[1])
+	print 'Taking cadences from', splits[0],'to',splits[1]
 
 	### now throw away saturated columns, nan pixels and nan cadences
 
 	pixels, ts = censor_tpf(tpf,ts,thresh=0.8)
+	print 'Censored TPF'
 
 	### subsample
 
-	pixels, ts = pixels[:,::args.sub], ts[::args.sub]
+	pixels_sub, ts_sub = pixels[::args.sub,:], ts[::args.sub]
+	print 'Subsampling by a factor of', args.sub
 
 	### now calculate the halo 
 
-	weights, opt_lc = tv_tpf(pixels,order=args.order)
+	print 'Calculating weights'
 
-	ts['CORR_FLUX'] = opt_lc
+	weights, opt_lc = tv_tpf(pixels_sub,order=args.order)
+
+	print 'Calculated weights!'
+
+	ts['corr_flux'] = opt_lc
 
 	### save your new light curve!
 
-	ts.write('%s/%shalo_lc.fits' % (args.save_dir,args.name))
+	ts.write('%s/%shalo_lc.fits' % (args.save_dir,args.name),overwrite=True)
+
+	if do_plot:
+		plt.clf()
+		plt.plot(ts['time'],opt_lc/np.nanmedian(opt_lc),'-')
+		plt.xlabel('Time')
+		plt.ylabel('Relative Flux')
+		plt.title(name)
+		plt.savefig('%s/%shalo_lc.png' % (args.save_dir,args.name))
 
 	print 'Saved halo-corrected light curve to %s/%shalo_lc.fits' % (args.save_dir,args.name)

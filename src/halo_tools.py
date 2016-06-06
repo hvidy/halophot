@@ -19,12 +19,12 @@ def read_tpf(fname):
 	tpf = target_fits[1]['FLUX'][:]
 
 	t, x, y = target_fits[1]['TIME'][:], target_fits[1]['POS_CORR1'][:], target_fits[1]['POS_CORR2'][:]
-	# quality = target_fits[1]['QUALITY'][:]
-	# print quality
+	quality = target_fits[1]['QUALITY'][:].astype('int32')
 
 	ts = Table({'time':t,
 				'x':x,
-				'y':y})
+				'y':y,
+				'quality':quality})
 
 	return tpf, ts
 
@@ -33,8 +33,6 @@ def censor_tpf(tpf,ts,thresh=0.8):
 
 	# first find bad pixels
 	maxflux = np.nanmax(tpf)
-	print tpf.shape
-	print tpf
 
 	for j in range(tpf.shape[1]):
 		for k in range(tpf.shape[2]):
@@ -43,22 +41,24 @@ def censor_tpf(tpf,ts,thresh=0.8):
 			elif np.nanmin(tpf[:,j,k]) < 100.:
 				tpf[:,j,k] = np.nan
 
-	# next find bad cadences
+	# find bad pixels
 
 	pixels = np.reshape(tpf.T,((tpf.shape[1]*tpf.shape[2]),tpf.shape[0]))
-	indic = np.zeros(pixels.shape[0])
-	for j in range(pixels.shape[0]):
-		indic[j] = np.sum(np.isfinite(pixels[j,:]))
-
+	indic = np.array([np.sum(np.isfinite(pixels[j,:])) 
+		for j in range(pixels.shape[0])])
 	pixels = pixels[indic>60,:]
-	ts = ts[indic>60,:]
+	
+	# next find bad cadences
 
-	indic_cad = np.zeros(pixels.shape[1])
-	for j in range(newpixels.shape[1]):
-		indic_cad[j] = np.sum(np.isfinite(pixels[:,j]))
+	m = (ts['quality'] == 0) # get bad quality 
+	pixels = pixels[:,m]
+	ts = ts[m]
 
-	pixels = pixels[:,indic_cad>200]
-	ts = ts[:,indic_cad>200]
+	# indic_cad = np.array([np.sum(np.isfinite(pixels[:,j])) 
+	# 	for j in range(pixels.shape[1])])
+
+	# pixels = pixels[:,indic_cad>200]
+	# ts = ts[indic_cad>200]
 
 	# this should get all the nans but if not just set them to 0
 	pixels[~np.isfinite(pixels)] = 0
@@ -67,7 +67,7 @@ def censor_tpf(tpf,ts,thresh=0.8):
 
 
 def get_slice(tpf,ts,start,stop):
-	return tpf[:,start:stop], ts[start:stop]
+	return tpf[start:stop,:,:], ts[start:stop]
 
 '''-----------------------------------------------------------------
 In this section we include the actual detrending code.
