@@ -1,0 +1,78 @@
+#!/usr/bin/env python
+import numpy as np
+import matplotlib.pyplot as plt
+from astropy.table import Table
+import scipy.optimize as optimize
+import fitsio
+from time import time as clock
+from os.path import join, exists, abspath, basename
+
+
+from halophot.halo_tools import *
+
+from argparse import ArgumentParser
+
+'''-----------------------------------------------------------------
+halo
+
+This executable Python script allows you to detrend any single halo
+photometry.
+
+An example call is 
+
+halo ktwo200007768-c04_lpd-targ.fits --data-dir /home/ben/Data/kepler/halo/ --name atlas -c 4 
+-----------------------------------------------------------------'''
+
+
+if __name__ == '__main__':
+	ap = ArgumentParser(description='halophot: K2 halo photometry with total variation.')
+	ap.add_argument('fname', metavar = 'F', type=str, help='Input target pixel file name.')
+	ap.add_argument('--data-dir', default=None, type=str)
+	ap.add_argument('--name', default='test',type=str,help='Target name')
+	ap.add_argument('-c', '--campaign', metavar='C', type=int, help='Campaign number')
+	ap.add_argument('-o', '--order', metavar='O', type=int,default=1, help='TV Order: \1 for gradient, 2 for concavity')
+	ap.add_argument('-sub', metavar='O', type=int,default=1, help='Subsampling parameter')
+	ap.add_argument('--splits', default=None, type=lambda s:fromstring(s.strip('[]'), sep=','), help='List of time values for kernel splits')
+	ap.add_argument('--quiet', action='store_true', default=False, help='suppress messages')
+	ap.add_argument('--save-dir', default='.', help='The directory to save the output file in')
+
+	args = ap.parse_args()
+
+	csplits = {4: [550,2200]}
+
+	if args.splits is None:
+		splits = csplits[args.campaign]
+	else:
+		splits = args.splits
+
+	if not exists(args.save_dir):
+		logger.error("Error: the save directory {:s} doesn't exists".format(args.save_dir), file=sys.stderr)
+		exit(errno.ENOENT)
+
+	### first load your data
+
+	tpf, ts = read_tpf(str(args.data_dir + args.fname))
+
+	### get a slice corresponding to the splits you want
+
+	# tpf, ts = get_slice(tpf,ts,splits[0],splits[1])
+
+	### now throw away saturated columns, nan pixels and nan cadences
+
+	pixels, ts = censor_tpf(tpf,ts,thresh=0.8)
+
+	### subsample
+
+	pixels, ts = pixels[:,::args.sub], ts[::args.sub]
+
+	### now calculate the halo 
+
+	weights, opt_lc = tv_tpf(pixels,order=args.order)
+
+	ts['CORR_FLUX'] = opt_lc
+
+	### save your new light curve!
+
+	ts.write('%s/%shalo_lc.fits' % (args.save_dir,args.name))
+
+	print 'Saved halo-corrected light curve to %s/%shalo_lc.fits' % (args.save_dir,args.name)
