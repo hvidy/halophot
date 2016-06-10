@@ -39,18 +39,26 @@ An example call is
 halo ktwo200007768-c04_lpd-targ.fits --data-dir /home/ben/Data/kepler/halo/ --name atlas -c 4 
 -----------------------------------------------------------------'''
 
-
 if __name__ == '__main__':
 	ap = ArgumentParser(description='halophot: K2 halo photometry with total variation.')
 	ap.add_argument('fname', type=str, help='Input target pixel file name.')
 	ap.add_argument('--data-dir', default=None, type=str)
 	ap.add_argument('--name', default='test',type=str,help='Target name')
-	ap.add_argument('-c', '--campaign', metavar='C', type=int, help='Campaign number')
-	ap.add_argument('-o', '--order', metavar='O', type=int,default=1, help='TV Order: \1 for gradient, 2 for concavity')
+	ap.add_argument('-c', '--campaign', metavar='C',default=4, type=int, 
+		help='Campaign number')
+	ap.add_argument('-o', '--order', metavar='O', type=int,default=1, 
+		help='TV Order: \1 for gradient, 2 for concavity')
 	ap.add_argument('-sub',  type=int,default=1, help='Subsampling parameter')
-	ap.add_argument('--splits', default=None, type=lambda s:fromstring(s.strip('[]'), sep=','), help='List of time values for kernel splits')
-	ap.add_argument('--quiet', action='store_true', default=False, help='suppress messages')
-	ap.add_argument('--save-dir', default='.', help='The directory to save the output file in')
+	ap.add_argument('--splits', default=None, type=lambda s:fromstring(s.strip('[]'), 
+		sep=','), help='List of time values for kernel splits')
+	ap.add_argument('--quiet', action='store_true', default=False, 
+		help='suppress messages')
+	ap.add_argument('--save-dir', default='.', 
+		help='The directory to save the output file in')
+	ap.add_argument('--do-plot', action = 'store_true', default = False, \
+					help = 'produce plots')
+	ap.add_argument('--do-split', action = 'store_true', default = False, \
+					help = 'produce plots')
 
 	args = ap.parse_args()
 
@@ -70,40 +78,44 @@ if __name__ == '__main__':
 	tpf, ts = read_tpf(fname)
 	print 'Data loaded!'
 
-	### get a slice corresponding to the splits you want
-	tpf, ts = get_slice(tpf,ts,splits[0],splits[1])
-	print 'Taking cadences from', splits[0],'to',splits[1]
+	if args.do_split:
+		'Splitting at',splits
+		# do first segment
+		tpf1, ts1, w1, wm1 = do_lc(tpf, ts, (None,splits[0]), args.sub, args.order)
 
-	### now throw away saturated columns, nan pixels and nan cadences
+		# do others
+		tpf2, ts2, w2, wm2 = do_lc(tpf, ts, (splits[0],splits[1]), args.sub, args.order)
+		tpf3, ts3, w3, weightmap = do_lc(tpf, ts, (splits[1],None), args.sub, args.order)
 
-	pixels, ts = censor_tpf(tpf,ts,thresh=0.8)
-	print 'Censored TPF'
+		## now stitch these
 
-	### subsample
-
-	pixels_sub, ts_sub = pixels[::args.sub,:], ts[::args.sub]
-	print 'Subsampling by a factor of', args.sub
-
-	### now calculate the halo 
-
-	print 'Calculating weights'
-
-	weights, opt_lc = tv_tpf(pixels_sub,order=args.order)
-
-	print 'Calculated weights!'
-
-	ts['corr_flux'] = opt_lc
+		newts = stitch([ts1,ts2,ts3])
+	else:
+		print 'Not splitting'
+		tpf, newts, weights, weightmap = do_lc(tpf,ts,(None,None),args.sub, args.order)
 
 	### save your new light curve!
 
-	ts.write('%s/%shalo_lc.fits' % (args.save_dir,args.name),overwrite=True)
+	newts.write('%s/%shalo_lc.fits' % (args.save_dir,args.name),overwrite=True)
 
-	if do_plot:
+	if args.do_plot:
+		time, opt_lc = newts['time'][:], newts['corr_flux'][:]
+
+		plt.figure(1)
 		plt.clf()
-		plt.plot(ts['time'],opt_lc/np.nanmedian(opt_lc),'-')
+		plt.plot(newts['time'],opt_lc/np.nanmedian(opt_lc),'-')
 		plt.xlabel('Time')
 		plt.ylabel('Relative Flux')
-		plt.title(name)
+		plt.title(args.name)
+		plt.show()
 		plt.savefig('%s/%shalo_lc.png' % (args.save_dir,args.name))
 
-	print 'Saved halo-corrected light curve to %s/%shalo_lc.fits' % (args.save_dir,args.name)
+		if args.sub == 1:
+			plt.figure(2)
+			plt.clf()
+			norm = np.size(weightmap)
+			plt.imshow(np.log10(weightmap.T*norm),cmap='seismic',
+				interpolation='None')
+			plt.colorbar()
+
+	print 'Saved halo-corrected light curve to %s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order)
