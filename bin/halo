@@ -49,6 +49,7 @@ if __name__ == '__main__':
 	ap.add_argument('-o', '--order', metavar='O', type=int,default=1, 
 		help='TV Order: \1 for gradient, 2 for concavity')
 	ap.add_argument('-sub',  type=int,default=1, help='Subsampling parameter')
+	ap.add_argument('-maxiter',  type=int,default=151, help='Maximum # iterations')
 	ap.add_argument('--splits', default=None, type=lambda s:fromstring(s.strip('[]'), 
 		sep=','), help='List of time values for kernel splits')
 	ap.add_argument('--quiet', action='store_true', default=False, 
@@ -81,26 +82,37 @@ if __name__ == '__main__':
 	if args.do_split:
 		'Splitting at',splits
 		# do first segment
-		tpf1, ts1, w1, wm1 = do_lc(tpf, ts, (None,splits[0]), args.sub, args.order)
+		tpf1, ts1, w1, wm1 = do_lc(tpf, ts, (None,splits[0]), args.sub, args.order,
+			maxiter=args.maxiter)
 
 		# do others
-		tpf2, ts2, w2, wm2 = do_lc(tpf, ts, (splits[0],splits[1]), args.sub, args.order)
-		tpf3, ts3, w3, weightmap = do_lc(tpf, ts, (splits[1],None), args.sub, args.order)
+		tpf2, ts2, w2, wm2 = do_lc(tpf, ts, (splits[0],splits[1]), args.sub, args.order,
+			maxiter=args.maxiter)
+		tpf3, ts3, w3, weightmap = do_lc(tpf, ts, (splits[1],None), args.sub, args.order,
+			maxiter=args.maxiter)
 
 		## now stitch these
 
 		newts = stitch([ts1,ts2,ts3])
 	else:
 		print 'Not splitting'
-		tpf, newts, weights, weightmap = do_lc(tpf,ts,(None,None),args.sub, args.order)
+		tpf, newts, weights, weightmap = do_lc(tpf,ts,(None,None),args.sub, args.order,
+			maxiter=args.maxiter)
+
+	time, opt_lc = newts['time'][:], newts['corr_flux'][:]
+
+	tv1 = diff_1(opt_lc/np.nanmedian(opt_lc))
+	tv2 = diff_2(opt_lc/np.nanmedian(opt_lc))
+
+	print 'Total variation (first order)',tv1
+
+	print 'Total variation (second order)',tv2
 
 	### save your new light curve!
 
 	newts.write('%s/%shalo_lc.fits' % (args.save_dir,args.name),overwrite=True)
 
 	if args.do_plot:
-		time, opt_lc = newts['time'][:], newts['corr_flux'][:]
-
 		plt.figure(1)
 		plt.clf()
 		plt.plot(newts['time'],opt_lc/np.nanmedian(opt_lc),'-')

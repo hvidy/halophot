@@ -90,7 +90,7 @@ def diff_1(z):
 def diff_2(z):
 	return np.sum(np.abs(2*z-np.roll(z,1)-np.roll(z,2)))
 
-def tv_tpf(pixelvector,order=1,w_init=None):
+def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101):
 	'''Use first order for total variation on gradient, second order
 	for total second derivative'''
 
@@ -113,14 +113,14 @@ def tv_tpf(pixelvector,order=1,w_init=None):
 			return diff_2(flux)
 
 	res = optimize.minimize(obj, w_init, method='SLSQP', constraints=cons, 
-		bounds = bounds, options={'disp': True})
+		bounds = bounds, options={'disp': True,'maxiter':maxiter})
 	
 	w_best = res['x']
-	print obj(w_best)
+	print 'Objective:', obj(w_best)
 	lc_opt = np.dot(w_best.T,pixelvector)
 	return w_best, lc_opt
 
-def do_lc(tpf,ts,splits,sub,order):
+def do_lc(tpf,ts,splits,sub,order,maxiter=101):
 	### get a slice corresponding to the splits you want
 	if splits[0] is None and splits[1] is not None:
 		print 'Taking cadences from beginning to',splits[1]
@@ -148,7 +148,7 @@ def do_lc(tpf,ts,splits,sub,order):
 
 	print 'Calculating weights'
 
-	weights, opt_lc = tv_tpf(pixels_sub,order=order)
+	weights, opt_lc = tv_tpf(pixels_sub,order=order,maxiter=maxiter)
 	print 'Calculated weights!'
 
 	ts['corr_flux'] = opt_lc
