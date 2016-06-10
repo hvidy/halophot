@@ -85,10 +85,10 @@ In this section we include the actual detrending code.
 -----------------------------------------------------------------'''
 
 def diff_1(z):
-	return np.sum(np.abs(z-np.roll(z,1)))
+	return np.sum(np.abs(z[1:-1]-np.roll(z,1)[1:-1]))
 
 def diff_2(z):
-	return np.sum(np.abs(2*z-np.roll(z,1)-np.roll(z,2)))
+	return np.sum(np.abs(2*z[1:-1]-np.roll(z,1)[1:-1]-np.roll(z,2)[1:-1]))
 
 def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101):
 	'''Use first order for total variation on gradient, second order
@@ -116,7 +116,6 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101):
 		bounds = bounds, options={'disp': True,'maxiter':maxiter})
 	
 	w_best = res['x']
-	print 'Objective:', obj(w_best)
 	lc_opt = np.dot(w_best.T,pixelvector)
 	return w_best, lc_opt
 
