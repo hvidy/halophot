@@ -36,7 +36,7 @@ photometry.
 
 An example call is 
 
-halo ktwo200007768-c04_lpd-targ.fits --data-dir /home/ben/Data/kepler/halo/ --name atlas -c 4 
+halo ktwo200007768-c04_lpd-targ.fits --data-dir /home/ben/Data/kepler/halo/ --name atlas -c 4 --do-plot -sub 8
 -----------------------------------------------------------------'''
 
 if __name__ == '__main__':
@@ -110,7 +110,7 @@ if __name__ == '__main__':
 
 	### save your new light curve!
 
-	newts.write('%s/%shalo_lc.fits' % (args.save_dir,args.name),overwrite=True)
+	newts.write('%s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order),overwrite=True)
 
 	if args.do_plot:
 		plt.figure(1)
@@ -119,8 +119,8 @@ if __name__ == '__main__':
 		plt.xlabel('Time')
 		plt.ylabel('Relative Flux')
 		plt.title(args.name)
-		plt.savefig('%s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order))
-		print 'Saved halo-corrected light curve to %s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order)
+		plt.savefig('%s/%shalo_lc_o%s.png' % (args.save_dir,args.name,args.order))
+		print 'Saved halo-corrected light curve to %s/%shalo_lc_o%s.png' % (args.save_dir,args.name,args.order)
 
 		if args.sub == 1:
 			plt.figure(2)
@@ -129,5 +129,5 @@ if __name__ == '__main__':
 			plt.imshow(np.log10(weightmap.T*norm),cmap='seismic',
 				interpolation='None')
 			plt.colorbar()
-			plt.savefig('%s/%s_weightmap_o%s.fits' % (args.save_dir,args.name,args.order))
-			print 'Weight map saved to %s/%s_weightmap_o%s.fits' % (args.save_dir,args.name,args.order)
+			plt.savefig('%s/%s_weightmap_o%s.png' % (args.save_dir,args.name,args.order))
+			print 'Weight map saved to %s/%s_weightmap_o%s.png' % (args.save_dir,args.name,args.order)
