@@ -20,9 +20,11 @@ def read_tpf(fname):
 	tpf = target_fits[1]['FLUX'][:]
 
 	t, x, y = target_fits[1]['TIME'][:], target_fits[1]['POS_CORR1'][:], target_fits[1]['POS_CORR2'][:]
+	cad = target_fits[1]['CADENCENO'][:]
 	quality = target_fits[1]['QUALITY'][:].astype('int32')
 
 	ts = Table({'time':t,
+				'cadence':cad,
 				'x':x,
 				'y':y,
 				'quality':quality})
