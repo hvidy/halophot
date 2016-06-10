@@ -111,7 +111,8 @@ if __name__ == '__main__':
 	### save your new light curve!
 
 	newts.write('%s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order),overwrite=True)
-
+	print 'Saved halo-corrected light curve to %s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order)
+	
 	if args.do_plot:
 		plt.figure(1)
 		plt.clf()
@@ -120,7 +121,8 @@ if __name__ == '__main__':
 		plt.ylabel('Relative Flux')
 		plt.title(args.name)
 		plt.savefig('%s/%shalo_lc_o%s.png' % (args.save_dir,args.name,args.order))
-		print 'Saved halo-corrected light curve to %s/%shalo_lc_o%s.png' % (args.save_dir,args.name,args.order)
+		plt.show()
+		print 'Saved halo-corrected light curve plot to %s/%shalo_lc_o%s.png' % (args.save_dir,args.name,args.order)
 
 		if args.sub == 1:
 			plt.figure(2)
@@ -130,4 +132,5 @@ if __name__ == '__main__':
 				interpolation='None')
 			plt.colorbar()
 			plt.savefig('%s/%s_weightmap_o%s.png' % (args.save_dir,args.name,args.order))
+			plt.show()
 			print 'Weight map saved to %s/%s_weightmap_o%s.png' % (args.save_dir,args.name,args.order)
