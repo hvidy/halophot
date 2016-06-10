@@ -11,7 +11,6 @@ from halophot.halo_tools import *
 
 from argparse import ArgumentParser
 
-
 import matplotlib as mpl
 
 mpl.style.use('seaborn-colorblind')
@@ -80,16 +79,21 @@ if __name__ == '__main__':
 	print 'Data loaded!'
 
 	if args.do_split:
+		print 'First doing one run to establish weights'
+
+		tpf, newts, weights, weightmap = do_lc(tpf,ts,(None,None),args.sub, args.order,
+			maxiter=args.maxiter)
+
 		'Splitting at',splits
 		# do first segment
 		tpf1, ts1, w1, wm1 = do_lc(tpf, ts, (None,splits[0]), args.sub, args.order,
-			maxiter=args.maxiter)
+			maxiter=args.maxiter,w_init=weights)
 
 		# do others
 		tpf2, ts2, w2, wm2 = do_lc(tpf, ts, (splits[0],splits[1]), args.sub, args.order,
-			maxiter=args.maxiter)
+			maxiter=args.maxiter,w_init=weights)
 		tpf3, ts3, w3, weightmap = do_lc(tpf, ts, (splits[1],None), args.sub, args.order,
-			maxiter=args.maxiter)
+			maxiter=args.maxiter,w_init=weights)
 
 		## now stitch these
 
@@ -101,18 +105,18 @@ if __name__ == '__main__':
 
 	time, opt_lc = newts['time'][:], newts['corr_flux'][:]
 
-	tv1 = diff_1(opt_lc/np.nanmedian(opt_lc))
-	tv2 = diff_2(opt_lc/np.nanmedian(opt_lc))
+	tv1 = diff_1(opt_lc/np.nanmedian(opt_lc))/float(np.size(opt_lc))
+	tv2 = diff_2(opt_lc/np.nanmedian(opt_lc))/float(np.size(opt_lc))
 
-	print 'Total variation (first order)',tv1
+	print 'Total variation per point (first order)',tv1
 
-	print 'Total variation (second order)',tv2
+	print 'Total variation per point (second order)',tv2
 
 	### save your new light curve!
 
 	newts.write('%s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order),overwrite=True)
 	print 'Saved halo-corrected light curve to %s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order)
-	
+
 	if args.do_plot:
 		plt.figure(1)
 		plt.clf()
@@ -124,13 +128,15 @@ if __name__ == '__main__':
 		plt.show()
 		print 'Saved halo-corrected light curve plot to %s/%shalo_lc_o%s.png' % (args.save_dir,args.name,args.order)
 
-		if args.sub == 1:
-			plt.figure(2)
-			plt.clf()
-			norm = np.size(weightmap)
-			plt.imshow(np.log10(weightmap.T*norm),cmap='seismic',
-				interpolation='None')
-			plt.colorbar()
-			plt.savefig('%s/%s_weightmap_o%s.png' % (args.save_dir,args.name,args.order))
-			plt.show()
-			print 'Weight map saved to %s/%s_weightmap_o%s.png' % (args.save_dir,args.name,args.order)
+		plt.figure(2)
+		plt.clf()
+		norm = np.size(weightmap)
+		weightmap = np.ma.array(weightmap,mask=np.isnan(weightmap))
+		cmap = mpl.cm.seismic
+		cmap.set_bad('k',1.)
+		plt.imshow(np.log10(weightmap.T*norm),cmap=cmap,
+			interpolation='None')
+		plt.colorbar()
+		plt.savefig('%s/%s_weightmap_o%s.png' % (args.save_dir,args.name,args.order))
+		plt.show()
+		print 'Weight map saved to %s/%s_weightmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub)

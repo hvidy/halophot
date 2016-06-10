@@ -121,7 +121,7 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101):
 	lc_opt = np.dot(w_best.T,pixelvector)
 	return w_best, lc_opt
 
-def do_lc(tpf,ts,splits,sub,order,maxiter=101):
+def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None):
 	### get a slice corresponding to the splits you want
 	if splits[0] is None and splits[1] is not None:
 		print 'Taking cadences from beginning to',splits[1]
@@ -159,6 +159,7 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101):
 		return tpf, ts, weights, pixelmap
 
 	else:
+		pixelmap.ravel()[mapping[0][::sub]] = weights
 		return tpf, ts, weights, pixelmap
 
 '''-----------------------------------------------------------------
