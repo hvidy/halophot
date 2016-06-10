@@ -103,17 +103,20 @@ def tv_tpf(pixelvector,order=1,w_init=None):
 	if order==1:
 		def obj(weights):
 			flux = np.dot(weights.T,pixelvector)
-			return diff_1(flux)/np.nanmedian(flux)
+			flux /= np.nanmedian(flux)
+			return diff_1(flux)
 
 	elif order==2:
 		def obj(weights):
 			flux = np.dot(weights.T,pixelvector)
-			return diff_1(flux)/np.nanmedian(flux)
+			flux/= np.nanmedian(flux)
+			return diff_2(flux)
 
 	res = optimize.minimize(obj, w_init, method='SLSQP', constraints=cons, 
 		bounds = bounds, options={'disp': True})
 	
 	w_best = res['x']
+	print obj(w_best)
 	lc_opt = np.dot(w_best.T,pixelvector)
 	return w_best, lc_opt
 
