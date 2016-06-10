@@ -119,8 +119,8 @@ if __name__ == '__main__':
 		plt.xlabel('Time')
 		plt.ylabel('Relative Flux')
 		plt.title(args.name)
-		plt.show()
-		plt.savefig('%s/%shalo_lc.png' % (args.save_dir,args.name))
+		plt.savefig('%s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order))
+		print 'Saved halo-corrected light curve to %s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order)
 
 		if args.sub == 1:
 			plt.figure(2)
@@ -129,5 +129,5 @@ if __name__ == '__main__':
 			plt.imshow(np.log10(weightmap.T*norm),cmap='seismic',
 				interpolation='None')
 			plt.colorbar()
-
-	print 'Saved halo-corrected light curve to %s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order)
+			plt.savefig('%s/%s_weightmap_o%s.fits' % (args.save_dir,args.name,args.order))
+			print 'Weight map saved to %s/%s_weightmap_o%s.fits' % (args.save_dir,args.name,args.order)
