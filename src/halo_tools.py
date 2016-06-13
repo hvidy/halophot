@@ -44,7 +44,7 @@ def censor_tpf(tpf,ts,thresh=0.8):
 			elif np.nanmin(tpf[:,j,k]) < 100.:
 				tpf[:,j,k] = np.nan
 
-	# find bad pixels
+	# then pick only pixels which are mostly good
 
 	pixels = np.reshape(tpf.T,((tpf.shape[1]*tpf.shape[2]),tpf.shape[0]))
 	indic = np.array([np.sum(np.isfinite(pixels[j,:])) 
