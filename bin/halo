@@ -135,7 +135,7 @@ if __name__ == '__main__':
 		cmap = mpl.cm.seismic
 		cmap.set_bad('k',1.)
 		plt.imshow(np.log10(weightmap.T*norm),cmap=cmap,
-			interpolation='None')
+			interpolation='None',origin='lower')
 		plt.colorbar()
 		plt.savefig('%s/%s_weightmap_o%s.png' % (args.save_dir,args.name,args.order))
 		plt.show()
