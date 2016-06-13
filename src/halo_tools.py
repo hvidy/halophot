@@ -137,7 +137,7 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None):
 	### now throw away saturated columns, nan pixels and nan cadences
 
 	pixels, ts, mapping = censor_tpf(tpf,ts,thresh=0.8)
-	pixelmap = np.zeros((tpf.shape[1],tpf.shape[2]))
+	pixelmap = np.zeros((tpf.shape[2],tpf.shape[1]))
 	print 'Censored TPF'
 
 	### subsample
