@@ -92,6 +92,12 @@ def diff_1(z):
 def diff_2(z):
 	return np.sum(np.abs(2*z[1:-1]-np.roll(z[1:-1],1)-np.roll(z[1:-1],2)))
 
+def grad_1(w,pixels):
+	flux = np.dot(weights.T,pixelvector)
+	flux /= np.nanmedian(flux)
+	diffs = np.abs(z[1:-1]-np.roll(z[1:-1],1))
+	return np.dot(pixels,(diffs-np.roll(diffs,1)))
+
 def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101):
 	'''Use first order for total variation on gradient, second order
 	for total second derivative'''
@@ -116,12 +122,30 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101):
 
 	res = optimize.minimize(obj, w_init, method='SLSQP', constraints=cons, 
 		bounds = bounds, options={'disp': True,'maxiter':maxiter})
+
+	if 'Positive directional derivative for linesearch' in res['message']:
+		print 'Failed to converge well! Rescaling.'
+		if order==1:
+			def obj(weights):
+				flux = np.dot(weights.T,pixelvector)
+				flux /= np.nanmedian(flux)
+				return diff_1(flux)/10.
+
+		elif order==2:
+			def obj(weights):
+				flux = np.dot(weights.T,pixelvector)
+				flux/= np.nanmedian(flux)
+				return diff_2(flux)/10.
+		w_init = np.random.rand(npix)
+		w_init /= w_init.sum()
+		res = optimize.minimize(obj, w_init, method='SLSQP', constraints=cons, 
+			bounds = bounds, options={'disp': True,'maxiter':maxiter})
 	
 	w_best = res['x']
 	lc_opt = np.dot(w_best.T,pixelvector)
 	return w_best, lc_opt
 
-def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None):
+def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False):
 	### get a slice corresponding to the splits you want
 	if splits[0] is None and splits[1] is not None:
 		print 'Taking cadences from beginning to',splits[1]
@@ -148,8 +172,11 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None):
 	### now calculate the halo 
 
 	print 'Calculating weights'
+	if random_init:
+		w_init = np.random.rand(pixels_sub.shape[0])
+		w_init /= np.sum(w_init)
 
-	weights, opt_lc = tv_tpf(pixels_sub,order=order,maxiter=maxiter)
+	weights, opt_lc = tv_tpf(pixels_sub,order=order,maxiter=maxiter,w_init=w_init)
 	print 'Calculated weights!'
 
 	ts['corr_flux'] = opt_lc

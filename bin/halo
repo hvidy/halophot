@@ -59,6 +59,8 @@ if __name__ == '__main__':
 					help = 'produce plots')
 	ap.add_argument('--do-split', action = 'store_true', default = False, \
 					help = 'produce plots')
+	ap.add_argument('--random-init', action = 'store_true', default = False, \
+					help = 'initialize search with random seed')
 
 	args = ap.parse_args()
 
@@ -82,18 +84,18 @@ if __name__ == '__main__':
 		print 'First doing one run to establish weights'
 
 		tpf, newts, weights, weightmap = do_lc(tpf,ts,(None,None),args.sub, args.order,
-			maxiter=args.maxiter)
+			maxiter=args.maxiter,random_init=args.random_init)
 
 		'Splitting at',splits
 		# do first segment
 		tpf1, ts1, w1, wm1 = do_lc(tpf, ts, (None,splits[0]), args.sub, args.order,
-			maxiter=args.maxiter,w_init=weights)
+			maxiter=args.maxiter,w_init=weights,random_init=args.random_init)
 
 		# do others
 		tpf2, ts2, w2, wm2 = do_lc(tpf, ts, (splits[0],splits[1]), args.sub, args.order,
-			maxiter=args.maxiter,w_init=weights)
+			maxiter=args.maxiter,w_init=weights,random_init=args.random_init)
 		tpf3, ts3, w3, weightmap = do_lc(tpf, ts, (splits[1],None), args.sub, args.order,
-			maxiter=args.maxiter,w_init=weights)
+			maxiter=args.maxiter,w_init=weights,random_init=args.random_init)
 
 		## now stitch these
 
@@ -101,7 +103,7 @@ if __name__ == '__main__':
 	else:
 		print 'Not splitting'
 		tpf, newts, weights, weightmap = do_lc(tpf,ts,(None,None),args.sub, args.order,
-			maxiter=args.maxiter)
+			maxiter=args.maxiter,random_init=args.random_init)
 
 	time, opt_lc = newts['time'][:], newts['corr_flux'][:]
 
