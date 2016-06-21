@@ -116,7 +116,15 @@ if __name__ == '__main__':
 
 	### save your new light curve!
 
-	newts.write('%s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order),overwrite=True)
+	norm = np.size(weightmap)
+	weightmap = np.ma.array(weightmap,mask=np.isnan(weightmap))
+	hdus = astropy.io.fits.HDUList(weightmap)
+	hdus.extend(newts)
+
+	hdus.writeto('%s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order),overwrite=True)
+
+
+	# newts.write('%s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order),overwrite=True)
 	print 'Saved halo-corrected light curve to %s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order)
 
 	if args.do_plot:
@@ -132,8 +140,6 @@ if __name__ == '__main__':
 
 		plt.figure(2)
 		plt.clf()
-		norm = np.size(weightmap)
-		weightmap = np.ma.array(weightmap,mask=np.isnan(weightmap))
 		cmap = mpl.cm.seismic
 		cmap.set_bad('k',1.)
 		plt.imshow(np.log10(weightmap.T*norm),cmap=cmap,
