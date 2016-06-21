@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib as mpl
 from astropy.table import Table
 import scipy.optimize as optimize
 import fitsio
@@ -196,4 +197,3 @@ The cuts for Campaign 4 are
 550:2200
 2200:
 -----------------------------------------------------------------'''
-

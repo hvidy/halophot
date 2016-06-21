@@ -119,7 +119,7 @@ if __name__ == '__main__':
 	norm = np.size(weightmap)
 	weightmap = np.ma.array(weightmap,mask=np.isnan(weightmap))
 	output = fitsio.FITS('%s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order),'rw')
-	output.create_image_hdu(weightmap)
+	output.create_image_hdu(weightmap.T)
 	output.create_table_hdu(dict(newts))
 
 	# newts.write('%s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order),overwrite=True)
@@ -139,8 +139,10 @@ if __name__ == '__main__':
 		plt.figure(2)
 		plt.clf()
 		cmap = mpl.cm.seismic
+
 		cmap.set_bad('k',1.)
-		plt.imshow(np.log10(weightmap.T*norm),cmap=cmap,
+		im = np.log10(weightmap.T*norm)
+		plt.imshow(im,cmap=cmap, vmin=-2*np.nanmax(im),vmax=2*np.nanmax(im),
 			interpolation='None',origin='lower')
 		plt.colorbar()
 		plt.savefig('%s/%s_weightmap_o%s.png' % (args.save_dir,args.name,args.order))
