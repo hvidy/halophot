@@ -1,5 +1,4 @@
 # halophot
-[![Build Status](https://travis-ci.org/OxES/k2sc.svg?branch=master)](https://travis-ci.org/OxES/k2sc)
 [![Licence](http://img.shields.io/badge/license-GPLv3-blue.svg?style=flat)](http://www.gnu.org/licenses/gpl-3.0.html)
 
 ## K2 Halo Photometry
