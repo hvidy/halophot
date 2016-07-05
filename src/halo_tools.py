@@ -72,6 +72,14 @@ def censor_tpf(tpf,ts,thresh=0.8):
 def get_slice(tpf,ts,start,stop):
 	return tpf[start:stop,:,:], ts[start:stop]
 
+def get_annulus(tpf,rmin,rmax):
+	xs, ys = np.arange(tpf.shape[1])-tpf.shape[1]/2.,np.arange(tpf.shape[2])-tpf.shape[1]/2.
+	xx, yy = np.meshgrid(xs,ys)
+	rr = np.sqrt(xx**2 + yy **2)
+	mask = (rr>rmax)*(rr<rmin)
+	tpf[:,mask] = np.nan
+	return tpf
+
 def stitch(tslist):
 	# key idea is to match GP values at the edge
 	final = np.nanmedian(tslist[0]['corr_flux'][-5:])

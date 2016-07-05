@@ -51,6 +51,8 @@ if __name__ == '__main__':
 	ap.add_argument('-maxiter',  type=int,default=151, help='Maximum # iterations')
 	ap.add_argument('--splits', default=None, type=lambda s:fromstring(s.strip('[]'), 
 		sep=','), help='List of time values for kernel splits')
+	ap.add_argument('--rr', default=None, type=lambda s:fromstring(s.strip('[]'), 
+		sep=','), help='rmin, rmax (pix)')
 	ap.add_argument('--quiet', action='store_true', default=False, 
 		help='suppress messages')
 	ap.add_argument('--save-dir', default='.', 
@@ -79,6 +81,10 @@ if __name__ == '__main__':
 	fname = args.data_dir + args.fname
 	tpf, ts = read_tpf(fname)
 	print 'Data loaded!'
+
+	# get annulus if necessary
+	rmin, rmax = args.rr or (0,1e4)
+	tpf = get_annulus(tpf,rmin,rmax)
 
 	if args.do_split:
 		print 'First doing one run to establish weights'
