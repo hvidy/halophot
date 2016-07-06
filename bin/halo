@@ -49,9 +49,9 @@ if __name__ == '__main__':
 		help='TV Order: \1 for gradient, 2 for concavity')
 	ap.add_argument('-sub',  type=int,default=1, help='Subsampling parameter')
 	ap.add_argument('-maxiter',  type=int,default=151, help='Maximum # iterations')
-	ap.add_argument('--splits', default=None, type=lambda s:fromstring(s.strip('[]'), 
+	ap.add_argument('--splits', default=None, type=lambda s:np.fromstring(s.strip('[]'), 
 		sep=','), help='List of time values for kernel splits')
-	ap.add_argument('--rr', default=None, type=lambda s:fromstring(s.strip('[]'), 
+	ap.add_argument('--rr', default=None, type=lambda s:np.fromstring(s.strip('[]'), 
 		sep=','), help='rmin, rmax (pix)')
 	ap.add_argument('--quiet', action='store_true', default=False, 
 		help='suppress messages')
@@ -83,8 +83,11 @@ if __name__ == '__main__':
 	print 'Data loaded!'
 
 	# get annulus if necessary
-	rmin, rmax = args.rr or (0,1e4)
-	tpf = get_annulus(tpf,rmin,rmax)
+	if args.rr is not None:
+		rmin, rmax = args.rr
+		print 'Getting annulus from',rmin,'to',rmax
+		tpf = get_annulus(tpf,rmin,rmax)
+		print 'Using',np.sum(np.isfinite(tpf[0,:,:])),'pixels'
 
 	if args.do_split:
 		print 'First doing one run to establish weights'

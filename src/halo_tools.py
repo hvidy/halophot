@@ -76,7 +76,7 @@ def get_annulus(tpf,rmin,rmax):
 	xs, ys = np.arange(tpf.shape[1])-tpf.shape[1]/2.,np.arange(tpf.shape[2])-tpf.shape[1]/2.
 	xx, yy = np.meshgrid(xs,ys)
 	rr = np.sqrt(xx**2 + yy **2)
-	mask = (rr>rmax)*(rr<rmin)
+	mask = (rr>rmax) + (rr<rmin)
 	tpf[:,mask] = np.nan
 	return tpf
 
