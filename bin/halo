@@ -130,6 +130,7 @@ if __name__ == '__main__':
 	output = fitsio.FITS('%s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order),'rw')
 	output.create_image_hdu(weightmap.T)
 	output.create_table_hdu(dict(newts))
+	output[1].write(newts)
 
 	# newts.write('%s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order),overwrite=True)
 	print 'Saved halo-corrected light curve to %s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order)
