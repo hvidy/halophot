@@ -21,7 +21,7 @@ setup(name='halophot',
           "Intended Audience :: Science/Research",
           "Intended Audience :: Developers",
           "Development Status :: 4 - Beta",
-          "License :: OSI Approved :: GNU General Public License v2 (GPLv2)",
+          "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
           "Operating System :: OS Independent",
           "Programming Language :: Python"
       ]
