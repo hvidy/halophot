@@ -15,7 +15,7 @@ setup(name='halophot',
       scripts=['bin/halo'],
       packages=['halophot'],
       install_requires=["numpy", "astropy", "scipy"],
-      license='GPLv2',
+      license='GPLv3',
       classifiers=[
           "Topic :: Scientific/Engineering",
           "Intended Audience :: Science/Research",
