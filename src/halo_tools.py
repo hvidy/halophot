@@ -32,31 +32,33 @@ def read_tpf(fname):
 
 	return tpf, ts
 
-def censor_tpf(tpf,ts,thresh=0.8):
+def censor_tpf(tpf,ts,thresh=0.8,minflux=100.):
 	'''Throw away bad pixels and bad cadences'''
 
-	# first find bad pixels
+	dummy = tpf.copy()
+	tsd = ts.copy()
 	maxflux = np.nanmax(tpf)
 
-	for j in range(tpf.shape[1]):
-		for k in range(tpf.shape[2]):
-			if np.nanmax(tpf[:,j,k]) > (thresh*maxflux):
-				tpf[:,j,k] = np.nan
-			elif np.nanmin(tpf[:,j,k]) < 100.:
-				tpf[:,j,k] = np.nan
+	# find bad pixels
+
+	m = (ts['quality'] == 0) # get bad quality 
+	dummy = dummy[m,:,:]
+	tsd = tsd[m]
+
+	dummy[dummy<0] = 0 # just as a check!
+
+	saturated = np.nanmax(dummy,axis=0) > (thresh*maxflux)
+	dummy[:,saturated] = np.nan 
+
+	no_flux = np.nanmin(dummy,axis=0) < minflux
+	dummy[:,no_flux] = np.nan
 
 	# then pick only pixels which are mostly good
 
-	pixels = np.reshape(tpf.T,((tpf.shape[1]*tpf.shape[2]),tpf.shape[0]))
+	pixels = np.reshape(dummy.T,((tpf.shape[1]*tpf.shape[2]),dummy.shape[0]))
 	indic = np.array([np.sum(np.isfinite(pixels[j,:])) 
 		for j in range(pixels.shape[0])])
 	pixels = pixels[indic>60,:]
-
-	# next find bad cadences
-
-	m = (ts['quality'] == 0) # get bad quality 
-	pixels = pixels[:,m]
-	ts = ts[m]
 
 	# indic_cad = np.array([np.sum(np.isfinite(pixels[:,j])) 
 	# 	for j in range(pixels.shape[1])])
@@ -67,7 +69,7 @@ def censor_tpf(tpf,ts,thresh=0.8):
 	# this should get all the nans but if not just set them to 0
 	pixels[~np.isfinite(pixels)] = 0
 
-	return pixels,ts, np.where(indic>60)
+	return pixels,tsd, np.where(indic>60)
 
 def get_slice(tpf,ts,start,stop):
 	return tpf[start:stop,:,:], ts[start:stop]
@@ -154,7 +156,8 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101):
 	lc_opt = np.dot(w_best.T,pixelvector)
 	return w_best, lc_opt
 
-def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False):
+def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
+	thresh=0.8,minflux=100.):
 	### get a slice corresponding to the splits you want
 	if splits[0] is None and splits[1] is not None:
 		print 'Taking cadences from beginning to',splits[1]
@@ -169,7 +172,7 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False):
 
 	### now throw away saturated columns, nan pixels and nan cadences
 
-	pixels, ts, mapping = censor_tpf(tpf,ts,thresh=0.8)
+	pixels, ts, mapping = censor_tpf(tpf,ts,thresh=thresh,minflux=minflux)
 	pixelmap = np.zeros((tpf.shape[2],tpf.shape[1]))
 	print 'Censored TPF'
 
