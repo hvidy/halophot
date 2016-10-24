@@ -46,7 +46,7 @@ if __name__ == '__main__':
 	ap.add_argument('-c', '--campaign', metavar='C',default=4, type=int, 
 		help='Campaign number')
 	ap.add_argument('-o', '--order', metavar='O', type=int,default=1, 
-		help='TV Order: \1 for gradient, 2 for concavity')
+		help='TV Order: 1 for gradient, 2 for concavity')
 	ap.add_argument('-sub',  type=int,default=1, help='Subsampling parameter')
 	ap.add_argument('-maxiter',  type=int,default=151, help='Maximum # iterations')
 	ap.add_argument('--splits', default=None, type=lambda s:np.fromstring(s.strip('[]'), 
