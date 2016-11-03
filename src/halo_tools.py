@@ -157,7 +157,7 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101):
 	return w_best, lc_opt
 
 def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
-	thresh=0.8,minflux=100.):
+	thresh=0.8,minflux=100.,consensus=False):
 	### get a slice corresponding to the splits you want
 	if splits[0] is None and splits[1] is not None:
 		print 'Taking cadences from beginning to',splits[1]
@@ -178,6 +178,7 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
 
 	### subsample
 	if consensus:			
+		assert sub>1, "Must be subsampled to use consensus"
 		print 'Subsampling by a factor of', sub
 		for j in range(sub):
 			pixels_sub = pixels[j::sub,:]
