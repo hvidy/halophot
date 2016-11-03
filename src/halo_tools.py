@@ -177,19 +177,37 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
 	print 'Censored TPF'
 
 	### subsample
+	if consensus:			
+		print 'Subsampling by a factor of', sub
+		for j in range(sub):
+			pixels_sub = pixels[j::sub,:]
+			weights = np.zeros(pixels.shape[0])
+			opt_lcs = np.zeros((pixels_sub.shape[1],sub))
+			### now calculate the halo 
+			print 'Calculating weights'
+			if random_init:
+				w_init = np.random.rand(pixels_sub.shape[0])
+				w_init /= np.sum(w_init)
 
-	pixels_sub, ts_sub = pixels[::sub,:], ts[::sub]
-	print 'Subsampling by a factor of', sub
+			weights[j::sub], opt_lcs[:,j] = tv_tpf(pixels_sub,order=order,maxiter=maxiter,w_init=w_init)
+			print 'Calculated weights!'
 
-	### now calculate the halo 
+		norm_lcs = opt_lcs/np.nanmedian(opt_lcs,axis=0)
+		opt_lc = np.nanmean(norm_lcs,axis=1)
 
-	print 'Calculating weights'
-	if random_init:
-		w_init = np.random.rand(pixels_sub.shape[0])
-		w_init /= np.sum(w_init)
+	else:
+		pixels_sub = pixels[::sub,:]
+		print 'Subsampling by a factor of', sub
 
-	weights, opt_lc = tv_tpf(pixels_sub,order=order,maxiter=maxiter,w_init=w_init)
-	print 'Calculated weights!'
+		### now calculate the halo 
+
+		print 'Calculating weights'
+		if random_init:
+			w_init = np.random.rand(pixels_sub.shape[0])
+			w_init /= np.sum(w_init)
+
+		weights, opt_lc = tv_tpf(pixels_sub,order=order,maxiter=maxiter,w_init=w_init)
+		print 'Calculated weights!'
 
 	ts['corr_flux'] = opt_lc
 

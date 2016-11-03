@@ -65,6 +65,8 @@ if __name__ == '__main__':
 					help = 'initialize search with random seed')
 	ap.add_argument('--minflux', type=float,default=100., help='Minimum flux to include')
 	ap.add_argument('--thresh', type=float,default=0.8, help='What fraction of saturation to throw away')
+	ap.add_argument('--consensus', action = 'store_true', default = False, \
+					help = 'use with subsampling to run fast and avoid overfitting')
 
 
 	args = ap.parse_args()
@@ -97,21 +99,21 @@ if __name__ == '__main__':
 
 		tpf, newts, weights, weightmap = do_lc(tpf,ts,(None,None),args.sub, args.order,
 			maxiter=args.maxiter,random_init=args.random_init,
-			thresh=args.thresh,minflux=args.minflux)
+			thresh=args.thresh,minflux=args.minflux,consensus=consensus)
 
 		'Splitting at',splits
 		# do first segment
 		tpf1, ts1, w1, wm1 = do_lc(tpf, ts, (None,splits[0]), args.sub, args.order,
 			maxiter=args.maxiter,w_init=weights,random_init=args.random_init,
-			thresh=args.thresh,minflux=args.minflux)
+			thresh=args.thresh,minflux=args.minflux,consensus=consensus)
 
 		# do others
 		tpf2, ts2, w2, wm2 = do_lc(tpf, ts, (splits[0],splits[1]), args.sub, args.order,
 			maxiter=args.maxiter,w_init=weights,random_init=args.random_init,
-			thresh=args.thresh,minflux=args.minflux)
+			thresh=args.thresh,minflux=args.minflux,consensus=consensus)
 		tpf3, ts3, w3, weightmap = do_lc(tpf, ts, (splits[1],None), args.sub, args.order,
 			maxiter=args.maxiter,w_init=weights,random_init=args.random_init,
-			thresh=args.thresh,minflux=args.minflux)
+			thresh=args.thresh,minflux=args.minflux,consensus=consensus)
 
 		## now stitch these
 
@@ -120,7 +122,7 @@ if __name__ == '__main__':
 		print 'Not splitting'
 		tpf, newts, weights, weightmap = do_lc(tpf,ts,(None,None),args.sub, args.order,
 			maxiter=args.maxiter,random_init=args.random_init,
-			thresh=args.thresh,minflux=args.minflux)
+			thresh=args.thresh,minflux=args.minflux,consensus=consensus)
 
 	time, opt_lc = newts['time'][:], newts['corr_flux'][:]
 
