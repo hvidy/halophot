@@ -180,15 +180,18 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
 	if consensus:			
 		assert sub>1, "Must be subsampled to use consensus"
 		print 'Subsampling by a factor of', sub
+		
+		weights = np.zeros(pixels.shape[0])
+		opt_lcs = np.zeros((pixels_sub.shape[1],sub))
+
+		if random_init:
+			w_init = np.random.rand(pixels_sub.shape[0])
+			w_init /= np.sum(w_init)
+
 		for j in range(sub):
 			pixels_sub = pixels[j::sub,:]
-			weights = np.zeros(pixels.shape[0])
-			opt_lcs = np.zeros((pixels_sub.shape[1],sub))
 			### now calculate the halo 
 			print 'Calculating weights'
-			if random_init:
-				w_init = np.random.rand(pixels_sub.shape[0])
-				w_init /= np.sum(w_init)
 
 			weights[j::sub], opt_lcs[:,j] = tv_tpf(pixels_sub,order=order,maxiter=maxiter,w_init=w_init)
 			print 'Calculated weights!'
@@ -215,7 +218,9 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
 	if sub == 1:
 		pixelmap.ravel()[mapping] = weights
 		return tpf, ts, weights, pixelmap
-
+	elif consensus:
+		pixelmap.ravel()[mapping] = weights
+		return tpf, ts, weights, pixelmap
 	else:
 		pixelmap.ravel()[mapping[0][::sub]] = weights
 		return tpf, ts, weights, pixelmap
