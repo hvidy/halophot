@@ -219,7 +219,7 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
 		pixelmap.ravel()[mapping] = weights
 		return tpf, ts, weights, pixelmap
 	elif consensus:
-		pixelmap.ravel()[mapping] = weights
+		pixelmap.ravel()[mapping] = weights/float(sub)
 		return tpf, ts, weights, pixelmap
 	else:
 		pixelmap.ravel()[mapping[0][::sub]] = weights
