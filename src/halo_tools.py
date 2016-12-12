@@ -32,7 +32,7 @@ def read_tpf(fname):
 
 	return tpf, ts
 
-def censor_tpf(tpf,ts,thresh=0.8,minflux=100.):
+def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=False):
 	'''Throw away bad pixels and bad cadences'''
 
 	dummy = tpf.copy()
@@ -41,9 +41,11 @@ def censor_tpf(tpf,ts,thresh=0.8,minflux=100.):
 
 	# find bad pixels
 
-	m = (ts['quality'] == 0) # get bad quality 
-	dummy = dummy[m,:,:]
-	tsd = tsd[m]
+	if do_quality:
+
+		m = (ts['quality'] == 0) # get bad quality 
+		dummy = dummy[m,:,:]
+		tsd = tsd[m]
 
 	dummy[dummy<0] = 0 # just as a check!
 
@@ -212,6 +214,8 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
 
 		weights, opt_lc = tv_tpf(pixels_sub,order=order,maxiter=maxiter,w_init=w_init)
 		print 'Calculated weights!'
+
+	opt_lc = np.dot(w_best.T,pixelvector)
 
 	ts['corr_flux'] = opt_lc
 
