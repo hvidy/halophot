@@ -87,6 +87,8 @@ if __name__ == '__main__':
 	tpf, ts = read_tpf(fname)
 	print 'Data loaded!'
 
+	start = clock()
+
 	# get annulus if necessary
 	if args.rr is not None:
 		rmin, rmax = args.rr
@@ -123,6 +125,8 @@ if __name__ == '__main__':
 		tpf, newts, weights, weightmap = do_lc(tpf,ts,(None,None),args.sub, args.order,
 			maxiter=args.maxiter,random_init=args.random_init,
 			thresh=args.thresh,minflux=args.minflux,consensus=args.consensus)
+
+	print_time(clock()-start)
 
 	time, opt_lc = newts['time'][:], newts['corr_flux'][:]
 
