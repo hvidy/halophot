@@ -159,7 +159,7 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False):
 		tvf = theano.function([w,In(p,value=pixelvector)],diff)
 		# hesstv = theano.function([w,In(p,value=pixelvector)],hw)
 		res = optimize.minimize(tvf, w_init, method='L-BFGS-B', jac=dtv, 
-			constraints=cons, bounds = bounds, options={'disp': True,'maxiter':600})
+			constraints=cons, bounds = bounds, options={'disp': False,'maxiter':maxiter})
 
 	else:
 		if order==1:
