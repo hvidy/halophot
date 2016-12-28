@@ -257,7 +257,7 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
 			w_init=w_init,analytic=analytic)
 		print 'Calculated weights!'
 
-	opt_lc = np.dot(weights.T,pixels_sub)
+	# opt_lc = np.dot(weights.T,pixels_sub)
 	ts['corr_flux'] = opt_lc
 
 	if sub == 1:
