@@ -86,7 +86,7 @@ def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=False):
 
 	# pixels = pixels[:,indic_cad>200]
 	# ts = ts[indic_cad>200]
-	pixels = pixels[np.all(np.isfinite(pixels),axis=0),:]
+	pixels = pixels[np.all(np.isfinite(pixels),axis=1),:]
 	# this should get all the nans but if not just set them to 0
 
 	pixels[~np.isfinite(pixels)] = 0
