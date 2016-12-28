@@ -193,7 +193,7 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False):
 	return w_best, lc_opt
 
 def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
-	thresh=0.8,minflux=100.,consensus=False):
+	thresh=0.8,minflux=100.,consensus=False,analytic=False):
 	### get a slice corresponding to the splits you want
 	if splits[0] is None and splits[1] is not None:
 		print 'Taking cadences from beginning to',splits[1]
@@ -229,7 +229,8 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
 			### now calculate the halo 
 			print 'Calculating weights'
 
-			weights[j::sub], opt_lcs[:,j] = tv_tpf(pixels_sub,order=order,maxiter=maxiter,w_init=w_init)
+			weights[j::sub], opt_lcs[:,j] = tv_tpf(pixels_sub,order=order,
+				maxiter=maxiter,w_init=w_init,analytic=analytic)
 			print 'Calculated weights!'
 
 		norm_lcs = opt_lcs/np.nanmedian(opt_lcs,axis=0)
@@ -246,7 +247,8 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
 			w_init = np.random.rand(pixels_sub.shape[0])
 			w_init /= np.sum(w_init)
 
-		weights, opt_lc = tv_tpf(pixels_sub,order=order,maxiter=maxiter,w_init=w_init)
+		weights, opt_lc = tv_tpf(pixels_sub,order=order,maxiter=maxiter,
+			w_init=w_init,analytic=analytic)
 		print 'Calculated weights!'
 
 	ts['corr_flux'] = opt_lc
