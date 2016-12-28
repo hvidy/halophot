@@ -6,6 +6,10 @@ import scipy.optimize as optimize
 import fitsio
 from time import time as clock
 import astropy.table
+import theano
+import theano.tensor as T
+from theano import pp
+from theano import In
 
 '''-----------------------------------------------------------------
 halo_tools.py 
