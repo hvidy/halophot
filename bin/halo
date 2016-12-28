@@ -154,9 +154,10 @@ if __name__ == '__main__':
 	print 'Saved halo-corrected light curve to %s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order)
 
 	if args.do_plot:
+		m = (opt_lc>0.)
 		plt.figure(1)
 		plt.clf()
-		plt.plot(newts['time'],opt_lc/np.nanmedian(opt_lc),'-')
+		plt.plot(newts['time'],opt_lc[m]/np.nanmedian(opt_lc[m]),'-')
 		plt.xlabel('Time')
 		plt.ylabel('Relative Flux')
 		plt.title(args.name)
