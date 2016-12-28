@@ -114,19 +114,16 @@ def stitch(tslist):
 In this section we include the actual detrending code.
 -----------------------------------------------------------------'''
 
+## it seems to be faster than using np.diff?
+
 def diff_1(z):
 	return np.sum(np.abs(z[1:-1]-np.roll(z[1:-1],1)))
 
 def diff_2(z):
-	return np.sum(np.abs(2*z[1:-1]-np.roll(z[1:-1],1)-np.roll(z[1:-1],2)))
+	return np.sum(np.abs(2*z[1:-1]-np.roll(z[1:-1],1)-np.roll(z[1:-1],-1)))
 
-def grad_1(w,pixels):
-	flux = np.dot(weights.T,pixelvector)
-	flux /= np.nanmedian(flux)
-	diffs = np.abs(z[1:-1]-np.roll(z[1:-1],1))
-	return np.dot(pixels,(diffs-np.roll(diffs,1)))
 
-def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101):
+def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False):
 	'''Use first order for total variation on gradient, second order
 	for total second derivative'''
 
@@ -136,39 +133,61 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101):
 	if w_init is None:
 		w_init = np.ones(npix)/np.float(npix)
 
-	if order==1:
-		def obj(weights):
-			flux = np.dot(weights.T,pixelvector)
-			flux /= np.nanmedian(flux)
-			return diff_1(flux)
+	if analytic:
+		w = T.dvector('w')
+		p = T.dmatrix('p')
+		f = T.dot(w,p)
+		fd = T.roll(f,1)
 
-	elif order==2:
-		def obj(weights):
-			flux = np.dot(weights.T,pixelvector)
-			flux/= np.nanmedian(flux)
-			return diff_2(flux)
+		if order == 1:
+			diff = T.sum(T.abs_(f-fd))/T.mean(f)
+		elif order == 2:
+			fd2 = T.roll(f,-1)
+			diff = T.sum(T.abs_(2*f-fd-fd2))/T.mean(f)
 
-	res = optimize.minimize(obj, w_init, method='SLSQP', constraints=cons, 
-		bounds = bounds, options={'disp': True,'maxiter':maxiter})
+		gw = T.grad(diff, w)
+		# hw = T.hessian(diff,w)
 
-	if 'Positive directional derivative for linesearch' in res['message']:
-		print 'Failed to converge well! Rescaling.'
+		dtv = theano.function([w,In(p,value=pixelvector)],gw)
+		tvf = theano.function([w,In(p,value=pixelvector)],diff)
+		# hesstv = theano.function([w,In(p,value=pixelvector)],hw)
+		res = optimize.minimize(tvf, w_init, method='L-BFGS-B', jac=dtv, 
+			constraints=cons, bounds = bounds, options={'disp': True,'maxiter':600})
+
+	else:
 		if order==1:
 			def obj(weights):
 				flux = np.dot(weights.T,pixelvector)
 				flux /= np.nanmedian(flux)
-				return diff_1(flux)/10.
+				return diff_1(flux)
 
 		elif order==2:
 			def obj(weights):
 				flux = np.dot(weights.T,pixelvector)
 				flux/= np.nanmedian(flux)
-				return diff_2(flux)/10.
-		w_init = np.random.rand(npix)
-		w_init /= w_init.sum()
+				return diff_2(flux)
+
 		res = optimize.minimize(obj, w_init, method='SLSQP', constraints=cons, 
 			bounds = bounds, options={'disp': True,'maxiter':maxiter})
-	
+
+		if 'Positive directional derivative for linesearch' in res['message']:
+			print 'Failed to converge well! Rescaling.'
+			if order==1:
+				def obj(weights):
+					flux = np.dot(weights.T,pixelvector)
+					flux /= np.nanmedian(flux)
+					return diff_1(flux)/10.
+
+			elif order==2:
+				def obj(weights):
+					flux = np.dot(weights.T,pixelvector)
+					flux/= np.nanmedian(flux)
+					return diff_2(flux)/10.
+			w_init = np.random.rand(npix)
+			w_init /= w_init.sum()
+			res = optimize.minimize(obj, w_init, method='SLSQP', constraints=cons, 
+				bounds = bounds, options={'disp': True,'maxiter':maxiter})
+		
 	w_best = res['x']
 	lc_opt = np.dot(w_best.T,pixelvector)
 	return w_best, lc_opt
