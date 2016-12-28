@@ -157,7 +157,7 @@ if __name__ == '__main__':
 		m = (opt_lc>0.)
 		plt.figure(1)
 		plt.clf()
-		plt.plot(newts['time'],opt_lc[m]/np.nanmedian(opt_lc[m]),'-')
+		plt.plot(newts['time'][m],opt_lc[m]/np.nanmedian(opt_lc[m]),'-')
 		plt.xlabel('Time')
 		plt.ylabel('Relative Flux')
 		plt.title(args.name)
