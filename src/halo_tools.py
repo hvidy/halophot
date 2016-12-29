@@ -143,7 +143,7 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False):
 	if analytic:
 		w = T.dvector('w')
 		p = T.dmatrix('p')
-		f = T.dot(w,p)
+		f = T.dot(T.nnet.softmax(w),p)
 		fd = T.roll(f,1)
 
 		if order == 1:
@@ -159,7 +159,8 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False):
 		tvf = theano.function([w,In(p,value=pixelvector)],diff)
 		# hesstv = theano.function([w,In(p,value=pixelvector)],hw)
 		res = optimize.minimize(tvf, w_init, method='L-BFGS-B', jac=dtv, 
-			constraints=cons, bounds = bounds, options={'disp': False,'maxiter':maxiter})
+			options={'disp': False,'maxiter':maxiter})
+		w_best = np.exp(res['x'])/np.sum(np.exp(res['x'])) # softmax
 
 	else:
 		if order==1:
@@ -195,7 +196,8 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False):
 			res = optimize.minimize(obj, w_init, method='SLSQP', constraints=cons, 
 				bounds = bounds, options={'disp': True,'maxiter':maxiter})
 		
-	w_best = res['x']
+			w_best = res['x']
+
 	lc_opt = np.dot(w_best.T,pixelvector)
 	return w_best, lc_opt
 
