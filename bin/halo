@@ -177,7 +177,9 @@ if __name__ == '__main__':
 		plt.savefig('%s/%s_weightmap_o%s.png' % (args.save_dir,args.name,args.order))
 		plt.show()
 		print 'Weight map saved to %s/%s_weightmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub)
-
+		
+		plt.figure(3)
+		plt.clf()
 		cmap.set_bad('k',1.)
 		im = np.log10(np.nanmedian(tpf,axis=0))
 		plt.imshow(im,cmap=cmap, vmin=-2*np.nanmax(im),vmax=2*np.nanmax(im),
@@ -185,4 +187,4 @@ if __name__ == '__main__':
 		plt.colorbar()
 		plt.savefig('%s/%s_fluxmap_o%s.png' % (args.save_dir,args.name,args.order))
 		plt.show()
-		print 'Weight map saved to %s/%s_fluxmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub)
+		print 'Flux map saved to %s/%s_fluxmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub)
