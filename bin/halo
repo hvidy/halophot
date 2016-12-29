@@ -89,6 +89,10 @@ if __name__ == '__main__':
 	### first load your data
 	fname = args.data_dir + args.fname
 	tpf, ts = read_tpf(fname)
+
+	if args.campaign == 10:
+		m = ts['time']>2760
+		tpf, ts = tpf[m,:,:], ts[m]
 	print 'Data loaded!'
 
 	start = clock()
