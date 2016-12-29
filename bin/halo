@@ -93,6 +93,11 @@ if __name__ == '__main__':
 	if args.campaign == 10:
 		m = ts['time']>2760
 		tpf, ts = tpf[m,:,:], ts[m]
+
+	if args.campaign == 7:
+		m = ts['time']>2468
+		tpf, ts = tpf[m,:,:], ts[m]
+
 	print 'Data loaded!'
 
 	start = clock()
