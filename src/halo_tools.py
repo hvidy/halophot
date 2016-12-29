@@ -148,10 +148,10 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False):
 		ffd = T.roll(ff,1)
 
 		if order == 1:
-			diff = T.sum(T.abs_(ff-ffd))#/T.mean(ff)
+			diff = T.sum(T.abs_(ff-ffd))/T.mean(ff)
 		elif order == 2:
 			ffd2 = T.roll(ff,-1)
-			diff = T.sum(T.abs_(2*ff-ffd-ffd2))#/T.mean(ff)
+			diff = T.sum(T.abs_(2*ff-ffd-ffd2))/T.mean(ff)
 
 		gw = T.grad(diff, w)
 		hw = T.hessian(diff,w)
