@@ -137,28 +137,30 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False):
 	npix = np.shape(pixelvector)[0]
 	cons = ({'type': 'eq', 'fun': lambda z: z.sum() - 1.})
 	bounds = npix*((0,1),)
+
 	if w_init is None:
 		w_init = np.ones(npix)/np.float(npix)
 
 	if analytic:
 		w = T.dvector('w')
 		p = T.dmatrix('p')
-		f = T.dot(T.nnet.softmax(w),p)
-		fd = T.roll(f,1)
+		ff = T.dot(T.nnet.softmax(w),p)
+		ffd = T.roll(ff,1)
 
 		if order == 1:
-			diff = T.sum(T.abs_(f-fd))/T.mean(f)
+			diff = T.sum(T.abs_(ff-ffd))/T.mean(ff)
 		elif order == 2:
-			fd2 = T.roll(f,-1)
-			diff = T.sum(T.abs_(2*f-fd-fd2))/T.mean(f)
+			ffd2 = T.roll(ff,-1)
+			diff = T.sum(T.abs_(2*ff-ffd-ffd2))/T.mean(ff)
 
 		gw = T.grad(diff, w)
-		# hw = T.hessian(diff,w)
+		hw = T.hessian(diff,w)
 
 		dtv = theano.function([w,In(p,value=pixelvector)],gw)
 		tvf = theano.function([w,In(p,value=pixelvector)],diff)
-		# hesstv = theano.function([w,In(p,value=pixelvector)],hw)
-		res = optimize.minimize(tvf, w_init, method='L-BFGS-B', jac=dtv, 
+		hesstv = theano.function([w,In(p,value=pixelvector)],hw)
+
+		res = optimize.minimize(tvf, w_init, method='L-BFGS-B', jac=dtv, hess = hesstv, 
 			options={'disp': False,'maxiter':maxiter})
 		w_best = np.exp(res['x'])/np.sum(np.exp(res['x'])) # softmax
 
