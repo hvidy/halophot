@@ -196,7 +196,7 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False):
 			res = optimize.minimize(obj, w_init, method='SLSQP', constraints=cons, 
 				bounds = bounds, options={'disp': True,'maxiter':maxiter})
 		
-			w_best = res['x']
+		w_best = res['x']
 
 	lc_opt = np.dot(w_best.T,pixelvector)
 	return w_best, lc_opt
