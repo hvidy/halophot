@@ -285,13 +285,13 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
 
 	if sub == 1:
 		pixelmap.ravel()[mapping] = weights
-		return tpf, ts, weights, pixelmap, pixelvector
+		return tpf, ts, weights, pixelmap, pixels_sub
 	elif consensus:
 		pixelmap.ravel()[mapping] = weights/float(sub)
-		return tpf, ts, weights, pixelmap, pixelvector
+		return tpf, ts, weights, pixelmap, pixels_sub
 	else:
 		pixelmap.ravel()[mapping[0][::sub]] = weights
-		return tpf, ts, weights, pixelmap, pixelvector
+		return tpf, ts, weights, pixelmap, pixels_sub
 
 '''-----------------------------------------------------------------
 The cuts for Campaign 4 are
