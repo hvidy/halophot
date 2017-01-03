@@ -95,7 +95,7 @@ if __name__ == '__main__':
 		tpf, ts = tpf[m,:,:], ts[m]
 
 	if args.campaign == 7:
-		m = ts['time']>2468
+		m = ts['time']>2470
 		tpf, ts = tpf[m,:,:], ts[m]
 
 	print 'Data loaded!'
