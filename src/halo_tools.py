@@ -145,7 +145,7 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False):
 	if analytic:
 		w = T.dvector('w')
 		p = T.dmatrix('p')
-		ff = T.dot(T.nnet.sigmoid(w),p)
+		ff = T.dot(T.nnet.softmax(w),p)
 		ffd = T.roll(ff,1)
 
 		if order == 1:
@@ -163,8 +163,7 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False):
 
 		res = optimize.minimize(tvf, w_init, method='L-BFGS-B', jac=dtv, 
 			options={'disp': False,'maxiter':maxiter})
-		# w_best = np.exp(res['x'])/np.sum(np.exp(res['x'])) # softmax
-		w_best = 1./(1.+np.exp(-res['x']))
+		w_best = np.exp(res['x'])/np.sum(np.exp(res['x'])) # softmax
 
 		lc_first_try = np.dot(w_best.T,pixelvector)
 
@@ -181,8 +180,7 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False):
 
 		res = optimize.minimize(tvf2, w_init, method='L-BFGS-B', jac=dtv2, 
 			options={'disp': False,'maxiter':maxiter})
-		# w_best = np.exp(res['x'])/np.sum(np.exp(res['x'])) # softmax
-		w_best = 1./(1.+np.exp(-res['x'])) # sigmoid
+		w_best = np.exp(res['x'])/np.sum(np.exp(res['x'])) # softmax
 
 
 	else:
