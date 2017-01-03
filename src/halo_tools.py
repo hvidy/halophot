@@ -173,7 +173,7 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False):
 
 		print 'Clipping %d bad points' % np.sum(~good)
 
-		pixels_masked, ts_masked = pixelvector[:,good], ts[good]
+		pixels_masked = pixelvector[:,good]
 
 		dtv = theano.function([w,In(p,value=pixels_masked)],gw)
 		tvf = theano.function([w,In(p,value=pixels_masked)],diff)
