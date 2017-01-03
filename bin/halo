@@ -149,7 +149,7 @@ if __name__ == '__main__':
 		good = sigma_clip(opt_lc,max_sigma=3.5)
 
 		print 'Clipping %d bad points' % np.sum(~good)
-
+		pixelvector = np.reshape(tpf.T,((tpf.shape[1]*tpf.shape[2]),tpf.shape[0]))
 		pixelvector, ts = pixelvector[:,good], ts[good]
 		lc_opt = np.dot(weights,pixelvector)
 
