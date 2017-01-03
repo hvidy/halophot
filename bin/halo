@@ -114,21 +114,21 @@ if __name__ == '__main__':
 	if args.do_split:
 		print 'First doing one run to establish weights'
 
-		tpf, newts, weights, weightmap = do_lc(tpf,ts,(None,None),args.sub, args.order,
+		tpf, newts, weights, weightmap, pixelvector = do_lc(tpf,ts,(None,None),args.sub, args.order,
 			maxiter=args.maxiter,random_init=args.random_init,
 			thresh=args.thresh,minflux=args.minflux,consensus=args.consensus,analytic=args.analytic)
 
 		'Splitting at',splits
 		# do first segment
-		tpf1, ts1, w1, wm1 = do_lc(tpf, ts, (None,splits[0]), args.sub, args.order,
+		tpf1, ts1, w1, wm1, pv1 = do_lc(tpf, ts, (None,splits[0]), args.sub, args.order,
 			maxiter=args.maxiter,w_init=weights,random_init=args.random_init,
 			thresh=args.thresh,minflux=args.minflux,consensus=args.consensus,analytic=args.analytic)
 
 		# do others
-		tpf2, ts2, w2, wm2 = do_lc(tpf, ts, (splits[0],splits[1]), args.sub, args.order,
+		tpf2, ts2, w2, wm2, pv2 = do_lc(tpf, ts, (splits[0],splits[1]), args.sub, args.order,
 			maxiter=args.maxiter,w_init=weights,random_init=args.random_init,
 			thresh=args.thresh,minflux=args.minflux,consensus=args.consensus)
-		tpf3, ts3, w3, weightmap = do_lc(tpf, ts, (splits[1],None), args.sub, args.order,
+		tpf3, ts3, w3, weightmap, pixelvector = do_lc(tpf, ts, (splits[1],None), args.sub, args.order,
 			maxiter=args.maxiter,w_init=weights,random_init=args.random_init,
 			thresh=args.thresh,minflux=args.minflux,consensus=args.consensus,analytic=args.analytic)
 
@@ -137,7 +137,7 @@ if __name__ == '__main__':
 		newts = stitch([ts1,ts2,ts3])
 	else:
 		print 'Not splitting'
-		tpf, newts, weights, weightmap = do_lc(tpf,ts,(None,None),args.sub, args.order,
+		tpf, newts, weights, weightmap, pixelvector = do_lc(tpf,ts,(None,None),args.sub, args.order,
 			maxiter=args.maxiter,random_init=args.random_init,
 			thresh=args.thresh,minflux=args.minflux,consensus=args.consensus,analytic=args.analytic)
 
@@ -149,7 +149,6 @@ if __name__ == '__main__':
 		good = sigma_clip(opt_lc,max_sigma=3.5)
 
 		print 'Clipping %d bad points' % np.sum(~good)
-		pixelvector = np.reshape(tpf.T,((tpf.shape[1]*tpf.shape[2]),tpf.shape[0]))
 		pixelvector, ts = pixelvector[:,good], ts[good]
 		lc_opt = np.dot(weights,pixelvector)
 
