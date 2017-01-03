@@ -194,6 +194,6 @@ if __name__ == '__main__':
 		plt.imshow(im,cmap=cmap, vmin=-2*np.nanmax(im),vmax=2*np.nanmax(im),
 			interpolation='None',origin='lower')
 		plt.colorbar()
-		plt.savefig('%s/%s_fluxmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub)
+		plt.savefig('%s/%s_fluxmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
 		plt.show()
 		print 'Flux map saved to %s/%s_fluxmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub)
