@@ -154,13 +154,30 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False):
 			diff = T.sum(T.abs_(2*ff-ffd-ffd2))/T.mean(ff)
 
 		gw = T.grad(diff, w)
-		hw = T.hessian(diff,w)
+		# hw = T.hessian(diff,w)
 
 		dtv = theano.function([w,In(p,value=pixelvector)],gw)
 		tvf = theano.function([w,In(p,value=pixelvector)],diff)
-		hesstv = theano.function([w,In(p,value=pixelvector)],hw)
+		# hesstv = theano.function([w,In(p,value=pixelvector)],hw)
 
-		res = optimize.minimize(tvf, w_init, method='L-BFGS-B', jac=dtv, hess = hesstv, 
+		res = optimize.minimize(tvf, w_init, method='L-BFGS-B', jac=dtv, 
+			options={'disp': False,'maxiter':maxiter})
+		w_best = np.exp(res['x'])/np.sum(np.exp(res['x'])) # softmax
+
+		lc_first_try = np.dot(w_best.T,pixelvector)
+
+		print 'Sigma clipping'
+
+		good = sigma_clip(lc_first_try)
+
+		print 'Clipping %d bad points' % np.sum(~good)
+
+		pixels_masked, ts_masked = pixelvector[good,:], ts[good]
+
+		dtv = theano.function([w,In(p,value=pixels_masked)],gw)
+		tvf = theano.function([w,In(p,value=pixels_masked)],diff)
+
+		res = optimize.minimize(tvf, w_init, method='L-BFGS-B', jac=dtv, 
 			options={'disp': False,'maxiter':maxiter})
 		w_best = np.exp(res['x'])/np.sum(np.exp(res['x'])) # softmax
 
