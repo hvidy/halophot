@@ -143,6 +143,14 @@ if __name__ == '__main__':
 
 	time, opt_lc = newts['time'][:], newts['corr_flux'][:]
 
+	if sigclip:
+		good = sigma_clip(opt_lc,max_sigma=3.5)
+
+		print 'Clipping %d bad points' % np.sum(~good)
+
+		pixelvector, ts = pixelvector[:,good], ts[good]
+		lc_opt = np.dot(weights,pixelvector)
+
 	tv1 = diff_1(opt_lc/np.nanmedian(opt_lc))/float(np.size(opt_lc))
 	tv2 = diff_2(opt_lc/np.nanmedian(opt_lc))/float(np.size(opt_lc))
 
