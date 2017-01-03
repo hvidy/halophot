@@ -169,16 +169,16 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False):
 
 		print 'Sigma clipping'
 
-		good = sigma_clip(lc_first_try)
+		good = sigma_clip(lc_first_try,max_sigma=3.5)
 
 		print 'Clipping %d bad points' % np.sum(~good)
 
 		pixels_masked = pixelvector[:,good]
 
-		dtv = theano.function([w,In(p,value=pixels_masked)],gw)
-		tvf = theano.function([w,In(p,value=pixels_masked)],diff)
+		dtv2 = theano.function([w,In(p,value=pixels_masked)],gw)
+		tvf2 = theano.function([w,In(p,value=pixels_masked)],diff)
 
-		res = optimize.minimize(tvf, w_init, method='L-BFGS-B', jac=dtv, 
+		res = optimize.minimize(tvf2, w_init, method='L-BFGS-B', jac=dtv2, 
 			options={'disp': False,'maxiter':maxiter})
 		w_best = np.exp(res['x'])/np.sum(np.exp(res['x'])) # softmax
 
