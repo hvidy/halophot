@@ -150,7 +150,7 @@ if __name__ == '__main__':
 
 		print 'Clipping %d bad points' % np.sum(~good)
 		pixelvector, ts = pixelvector[:,good], ts[good]
-		lc_opt = np.dot(weights,pixelvector)
+		opt_lc = np.dot(weights,pixelvector)
 
 	tv1 = diff_1(opt_lc/np.nanmedian(opt_lc))/float(np.size(opt_lc))
 	tv2 = diff_2(opt_lc/np.nanmedian(opt_lc))/float(np.size(opt_lc))
