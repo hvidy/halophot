@@ -116,21 +116,25 @@ if __name__ == '__main__':
 
 		tpf, newts, weights, weightmap, pixelvector = do_lc(tpf,ts,(None,None),args.sub, args.order,
 			maxiter=args.maxiter,random_init=args.random_init,
-			thresh=args.thresh,minflux=args.minflux,consensus=args.consensus,analytic=args.analytic)
+			thresh=args.thresh,minflux=args.minflux,consensus=args.consensus,analytic=args.analytic,
+			sigclip=args.sigclip)
 
 		'Splitting at',splits
 		# do first segment
 		tpf1, ts1, w1, wm1, pv1 = do_lc(tpf, ts, (None,splits[0]), args.sub, args.order,
 			maxiter=args.maxiter,w_init=weights,random_init=args.random_init,
-			thresh=args.thresh,minflux=args.minflux,consensus=args.consensus,analytic=args.analytic)
+			thresh=args.thresh,minflux=args.minflux,consensus=args.consensus,analytic=args.analytic,
+			sigclip=args.sigclip)
 
 		# do others
 		tpf2, ts2, w2, wm2, pv2 = do_lc(tpf, ts, (splits[0],splits[1]), args.sub, args.order,
 			maxiter=args.maxiter,w_init=weights,random_init=args.random_init,
-			thresh=args.thresh,minflux=args.minflux,consensus=args.consensus)
+			thresh=args.thresh,minflux=args.minflux,consensus=args.consensus,sigclip=args.sigclip)
+
 		tpf3, ts3, w3, weightmap, pixelvector = do_lc(tpf, ts, (splits[1],None), args.sub, args.order,
 			maxiter=args.maxiter,w_init=weights,random_init=args.random_init,
-			thresh=args.thresh,minflux=args.minflux,consensus=args.consensus,analytic=args.analytic)
+			thresh=args.thresh,minflux=args.minflux,consensus=args.consensus,analytic=args.analytic,
+			sigclip=args.sigclip)
 
 		## now stitch these
 
@@ -139,7 +143,8 @@ if __name__ == '__main__':
 		print 'Not splitting'
 		tpf, newts, weights, weightmap, pixelvector = do_lc(tpf,ts,(None,None),args.sub, args.order,
 			maxiter=args.maxiter,random_init=args.random_init,
-			thresh=args.thresh,minflux=args.minflux,consensus=args.consensus,analytic=args.analytic)
+			thresh=args.thresh,minflux=args.minflux,consensus=args.consensus,analytic=args.analytic,
+			sigclip=args.sigclip)
 
 	print_time(clock()-start)
 

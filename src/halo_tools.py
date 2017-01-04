@@ -231,7 +231,7 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=Fa
 	return w_best, lc_opt
 
 def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
-	thresh=0.8,minflux=100.,consensus=False,analytic=False):
+	thresh=0.8,minflux=100.,consensus=False,analytic=False,sigclip=False):
 	### get a slice corresponding to the splits you want
 	if splits[0] is None and splits[1] is not None:
 		print 'Taking cadences from beginning to',splits[1]
@@ -268,7 +268,7 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
 			print 'Calculating weights'
 
 			weights[j::sub], opt_lcs[:,j] = tv_tpf(pixels_sub,order=order,
-				maxiter=maxiter,w_init=w_init,analytic=analytic)
+				maxiter=maxiter,w_init=w_init,analytic=analytic,sigclip=sigclip)
 			print 'Calculated weights!'
 
 		norm_lcs = opt_lcs/np.nanmedian(opt_lcs,axis=0)
