@@ -85,8 +85,7 @@ if __name__ == '__main__':
 		splits = args.splits
 
 	if not exists(args.save_dir):
-		logger.error("Error: the save directory {:s} doesn't exists".format(args.save_dir), file=sys.stderr)
-		exit(errno.ENOENT)
+		print "Error: the save directory {:s} doesn't exist".format(args.save_dir)
 
 	### first load your data
 	fname = args.data_dir + args.fname
