@@ -136,7 +136,7 @@ def diff_2(z):
 	return np.sum(np.abs(2*z[1:-1]-np.roll(z[1:-1],1)-np.roll(z[1:-1],-1)))
 
 
-def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False):
+def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=False):
 	'''Use first order for total variation on gradient, second order
 	for total second derivative'''
 
@@ -172,21 +172,24 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False):
 
 		lc_first_try = np.dot(w_best.T,pixelvector)
 
-		print 'Sigma clipping'
+		
+		if sigclip:
+			print 'Sigma clipping'
 
-		good = sigma_clip(lc_first_try,max_sigma=3.5)
+			good = sigma_clip(lc_first_try,max_sigma=3.5)
 
-		print 'Clipping %d bad points' % np.sum(~good)
+			print 'Clipping %d bad points' % np.sum(~good)
 
-		pixels_masked = pixelvector[:,good]
+			pixels_masked = pixelvector[:,good]
 
-		dtv2 = theano.function([w,In(p,value=pixels_masked)],gw)
-		tvf2 = theano.function([w,In(p,value=pixels_masked)],diff)
+			dtv2 = theano.function([w,In(p,value=pixels_masked)],gw)
+			tvf2 = theano.function([w,In(p,value=pixels_masked)],diff)
 
-		res = optimize.minimize(tvf2, w_init, method='L-BFGS-B', jac=dtv2, 
-			options={'disp': False,'maxiter':maxiter})
-		w_best = np.exp(res['x'])/np.sum(np.exp(res['x'])) # softmax
-
+			res = optimize.minimize(tvf2, w_init, method='L-BFGS-B', jac=dtv2, 
+				options={'disp': False,'maxiter':maxiter})
+			w_best = np.exp(res['x'])/np.sum(np.exp(res['x'])) # softmax
+		else:
+			pass
 
 	else:
 		if order==1:
