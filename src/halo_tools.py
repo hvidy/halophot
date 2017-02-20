@@ -74,11 +74,13 @@ def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=False):
 
 	no_flux = np.nanmin(dummy,axis=0) < minflux
 	dummy[:,no_flux] = np.nan
-
+	
 	xc, yc = np.nanmedian(ts['x']), np.nanmedian(ts['y'])
-	rr = np.sqrt((ts['x']-xc)**2 + (ts['y']-yc)**2)
-	goodpos = (rr<5) * np.isfinite(ts['x']) * np.isfinite(ts['y'])
-	dummy = dummy[goodpos,:,:] # some campaigns have a few extremely bad cadences
+
+	if np.sum(np.isfinite('xc')>=0.8*xc.shape[0]:
+		rr = np.sqrt((ts['x']-xc)**2 + (ts['y']-yc)**2)
+		goodpos = (rr<5) * np.isfinite(ts['x']) * np.isfinite(ts['y'])
+		dummy = dummy[goodpos,:,:] # some campaigns have a few extremely bad cadences
 
 	# then pick only pixels which are mostly good
 
