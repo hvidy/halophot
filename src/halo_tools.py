@@ -52,7 +52,7 @@ def read_tpf(fname):
 
 	return tpf, ts
 
-def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=False):
+def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=True):
 	'''Throw away bad pixels and bad cadences'''
 
 	dummy = tpf.copy()
