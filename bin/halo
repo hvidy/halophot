@@ -77,6 +77,7 @@ if __name__ == '__main__':
 	csplits = {4: [550,2200],
 			   7: None,
 			   8: None,
+			   9: None,
 			   10:None}
 
 	if args.splits is None:
