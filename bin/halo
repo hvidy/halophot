@@ -67,13 +67,17 @@ if __name__ == '__main__':
 	ap.add_argument('--thresh', type=float,default=0.8, help='What fraction of saturation to throw away')
 	ap.add_argument('--consensus', action = 'store_true', default = False, \
 					help = 'use with subsampling to run fast and avoid overfitting')
-
+	ap.add_argument('--analytic', action = 'store_true', default = False, \
+					help = 'use analytic derivatives; faster but less accurate')
+	ap.add_argument('--sigclip', action = 'store_true', default = False, \
+					help = 'sigma-clip the final light curve')
 
 	args = ap.parse_args()
 
 	csplits = {4: [550,2200],
 			   7: None,
 			   8: None,
+			   9: None,
 			   10:None}
 
 	if args.splits is None:
@@ -82,12 +86,20 @@ if __name__ == '__main__':
 		splits = args.splits
 
 	if not exists(args.save_dir):
-		logger.error("Error: the save directory {:s} doesn't exists".format(args.save_dir), file=sys.stderr)
-		exit(errno.ENOENT)
+		print "Error: the save directory {:s} doesn't exist".format(args.save_dir)
 
 	### first load your data
 	fname = args.data_dir + args.fname
 	tpf, ts = read_tpf(fname)
+
+	if args.campaign == 10:
+		m = ts['time']>2760
+		tpf, ts = tpf[m,:,:], ts[m]
+
+	if args.campaign == 7:
+		m = ts['time']>2470
+		tpf, ts = tpf[m,:,:], ts[m]
+
 	print 'Data loaded!'
 
 	start = clock()
@@ -102,36 +114,48 @@ if __name__ == '__main__':
 	if args.do_split:
 		print 'First doing one run to establish weights'
 
-		tpf, newts, weights, weightmap = do_lc(tpf,ts,(None,None),args.sub, args.order,
+		tpf, newts, weights, weightmap, pixelvector = do_lc(tpf,ts,(None,None),args.sub, args.order,
 			maxiter=args.maxiter,random_init=args.random_init,
-			thresh=args.thresh,minflux=args.minflux,consensus=args.consensus)
+			thresh=args.thresh,minflux=args.minflux,consensus=args.consensus,analytic=args.analytic,
+			sigclip=args.sigclip)
 
 		'Splitting at',splits
 		# do first segment
-		tpf1, ts1, w1, wm1 = do_lc(tpf, ts, (None,splits[0]), args.sub, args.order,
+		tpf1, ts1, w1, wm1, pv1 = do_lc(tpf, ts, (None,splits[0]), args.sub, args.order,
 			maxiter=args.maxiter,w_init=weights,random_init=args.random_init,
-			thresh=args.thresh,minflux=args.minflux,consensus=args.consensus)
+			thresh=args.thresh,minflux=args.minflux,consensus=args.consensus,analytic=args.analytic,
+			sigclip=args.sigclip)
 
 		# do others
-		tpf2, ts2, w2, wm2 = do_lc(tpf, ts, (splits[0],splits[1]), args.sub, args.order,
+		tpf2, ts2, w2, wm2, pv2 = do_lc(tpf, ts, (splits[0],splits[1]), args.sub, args.order,
 			maxiter=args.maxiter,w_init=weights,random_init=args.random_init,
-			thresh=args.thresh,minflux=args.minflux,consensus=args.consensus)
-		tpf3, ts3, w3, weightmap = do_lc(tpf, ts, (splits[1],None), args.sub, args.order,
+			thresh=args.thresh,minflux=args.minflux,consensus=args.consensus,sigclip=args.sigclip)
+
+		tpf3, ts3, w3, weightmap, pixelvector = do_lc(tpf, ts, (splits[1],None), args.sub, args.order,
 			maxiter=args.maxiter,w_init=weights,random_init=args.random_init,
-			thresh=args.thresh,minflux=args.minflux,consensus=args.consensus)
+			thresh=args.thresh,minflux=args.minflux,consensus=args.consensus,analytic=args.analytic,
+			sigclip=args.sigclip)
 
 		## now stitch these
 
 		newts = stitch([ts1,ts2,ts3])
 	else:
 		print 'Not splitting'
-		tpf, newts, weights, weightmap = do_lc(tpf,ts,(None,None),args.sub, args.order,
+		tpf, newts, weights, weightmap, pixelvector = do_lc(tpf,ts,(None,None),args.sub, args.order,
 			maxiter=args.maxiter,random_init=args.random_init,
-			thresh=args.thresh,minflux=args.minflux,consensus=args.consensus)
+			thresh=args.thresh,minflux=args.minflux,consensus=args.consensus,analytic=args.analytic,
+			sigclip=args.sigclip)
 
 	print_time(clock()-start)
 
 	time, opt_lc = newts['time'][:], newts['corr_flux'][:]
+
+	if args.sigclip:
+		good = sigma_clip(opt_lc,max_sigma=3.5)
+
+		print 'Clipping %d bad points' % np.sum(~good)
+		pixelvector, ts = pixelvector[:,good], ts[good]
+		opt_lc = np.dot(weights,pixelvector)
 
 	tv1 = diff_1(opt_lc/np.nanmedian(opt_lc))/float(np.size(opt_lc))
 	tv2 = diff_2(opt_lc/np.nanmedian(opt_lc))/float(np.size(opt_lc))
@@ -153,9 +177,10 @@ if __name__ == '__main__':
 	print 'Saved halo-corrected light curve to %s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order)
 
 	if args.do_plot:
+		m = (opt_lc>0.)
 		plt.figure(1)
 		plt.clf()
-		plt.plot(newts['time'],opt_lc/np.nanmedian(opt_lc),'-')
+		plt.plot(newts['time'][m],opt_lc[m]/np.nanmedian(opt_lc[m]),'-')
 		plt.xlabel('Time')
 		plt.ylabel('Relative Flux')
 		plt.title(args.name)
@@ -172,6 +197,17 @@ if __name__ == '__main__':
 		plt.imshow(im,cmap=cmap, vmin=-2*np.nanmax(im),vmax=2*np.nanmax(im),
 			interpolation='None',origin='lower')
 		plt.colorbar()
-		plt.savefig('%s/%s_weightmap_o%s.png' % (args.save_dir,args.name,args.order))
+		plt.savefig('%s/%s_weightmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
 		plt.show()
 		print 'Weight map saved to %s/%s_weightmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub)
+		
+		plt.figure(3)
+		plt.clf()
+		cmap.set_bad('k',1.)
+		im = np.log10(np.nanmedian(tpf,axis=0))
+		plt.imshow(im,cmap=cmap, vmin=-2*np.nanmax(im),vmax=2*np.nanmax(im),
+			interpolation='None',origin='lower')
+		plt.colorbar()
+		plt.savefig('%s/%s_fluxmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
+		plt.show()
+		print 'Flux map saved to %s/%s_fluxmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub)

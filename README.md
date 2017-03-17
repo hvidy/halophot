@@ -1,6 +1,10 @@
 # halophot
 [![Licence](http://img.shields.io/badge/license-GPLv3-blue.svg?style=flat)](http://www.gnu.org/licenses/gpl-3.0.html)
 
+## Contributors
+
+Tim White, Benjamin Pope
+
 ## K2 Halo Photometry
 
 This is code that implements a Total Variation (TV) based regularization for Kepler/K2 photometry of very bright stars. 
@@ -17,6 +21,14 @@ halo ktwo200007768-c04_lpd-targ.fits --data-dir /path/to/data/directory/ --name 
 
 where --sub is the subsampling parameter you would like to use (for science, use 1; for quick tests, it can be useful to run faster with subsampling) and -c is the campaign.
 
+## Theano
+
+We achieve a dramatic speed-up using Theano to compute analytic derivatives. This package can be downloaded at http://deeplearning.net/software/theano/install.html.
+
 ## License
 
 We invite anyone interested to use and modify this code under a GPL v3 license. 
+
+## Citation
+
+If you use our code, please cite us! The paper "Breaking the K2 bright limit with halo photometry: variability in the seven brightest stars of the Pleiades" (White et al.) has been submitted to MNRAS and KASC and we recommend that you cite this as in prep., and update the citation accordingly when the paper is (hopefully) accepted.
