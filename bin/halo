@@ -41,7 +41,7 @@ halo ktwo200007768-c04_lpd-targ.fits --data-dir /home/ben/Data/kepler/halo/ --na
 if __name__ == '__main__':
 	ap = ArgumentParser(description='halophot: K2 halo photometry with total variation.')
 	ap.add_argument('fname', type=str, help='Input target pixel file name.')
-	ap.add_argument('--data-dir', default=None, type=str)
+	ap.add_argument('--data-dir', default='', type=str)
 	ap.add_argument('--name', default='test',type=str,help='Target name')
 	ap.add_argument('-c', '--campaign', metavar='C',default=4, type=int, 
 		help='Campaign number')
