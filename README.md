@@ -31,4 +31,32 @@ We invite anyone interested to use and modify this code under a GPL v3 license.
 
 ## Citation
 
-If you use our code, please cite us! The paper "Breaking the K2 bright limit with halo photometry: variability in the seven brightest stars of the Pleiades" (White et al.) has been submitted to MNRAS and KASC and we recommend that you cite this as in prep., and update the citation accordingly when the paper is (hopefully) accepted.
+If you use our code, please cite
+
+    White et al. (2017), MNRAS, 471, 2882-2901, arXiv:1708.07462 
+
+Or use this this BibTeX entry:
+
+    @ARTICLE{White2017,
+       author = {{White}, T.~R. and {Pope}, B.~J.~S. and {Antoci}, V. and {P{\'a}pics}, P.~I. and 
+      {Aerts}, C. and {Gies}, D.~R. and {Gordon}, K. and {Huber}, D. and 
+      {Schaefer}, G.~H. and {Aigrain}, S. and {Albrecht}, S. and {Barclay}, T. and 
+      {Barentsen}, G. and {Beck}, P.~G. and {Bedding}, T.~R. and {Fredslund Andersen}, M. and 
+      {Grundahl}, F. and {Howell}, S.~B. and {Ireland}, M.~J. and 
+      {Murphy}, S.~J. and {Nielsen}, M.~B. and {Silva Aguirre}, V. and 
+      {Tuthill}, P.~G.},
+        title = "{Beyond the Kepler/K2 bright limit: variability in the seven brightest members of the Pleiades}",
+      journal = {\mnras},
+    archivePrefix = "arXiv",
+       eprint = {1708.07462},
+     primaryClass = "astro-ph.SR",
+     keywords = {asteroseismology, techniques: photometric, stars: early type, stars: variables: general, open clusters and associations: individual: Pleiades},
+         year = 2017,
+        month = nov,
+       volume = 471,
+        pages = {2882-2901},
+          doi = {10.1093/mnras/stx1050},
+       adsurl = {http://adsabs.harvard.edu/abs/2017MNRAS.471.2882W},
+      adsnote = {Provided by the SAO/NASA Astrophysics Data System}
+    }
+
