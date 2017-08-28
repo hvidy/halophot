@@ -212,6 +212,7 @@ if __name__ == '__main__':
 		
 		plt.figure(3)
 		plt.clf()
+		cmap = mpl.cm.hot
 		cmap.set_bad('k',1.)
 		im = np.log10(np.nanmedian(tpf,axis=0))
 		plt.imshow(im,cmap=cmap, vmin=-2*np.nanmax(im),vmax=2*np.nanmax(im),
