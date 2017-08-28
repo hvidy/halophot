@@ -215,7 +215,7 @@ if __name__ == '__main__':
 		cmap = mpl.cm.hot
 		cmap.set_bad('k',1.)
 		im = np.log10(np.nanmedian(tpf,axis=0))
-		plt.imshow(im,cmap=cmap, vmin=-2*np.nanmax(im),vmax=2*np.nanmax(im),
+		plt.imshow(im,cmap=cmap, vmin=np.nanmin(im),vmax=np.nanmax(im),
 			interpolation='None',origin='lower')
 		plt.colorbar()
 		plt.savefig('%s/%s_fluxmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
