@@ -77,7 +77,7 @@ if __name__ == '__main__':
 	csplits = {4: [550,2200]}
 
 	if args.splits is None:
-		if args.campaign in csplits.keys(:)
+		if args.campaign in csplits.keys()
 			splits = csplits[args.campaign]
 		else:
 			splits = None
