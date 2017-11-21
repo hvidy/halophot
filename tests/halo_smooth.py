@@ -44,9 +44,11 @@ Generate a toy light curve
 t = np.linspace(0,100,ncad)
 
 amplitude = 1.
-period = 2.
+period = 2.*np.pi
 
 x, y = amplitude*np.sin(2*np.pi*t/period), amplitude*np.cos(2*np.pi*t/period)
+x = 1.0*np.random.randn(x.shape[0])
+y = 1.0*np.random.randn(y.shape[0])
 
 f = 20*np.ones(ncad) + np.sin(t/6.) # make this whatever function you like! 
 f[400:500] *= 0.990 # toy transit
@@ -138,19 +140,19 @@ plt.plot(t,lc_opt_1,'.',label='TV1')
 plt.plot(t,f/np.nanmedian(f),'-',label='True')
 plt.ylabel('Time (d)')
 plt.xlabel('Flux')
-plt.title(r'Smooth $x,y$ Variations: Light curves')
+plt.title(r'%.1d Period : Light curves' % period)
 plt.legend()
-plt.savefig('smooth_lcs.png')
+plt.savefig('period_%.0f_lc.png' % period)
 plt.show()
 
-plt.figure(1)
+plt.figure(2)
 plt.clf()
 
 plt.plot(t,raw_lc-f/np.nanmedian(f),'.',label='Raw')
 plt.plot(t,lc_opt_1-f/np.nanmedian(f),'.',label='TV1')
 plt.ylabel('Time (d)')
 plt.xlabel('Flux')
-plt.title(r'Smooth $x,y$ Variations: Residuals')
+plt.title(r'%.1d d Period: Residuals' % period)
 plt.legend()
-plt.savefig('smooth_residuals.png')
+plt.savefig('period_%.0f_residuals.png' % period)
 plt.show()
