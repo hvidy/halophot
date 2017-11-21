@@ -24,7 +24,7 @@ mpl.rcParams['xtick.labelsize'] = 12
 mpl.rcParams['ytick.labelsize'] = 12
 
 
-fname = './EPIC_211309989_mast.fits' # point this path to your favourite K2SC light curve
+fname = '../EPIC_211309989_mast.fits' # point this path to your favourite K2SC light curve
 lc = Table.read(fname)
 
 x, y = lc['x'][150:1550], lc['y'][150:1550] # copy in the xy variations from real data 
