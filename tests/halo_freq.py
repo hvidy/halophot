@@ -34,8 +34,8 @@ x, y = lc['x'][150:1550], lc['y'][150:1550] # copy in the xy variations from rea
 ncad = np.size(x)
 
 '''--------------------------------------------------
-halo_smooth.py - does halo photometry work with smooth
-pointing variations or does it need jumpy ones?
+halo_freq.py - how well does halo photometry work 
+as a function of frequency?
 --------------------------------------------------'''
 
 '''------------------------
