@@ -102,3 +102,7 @@ def do_sim(xs, ys, fs,params={'width':3,'nx':10,'ny':10,'white':0,'sensitivity':
     lc_opt_1 /= np.nanmedian(lc_opt_1)
 
     return raw_lc, lc_opt_1 
+
+def mad(a,b):
+    '''Median absolute deviation'''
+    return np.median(np.abs(a-b))
