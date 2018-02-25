@@ -67,8 +67,8 @@ if __name__ == '__main__':
 	ap.add_argument('--thresh', type=float,default=0.8, help='What fraction of saturation to throw away')
 	ap.add_argument('--consensus', action = 'store_true', default = False, \
 					help = 'use with subsampling to run fast and avoid overfitting')
-	ap.add_argument('--analytic', action = 'store_true', default = False, \
-					help = 'use analytic derivatives; faster but less accurate')
+	ap.add_argument('--analytic', action = 'store_true', default = True, \
+					help = 'use analytic derivatives; orders of magnitude faster')
 	ap.add_argument('--sigclip', action = 'store_true', default = False, \
 					help = 'sigma-clip the final light curve')
 
@@ -170,7 +170,7 @@ if __name__ == '__main__':
 	output = fitsio.FITS('%s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order),'rw')
 	output.create_image_hdu(weightmap.T)
 	output.create_table_hdu(dict(newts))
-	output[1].write(newts)
+	output[1].write(dict(newts))
 
 	# newts.write('%s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order),overwrite=True)
 	print 'Saved halo-corrected light curve to %s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order)
@@ -196,6 +196,7 @@ if __name__ == '__main__':
 		plt.imshow(im,cmap=cmap, vmin=-2*np.nanmax(im),vmax=2*np.nanmax(im),
 			interpolation='None',origin='lower')
 		plt.colorbar()
+		plt.title('TV-min Weightmap %s' % args.name)
 		plt.savefig('%s/%s_weightmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
 		plt.show()
 		print 'Weight map saved to %s/%s_weightmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub)
@@ -208,6 +209,7 @@ if __name__ == '__main__':
 		plt.imshow(im,cmap=cmap, vmin=np.nanmin(im),vmax=np.nanmax(im),
 			interpolation='None',origin='lower')
 		plt.colorbar()
+		plt.title('%s Flux Map' % args.name)
 		plt.savefig('%s/%s_fluxmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
 		plt.show()
 		print 'Flux map saved to %s/%s_fluxmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub)
