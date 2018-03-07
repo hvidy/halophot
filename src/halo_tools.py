@@ -25,12 +25,12 @@ halo photometry in Python.
 
 def print_time(t):
 		if t>3600:
-			print 'Time taken: %d h %d m %3f s'\
-			% (np.int(np.floor(t/3600)), np.int(np.floor(np.mod(t,3600)/60)),np.mod(t,60))
+			print('Time taken: %d h %d m %3f s'\
+			% (np.int(np.floor(t/3600)), np.int(np.floor(np.mod(t,3600)/60)),np.mod(t,60)))
 		elif t>60:
-			print 'Time taken: %d m %3f s' % (np.int(np.floor(np.mod(t,3600)/60)),np.mod(t,60) )
+			print( 'Time taken: %d m %3f s' % (np.int(np.floor(np.mod(t,3600)/60)),np.mod(t,60) ))
 		else:
-			print 'Time taken: %3f s' % t
+			print( 'Time taken: %3f s' % t)
 
 # =========================================================================
 # =========================================================================
@@ -176,11 +176,11 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=Fa
 
 		
 		if sigclip:
-			print 'Sigma clipping'
+			print('Sigma clipping')
 
 			good = sigma_clip(lc_first_try,max_sigma=3.5)
 
-			print 'Clipping %d bad points' % np.sum(~good)
+			print('Clipping %d bad points' % np.sum(~good))
 
 			pixels_masked = pixelvector[:,good]
 
@@ -210,7 +210,7 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=Fa
 			bounds = bounds, options={'disp': True,'maxiter':maxiter})
 
 		if 'Positive directional derivative for linesearch' in res['message']:
-			print 'Failed to converge well! Rescaling.'
+			print('Failed to converge well! Rescaling.')
 			if order==1:
 				def obj(weights):
 					flux = np.dot(weights.T,pixelvector)
@@ -236,13 +236,13 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
 	thresh=0.8,minflux=100.,consensus=False,analytic=False,sigclip=False):
 	### get a slice corresponding to the splits you want
 	if splits[0] is None and splits[1] is not None:
-		print 'Taking cadences from beginning to',splits[1]
+		print('Taking cadences from beginning to',splits[1])
 	elif splits[0] is not None and splits[1] is None:
-		print 'Taking cadences from', splits[0],'to end'
+		print('Taking cadences from', splits[0],'to end')
 	elif splits[0] is None and splits[1] is None:
-		print 'Taking cadences from beginning to end'
+		print('Taking cadences from beginning to end')
 	else:
-		print 'Taking cadences from', splits[0],'to',splits[1]
+		print('Taking cadences from', splits[0],'to',splits[1])
 
 	tpf, ts = get_slice(tpf,ts,splits[0],splits[1])
 
@@ -250,12 +250,12 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
 
 	pixels, ts, mapping = censor_tpf(tpf,ts,thresh=thresh,minflux=minflux)
 	pixelmap = np.zeros((tpf.shape[2],tpf.shape[1]))
-	print 'Censored TPF'
+	print('Censored TPF')
 
 	### subsample
 	if consensus:			
 		assert sub>1, "Must be subsampled to use consensus"
-		print 'Subsampling by a factor of', sub
+		print('Subsampling by a factor of', sub)
 
 		weights = np.zeros(pixels.shape[0])
 		opt_lcs = np.zeros((pixels[::sub,:].shape[1],sub))
@@ -267,29 +267,29 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
 		for j in range(sub):
 			pixels_sub = pixels[j::sub,:]
 			### now calculate the halo 
-			print 'Calculating weights'
+			print('Calculating weights')
 
 			weights[j::sub], opt_lcs[:,j] = tv_tpf(pixels_sub,order=order,
 				maxiter=maxiter,w_init=w_init,analytic=analytic,sigclip=sigclip)
-			print 'Calculated weights!'
+			print('Calculated weights!')
 
 		norm_lcs = opt_lcs/np.nanmedian(opt_lcs,axis=0)
 		opt_lc = np.nanmean(norm_lcs,axis=1)
 
 	else:
 		pixels_sub = pixels[::sub,:]
-		print 'Subsampling by a factor of', sub
+		print('Subsampling by a factor of', sub)
 
 		### now calculate the halo 
 
-		print 'Calculating weights'
+		print('Calculating weights')
 		if random_init:
 			w_init = np.random.rand(pixels_sub.shape[0])
 			w_init /= np.sum(w_init)
 
 		weights, opt_lc = tv_tpf(pixels_sub,order=order,maxiter=maxiter,
 			w_init=w_init,analytic=analytic)
-		print 'Calculated weights!'
+		print('Calculated weights!')
 
 	# opt_lc = np.dot(weights.T,pixels_sub)
 	ts['corr_flux'] = opt_lc
