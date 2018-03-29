@@ -85,11 +85,27 @@ if __name__ == '__main__':
 		splits = args.splits
 
 	if not exists(args.save_dir):
-		print "Error: the save directory {:s} doesn't exist".format(args.save_dir)
+		print("Error: the save directory {:s} doesn't exist".format(args.save_dir))
 
 	### first load your data
 	fname = args.data_dir + args.fname
 	tpf, ts = read_tpf(fname)
+
+	if args.campaign == 13:
+		# m1 = np.logical_or(ts['cadence']<140911,ts['cadence']>140922)
+		# m2 = np.logical_and(m1,ts['cadence']<144619)
+		# m3 = np.logical_or(m2,ts['cadence']>144654)
+		# m4 = np.logical_and(m3,ts['cadence']<144715)
+		# m = np.logical_or(m4,ts['cadence']>144726)
+		# tpf,ts = tpf[m,:,:], ts[m]
+		m1 = np.logical_or(ts['time']<2988.2553329814764,ts['time']>2988.494)
+		#m11 = np.logical_and(m1,ts['time']<3001.9834)
+		#m12 = np.logical_or(m11,ts['time']>3001.9849)
+		m2 = np.logical_and(m1,ts['time']<3064.016165412577)
+		m3 = np.logical_or(m2,ts['time']>3064.75)
+		m4 = np.logical_and(m3,ts['time']<3065.9776255118923)
+		m = np.logical_or(m4,ts['time']>3066.2225)
+		tpf,ts = tpf[m,:,:], ts[m]
 
 	if args.campaign == 10:
 		m = ts['time']>2760
@@ -99,19 +115,19 @@ if __name__ == '__main__':
 		m = ts['time']>2470
 		tpf, ts = tpf[m,:,:], ts[m]
 
-	print 'Data loaded!'
+	print('Data loaded!')
 
 	start = clock()
 
 	# get annulus if necessary
 	if args.rr is not None:
 		rmin, rmax = args.rr
-		print 'Getting annulus from',rmin,'to',rmax
+		print('Getting annulus from',rmin,'to',rmax)
 		tpf = get_annulus(tpf,rmin,rmax)
-		print 'Using',np.sum(np.isfinite(tpf[0,:,:])),'pixels'
+		print('Using',np.sum(np.isfinite(tpf[0,:,:])),'pixels')
 
 	if args.do_split:
-		print 'First doing one run to establish weights'
+		print('First doing one run to establish weights')
 
 		tpf, newts, weights, weightmap, pixelvector = do_lc(tpf,ts,(None,None),args.sub, args.order,
 			maxiter=args.maxiter,random_init=args.random_init,
@@ -139,7 +155,7 @@ if __name__ == '__main__':
 
 		newts = stitch([ts1,ts2,ts3])
 	else:
-		print 'Not splitting'
+		print('Not splitting')
 		tpf, newts, weights, weightmap, pixelvector = do_lc(tpf,ts,(None,None),args.sub, args.order,
 			maxiter=args.maxiter,random_init=args.random_init,
 			thresh=args.thresh,minflux=args.minflux,consensus=args.consensus,analytic=args.analytic,
@@ -152,16 +168,16 @@ if __name__ == '__main__':
 	if args.sigclip:
 		good = sigma_clip(opt_lc,max_sigma=3.5)
 
-		print 'Clipping %d bad points' % np.sum(~good)
-		pixelvector, ts = pixelvector[:,good], ts[good]
+		print('Clipping %d bad points' % np.sum(~good))
+		pixelvector, newts = pixelvector[:,good], newts[good]
 		opt_lc = np.dot(weights,pixelvector)
 
 	tv1 = diff_1(opt_lc/np.nanmedian(opt_lc))/float(np.size(opt_lc))
 	tv2 = diff_2(opt_lc/np.nanmedian(opt_lc))/float(np.size(opt_lc))
 
-	print 'Total variation per point (first order)',tv1
+	print('Total variation per point (first order)',tv1)
 
-	print 'Total variation per point (second order)',tv2
+	print('Total variation per point (second order)',tv2)
 
 	### save your new light curve!
 
@@ -173,7 +189,7 @@ if __name__ == '__main__':
 	output[1].write(dict(newts))
 
 	# newts.write('%s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order),overwrite=True)
-	print 'Saved halo-corrected light curve to %s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order)
+	print('Saved halo-corrected light curve to %s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order))
 
 	if args.do_plot:
 		m = (opt_lc>0.)
@@ -185,7 +201,7 @@ if __name__ == '__main__':
 		plt.title(args.name)
 		plt.savefig('%s/%shalo_lc_o%s.png' % (args.save_dir,args.name,args.order))
 		plt.show()
-		print 'Saved halo-corrected light curve plot to %s/%shalo_lc_o%s.png' % (args.save_dir,args.name,args.order)
+		print('Saved halo-corrected light curve plot to %s/%shalo_lc_o%s.png' % (args.save_dir,args.name,args.order))
 
 		plt.figure(2)
 		plt.clf()
@@ -199,7 +215,7 @@ if __name__ == '__main__':
 		plt.title('TV-min Weightmap %s' % args.name)
 		plt.savefig('%s/%s_weightmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
 		plt.show()
-		print 'Weight map saved to %s/%s_weightmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub)
+		print('Weight map saved to %s/%s_weightmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
 		
 		plt.figure(3)
 		plt.clf()
@@ -212,4 +228,4 @@ if __name__ == '__main__':
 		plt.title('%s Flux Map' % args.name)
 		plt.savefig('%s/%s_fluxmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
 		plt.show()
-		print 'Flux map saved to %s/%s_fluxmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub)
+		print('Flux map saved to %s/%s_fluxmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
