@@ -74,20 +74,8 @@ if __name__ == '__main__':
 
 	args = ap.parse_args()
 
-	csplits = {0: None,
-			   1: None,
-			   2: None,
-			   3: None,
-			   4: [550,2200],
-			   5: None,
-			   6: None,
-			   7: None,
-			   8: None,
-			   9: None,
-			   10:None,
-			   11:None,
-			   12:None,
-			   13:None}
+	csplits = {j:None for j in range(16)}
+	csplits[4] = [550,2200]
 
 	if args.splits is None:
 		splits = csplits[args.campaign]
