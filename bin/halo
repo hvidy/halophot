@@ -67,7 +67,7 @@ if __name__ == '__main__':
 	ap.add_argument('--thresh', type=float,default=0.8, help='What fraction of saturation to throw away')
 	ap.add_argument('--consensus', action = 'store_true', default = False, \
 					help = 'use with subsampling to run fast and avoid overfitting')
-	ap.add_argument('--analytic', action = 'store_true', default = False, \
+	ap.add_argument('--analytic', action = 'store_true', default = True, \
 					help = 'use analytic derivatives; faster but less accurate')
 	ap.add_argument('--sigclip', action = 'store_true', default = False, \
 					help = 'sigma-clip the final light curve')
