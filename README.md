@@ -32,6 +32,8 @@ We invite anyone interested to use and modify this code under a GPL v3 license.
 
 ## Citation
 
+We request that anyone using this code for photometry of stars observed under the halo star GO programs in K2 include White and Pope as coauthors on any publications.
+
 If you use our code, please cite
 
     White et al. (2017), MNRAS, 471, 2882-2901, arXiv:1708.07462 
