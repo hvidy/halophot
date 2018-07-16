@@ -139,8 +139,47 @@ def diff_2(z):
 
 
 def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=False):
-	'''Use first order for total variation on gradient, second order
-	for total second derivative'''
+	'''
+	This is the main function here - once you have loaded the data, pass it to this
+	to do a TV-min light curve.
+
+	Keywords
+
+    order: int
+        Run nth order TV - ie first order is L1 norm on first derivative,
+        second order is L1 norm on second derivative, etc.
+        This is part of the Pock generalized TV scheme, so that
+        1st order gives you piecewise constant functions,
+        2nd order gives you piecewise affine functions, etc. 
+        Currently implemented only up to 2nd order in numerical, 1st in analytic!
+        We recommend first order very strongly.
+    maxiter: int
+        Number of iterations to optimize. 101 is default & usually sufficient.
+    w_init: None or array-like.
+        Initialize weights with a particular weight vector - useful if you have
+        already run TV-min and want to update, but otherwise set to None 
+        and it will have default initialization.
+    random_init: Boolean
+        If False, and w_init is None, it will initialize with uniform weights; if True, it
+        will initialize with random weights. False is usually better.
+    thresh: float
+        A float greater than 0. Pixels less than this fraction of the maximum
+        flux at any pixel will be masked out - this is to deal with saturation.
+        Because halo is usually intended for saturated stars, the default is 0.8, 
+        to deal with saturated pixels. If your star is not saturated, set this 
+        greater than 1.0. 
+    consensus: Boolean
+        If True, this will subsample the pixel space, separately calculate halo time 
+        series for eah set of pixels, and merge these at the end. This is to check
+        for validation, but is typically not useful, and is by default set False.
+    analytic: Boolean
+        If True, it will optimize the TV with autograd analytic derivatives, which is
+        several orders of magnitude faster than with numerical derivatives. This is 
+        by default True but you can run it numerically with False if you prefer.
+    sigclip: Boolean
+        If True, it will iteratively run the TV-min algorithm clipping outliers.
+        Use this for data with a lot of outliers, but by default it is set False.
+	'''
 
 	npix = np.shape(pixelvector)[0]
 	cons = ({'type': 'eq', 'fun': lambda z: z.sum() - 1.})
