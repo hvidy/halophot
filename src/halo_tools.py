@@ -220,21 +220,25 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=Fa
 
 			good = sigma_clip(lc_first_try,max_sigma=3.5)
 
-			print('Clipping %d bad points' % np.sum(~good))
 
-			pixels_masked = pixelvector[:,good]
+			if np.sum(~good) > 0:
+				print('Clipping %d bad points' % np.sum(~good))
 
-			def tv_masked(weights):
-				flux = agnp.dot(softmax(weights).T,pixels_masked)
-				diff = agnp.sum(agnp.abs(flux[1:] - flux[:-1]))
-				return diff/agnp.mean(flux)
+				pixels_masked = pixelvector[:,good]
 
-			gradient_masked = grad(tv_masked)
+				def tv_masked(weights):
+					flux = agnp.dot(softmax(weights).T,pixels_masked)
+					diff = agnp.sum(agnp.abs(flux[1:] - flux[:-1]))
+					return diff/agnp.mean(flux)
 
-			res = optimize.minimize(tv_masked, w_init, method='L-BFGS-B', jac=gradient_masked, 
-				options={'disp': False,'maxiter':maxiter})
+				gradient_masked = grad(tv_masked)
 
-			w_best = softmax(res['x']) # softmax
+				res = optimize.minimize(tv_masked, w_init, method='L-BFGS-B', jac=gradient_masked, 
+					options={'disp': False,'maxiter':maxiter})
+
+				w_best = softmax(res['x']) # softmax
+			else:
+				print('No outliers found, continuing')
 		else:
 			pass
 
