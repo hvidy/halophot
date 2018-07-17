@@ -198,7 +198,7 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=Fa
 		w_init = np.ones(npix)/np.float(npix)
 
 	if analytic: 
-		print 'Using Analytic Derivatives'
+		print('Using Analytic Derivatives')
 		# only use first order, it appears to be strictly better
 
 		def tv_soft(weights):
