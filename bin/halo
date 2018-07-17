@@ -30,7 +30,7 @@ mpl.rcParams['ytick.labelsize'] = 12
 '''-----------------------------------------------------------------
 halo
 
-This executable Python script allows you to detrend any single halo
+This executable Python script allows you to detrend any single object using halo
 photometry.
 
 An example call is 
