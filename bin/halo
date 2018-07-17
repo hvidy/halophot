@@ -35,7 +35,7 @@ photometry.
 
 An example call is 
 
-halo ktwo200007768-c04_lpd-targ.fits --data-dir /home/ben/Data/kepler/halo/ --name atlas -c 4 --do-plot -sub 8
+halo ktwo200007768-c04_lpd-targ.fits --data-dir /home/ben/Data/kepler/halo/ --name atlas -c 4 --do-plot
 -----------------------------------------------------------------'''
 
 if __name__ == '__main__':
