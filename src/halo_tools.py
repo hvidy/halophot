@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import matplotlib as mpl
 from astropy.table import Table
 import scipy.optimize as optimize
-import fitsio
+from astropy.io import fits
 from time import time as clock
 import astropy.table
 from k2sc.utils import sigma_clip
@@ -23,10 +23,10 @@ halo photometry in Python.
 -----------------------------------------------------------------'''
 
 def softmax(x):
-    '''From https://gist.github.com/stober/1946926'''
-    e_x = agnp.exp(x - agnp.max(x))
-    out = e_x / e_x.sum()
-    return out
+	'''From https://gist.github.com/stober/1946926'''
+	e_x = agnp.exp(x - agnp.max(x))
+	out = e_x / e_x.sum()
+	return out
 
 # =========================================================================
 # =========================================================================
@@ -44,19 +44,20 @@ def print_time(t):
 # =========================================================================
 
 def read_tpf(fname):
-	target_fits = fitsio.FITS(fname)
+	target_fits = fits.open(fname)
 
-	tpf = target_fits[1]['FLUX'][:]
+	tpf = target_fits[1].data['FLUX'][:]
 
-	t, x, y = target_fits[1]['TIME'][:], target_fits[1]['POS_CORR1'][:], target_fits[1]['POS_CORR2'][:]
-	cad = target_fits[1]['CADENCENO'][:]
-	quality = target_fits[1]['QUALITY'][:].astype('int32')
+	t, x, y = target_fits[1].data['TIME'][:], target_fits[1].data['POS_CORR1'][:], target_fits[1].data['POS_CORR2'][:]
+	cad = target_fits[1].data['CADENCENO'][:]
+	quality = target_fits[1].data['QUALITY'][:].astype('int32')
 
 	ts = Table({'time':t,
 				'cadence':cad,
 				'x':x,
 				'y':y,
 				'quality':quality})
+
 
 	return tpf, ts
 
@@ -153,40 +154,40 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=Fa
 
 	Keywords
 
-    order: int
-        Run nth order TV - ie first order is L1 norm on first derivative,
-        second order is L1 norm on second derivative, etc.
-        This is part of the Pock generalized TV scheme, so that
-        1st order gives you piecewise constant functions,
-        2nd order gives you piecewise affine functions, etc. 
-        Currently implemented only up to 2nd order in numerical, 1st in analytic!
-        We recommend first order very strongly.
-    maxiter: int
-        Number of iterations to optimize. 101 is default & usually sufficient.
-    w_init: None or array-like.
-        Initialize weights with a particular weight vector - useful if you have
-        already run TV-min and want to update, but otherwise set to None 
-        and it will have default initialization.
-    random_init: Boolean
-        If False, and w_init is None, it will initialize with uniform weights; if True, it
-        will initialize with random weights. False is usually better.
-    thresh: float
-        A float greater than 0. Pixels less than this fraction of the maximum
-        flux at any pixel will be masked out - this is to deal with saturation.
-        Because halo is usually intended for saturated stars, the default is 0.8, 
-        to deal with saturated pixels. If your star is not saturated, set this 
-        greater than 1.0. 
-    consensus: Boolean
-        If True, this will subsample the pixel space, separately calculate halo time 
-        series for eah set of pixels, and merge these at the end. This is to check
-        for validation, but is typically not useful, and is by default set False.
-    analytic: Boolean
-        If True, it will optimize the TV with autograd analytic derivatives, which is
-        several orders of magnitude faster than with numerical derivatives. This is 
-        by default True but you can run it numerically with False if you prefer.
-    sigclip: Boolean
-        If True, it will iteratively run the TV-min algorithm clipping outliers.
-        Use this for data with a lot of outliers, but by default it is set False.
+	order: int
+		Run nth order TV - ie first order is L1 norm on first derivative,
+		second order is L1 norm on second derivative, etc.
+		This is part of the Pock generalized TV scheme, so that
+		1st order gives you piecewise constant functions,
+		2nd order gives you piecewise affine functions, etc. 
+		Currently implemented only up to 2nd order in numerical, 1st in analytic!
+		We recommend first order very strongly.
+	maxiter: int
+		Number of iterations to optimize. 101 is default & usually sufficient.
+	w_init: None or array-like.
+		Initialize weights with a particular weight vector - useful if you have
+		already run TV-min and want to update, but otherwise set to None 
+		and it will have default initialization.
+	random_init: Boolean
+		If False, and w_init is None, it will initialize with uniform weights; if True, it
+		will initialize with random weights. False is usually better.
+	thresh: float
+		A float greater than 0. Pixels less than this fraction of the maximum
+		flux at any pixel will be masked out - this is to deal with saturation.
+		Because halo is usually intended for saturated stars, the default is 0.8, 
+		to deal with saturated pixels. If your star is not saturated, set this 
+		greater than 1.0. 
+	consensus: Boolean
+		If True, this will subsample the pixel space, separately calculate halo time 
+		series for eah set of pixels, and merge these at the end. This is to check
+		for validation, but is typically not useful, and is by default set False.
+	analytic: Boolean
+		If True, it will optimize the TV with autograd analytic derivatives, which is
+		several orders of magnitude faster than with numerical derivatives. This is 
+		by default True but you can run it numerically with False if you prefer.
+	sigclip: Boolean
+		If True, it will iteratively run the TV-min algorithm clipping outliers.
+		Use this for data with a lot of outliers, but by default it is set False.
 	'''
 
 	npix = np.shape(pixelvector)[0]
@@ -201,9 +202,9 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=Fa
 		# only use first order, it appears to be strictly better
 
 		def tv_soft(weights):
-		    flux = agnp.dot(softmax(weights).T,pixelvector)
-		    diff = agnp.sum(agnp.abs(flux[1:] - flux[:-1]))
-		    return diff/agnp.mean(flux)
+			flux = agnp.dot(softmax(weights).T,pixelvector)
+			diff = agnp.sum(agnp.abs(flux[1:] - flux[:-1]))
+			return diff/agnp.mean(flux)
 
 		gradient = grad(tv_soft)
 
@@ -224,9 +225,9 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=Fa
 			pixels_masked = pixelvector[:,good]
 
 			def tv_masked(weights):
-			    flux = agnp.dot(softmax(weights).T,pixels_masked)
-			    diff = agnp.sum(agnp.abs(flux[1:] - flux[:-1]))
-			    return diff/agnp.mean(flux)
+				flux = agnp.dot(softmax(weights).T,pixels_masked)
+				diff = agnp.sum(agnp.abs(flux[1:] - flux[:-1]))
+				return diff/agnp.mean(flux)
 
 			gradient_masked = grad(tv_masked)
 
