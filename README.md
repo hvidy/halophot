@@ -22,10 +22,6 @@ halo ktwo200007768-c04_lpd-targ.fits --data-dir /path/to/data/directory/ --name 
 
 where --sub is the subsampling parameter you would like to use (for science, use 1; for quick tests, it can be useful to run faster with subsampling) and -c is the campaign.
 
-## Theano
-
-We achieve a dramatic speed-up using Theano to compute analytic derivatives. This package can be downloaded at http://deeplearning.net/software/theano/install.html.
-
 ## License
 
 We invite anyone interested to use and modify this code under a GPL v3 license. 
