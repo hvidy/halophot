@@ -26,7 +26,7 @@ We invite anyone interested to use and modify this code under a GPL v3 license.
 
 ## Citation
 
-We request that anyone using this code for photometry of stars observed under the halo star GO programs in K2 include White and Pope as coauthors on any publications.
+We request that anyone using this code for photometry of stars observed under the bright star GO programs in K2 include White and Pope as coauthors on any publications.
 
 If you use our code, please cite
 
