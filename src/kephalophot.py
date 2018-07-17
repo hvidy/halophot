@@ -90,17 +90,17 @@ def kephalophot(infile,outfile,plotfile,plottype,filter,function,cutoff,clobber,
 # print target data
 
     if status == 0:
-        print ''
-        print '      KepID:  %s' % kepid
-        print ' RA (J2000):  %s' % ra
-        print 'Dec (J2000): %s' % dec
-        print '     KepMag:  %s' % kepmag
-        print '   SkyGroup:    %2s' % skygroup
-        print '     Season:    %2s' % str(season)
-        print '    Channel:    %2s' % channel
-        print '     Module:    %2s' % module
-        print '     Output:     %1s' % output
-        print ''
+        print('')
+        print('      KepID:  %s' % kepid)
+        print(' RA (J2000):  %s' % ra)
+        print('Dec (J2000): %s' % dec)
+        print('     KepMag:  %s' % kepmag)
+        print('   SkyGroup:    %2s' % skygroup)
+        print('     Season:    %2s' % str(season))
+        print('    Channel:    %2s' % channel)
+        print('     Module:    %2s' % module)
+        print('     Output:     %1s' % output)
+        print('')
 
 # how many quality = 0 rows? how many pixels?
 

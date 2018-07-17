@@ -11,7 +11,7 @@ import theano.tensor as T
 from theano import pp
 from theano import In
 from k2sc.utils import sigma_clip
-
+warnings.filterwarnings("ignore",category =RuntimeWarning)
 '''-----------------------------------------------------------------
 halo_tools.py 
 
@@ -25,12 +25,12 @@ halo photometry in Python.
 
 def print_time(t):
 		if t>3600:
-			print 'Time taken: %d h %d m %3f s'\
-			% (np.int(np.floor(t/3600)), np.int(np.floor(np.mod(t,3600)/60)),np.mod(t,60))
+			print('Time taken: %d h %d m %3f s'\
+			% (np.int(np.floor(t/3600)), np.int(np.floor(np.mod(t,3600)/60)),np.mod(t,60)))
 		elif t>60:
-			print 'Time taken: %d m %3f s' % (np.int(np.floor(np.mod(t,3600)/60)),np.mod(t,60) )
+			print( 'Time taken: %d m %3f s' % (np.int(np.floor(np.mod(t,3600)/60)),np.mod(t,60) ))
 		else:
-			print 'Time taken: %3f s' % t
+			print( 'Time taken: %3f s' % t)
 
 # =========================================================================
 # =========================================================================
@@ -77,9 +77,9 @@ def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=True):
 	
 	xc, yc = np.nanmedian(ts['x']), np.nanmedian(ts['y'])
 
-	if np.sum(np.isfinite(ts['x']))>=0.8*ts['x'].shape[0]:
-		rr = np.sqrt((ts['x']-xc)**2 + (ts['y']-yc)**2)
-		goodpos = (rr<5) * np.isfinite(ts['x']) * np.isfinite(ts['y'])
+	if np.sum(np.isfinite(ts['x']))>=0.8*tsd['x'].shape[0]:
+		rr = np.sqrt((tsd['x']-xc)**2 + (tsd['y']-yc)**2)
+		goodpos = (rr<5) * np.isfinite(tsd['x']) * np.isfinite(tsd['y'])
 		dummy = dummy[goodpos,:,:] # some campaigns have a few extremely bad cadences
 
 	# then pick only pixels which are mostly good
@@ -139,8 +139,47 @@ def diff_2(z):
 
 
 def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=False):
-	'''Use first order for total variation on gradient, second order
-	for total second derivative'''
+	'''
+	This is the main function here - once you have loaded the data, pass it to this
+	to do a TV-min light curve.
+
+	Keywords
+
+    order: int
+        Run nth order TV - ie first order is L1 norm on first derivative,
+        second order is L1 norm on second derivative, etc.
+        This is part of the Pock generalized TV scheme, so that
+        1st order gives you piecewise constant functions,
+        2nd order gives you piecewise affine functions, etc. 
+        Currently implemented only up to 2nd order in numerical, 1st in analytic!
+        We recommend first order very strongly.
+    maxiter: int
+        Number of iterations to optimize. 101 is default & usually sufficient.
+    w_init: None or array-like.
+        Initialize weights with a particular weight vector - useful if you have
+        already run TV-min and want to update, but otherwise set to None 
+        and it will have default initialization.
+    random_init: Boolean
+        If False, and w_init is None, it will initialize with uniform weights; if True, it
+        will initialize with random weights. False is usually better.
+    thresh: float
+        A float greater than 0. Pixels less than this fraction of the maximum
+        flux at any pixel will be masked out - this is to deal with saturation.
+        Because halo is usually intended for saturated stars, the default is 0.8, 
+        to deal with saturated pixels. If your star is not saturated, set this 
+        greater than 1.0. 
+    consensus: Boolean
+        If True, this will subsample the pixel space, separately calculate halo time 
+        series for eah set of pixels, and merge these at the end. This is to check
+        for validation, but is typically not useful, and is by default set False.
+    analytic: Boolean
+        If True, it will optimize the TV with autograd analytic derivatives, which is
+        several orders of magnitude faster than with numerical derivatives. This is 
+        by default True but you can run it numerically with False if you prefer.
+    sigclip: Boolean
+        If True, it will iteratively run the TV-min algorithm clipping outliers.
+        Use this for data with a lot of outliers, but by default it is set False.
+	'''
 
 	npix = np.shape(pixelvector)[0]
 	cons = ({'type': 'eq', 'fun': lambda z: z.sum() - 1.})
@@ -176,11 +215,11 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=Fa
 
 		
 		if sigclip:
-			print 'Sigma clipping'
+			print('Sigma clipping')
 
 			good = sigma_clip(lc_first_try,max_sigma=3.5)
 
-			print 'Clipping %d bad points' % np.sum(~good)
+			print('Clipping %d bad points' % np.sum(~good))
 
 			pixels_masked = pixelvector[:,good]
 
@@ -210,7 +249,7 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=Fa
 			bounds = bounds, options={'disp': True,'maxiter':maxiter})
 
 		if 'Positive directional derivative for linesearch' in res['message']:
-			print 'Failed to converge well! Rescaling.'
+			print('Failed to converge well! Rescaling.')
 			if order==1:
 				def obj(weights):
 					flux = np.dot(weights.T,pixelvector)
@@ -236,13 +275,13 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
 	thresh=0.8,minflux=100.,consensus=False,analytic=False,sigclip=False):
 	### get a slice corresponding to the splits you want
 	if splits[0] is None and splits[1] is not None:
-		print 'Taking cadences from beginning to',splits[1]
+		print('Taking cadences from beginning to',splits[1])
 	elif splits[0] is not None and splits[1] is None:
-		print 'Taking cadences from', splits[0],'to end'
+		print('Taking cadences from', splits[0],'to end')
 	elif splits[0] is None and splits[1] is None:
-		print 'Taking cadences from beginning to end'
+		print('Taking cadences from beginning to end')
 	else:
-		print 'Taking cadences from', splits[0],'to',splits[1]
+		print('Taking cadences from', splits[0],'to',splits[1])
 
 	tpf, ts = get_slice(tpf,ts,splits[0],splits[1])
 
@@ -250,12 +289,12 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
 
 	pixels, ts, mapping = censor_tpf(tpf,ts,thresh=thresh,minflux=minflux)
 	pixelmap = np.zeros((tpf.shape[2],tpf.shape[1]))
-	print 'Censored TPF'
+	print('Censored TPF')
 
 	### subsample
 	if consensus:			
 		assert sub>1, "Must be subsampled to use consensus"
-		print 'Subsampling by a factor of', sub
+		print('Subsampling by a factor of', sub)
 
 		weights = np.zeros(pixels.shape[0])
 		opt_lcs = np.zeros((pixels[::sub,:].shape[1],sub))
@@ -267,29 +306,29 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
 		for j in range(sub):
 			pixels_sub = pixels[j::sub,:]
 			### now calculate the halo 
-			print 'Calculating weights'
+			print('Calculating weights')
 
 			weights[j::sub], opt_lcs[:,j] = tv_tpf(pixels_sub,order=order,
 				maxiter=maxiter,w_init=w_init,analytic=analytic,sigclip=sigclip)
-			print 'Calculated weights!'
+			print('Calculated weights!')
 
 		norm_lcs = opt_lcs/np.nanmedian(opt_lcs,axis=0)
 		opt_lc = np.nanmean(norm_lcs,axis=1)
 
 	else:
 		pixels_sub = pixels[::sub,:]
-		print 'Subsampling by a factor of', sub
+		print('Subsampling by a factor of', sub)
 
 		### now calculate the halo 
 
-		print 'Calculating weights'
+		print('Calculating weights')
 		if random_init:
 			w_init = np.random.rand(pixels_sub.shape[0])
 			w_init /= np.sum(w_init)
 
 		weights, opt_lc = tv_tpf(pixels_sub,order=order,maxiter=maxiter,
 			w_init=w_init,analytic=analytic)
-		print 'Calculated weights!'
+		print('Calculated weights!')
 
 	# opt_lc = np.dot(weights.T,pixels_sub)
 	ts['corr_flux'] = opt_lc
