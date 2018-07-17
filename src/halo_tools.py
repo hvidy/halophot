@@ -11,7 +11,11 @@ import theano.tensor as T
 from theano import pp
 from theano import In
 from k2sc.utils import sigma_clip
+
+import warnings
 warnings.filterwarnings("ignore",category =RuntimeWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
+
 '''-----------------------------------------------------------------
 halo_tools.py 
 
