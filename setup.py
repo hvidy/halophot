@@ -14,7 +14,7 @@ setup(name='halophot',
       package_dir={'halophot':'src'},
       scripts=['bin/halo'],
       packages=['halophot'],
-      install_requires=["numpy", "astropy", "scipy","autograd"],
+      install_requires=["numpy", "astropy", "scipy","autograd","k2sc"],
       license='GPLv3',
       classifiers=[
           "Topic :: Scientific/Engineering",
