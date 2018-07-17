@@ -1,4 +1,6 @@
 import numpy as np
+from autograd import numpy as agnp
+from autograd import grad 
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 from astropy.table import Table
@@ -6,10 +8,6 @@ import scipy.optimize as optimize
 import fitsio
 from time import time as clock
 import astropy.table
-import theano
-import theano.tensor as T
-from theano import pp
-from theano import In
 from k2sc.utils import sigma_clip
 
 import warnings
@@ -23,6 +21,12 @@ In this package we include all the functions that are necessary for
 halo photometry in Python.
 
 -----------------------------------------------------------------'''
+
+def softmax(x):
+    '''From https://gist.github.com/stober/1946926'''
+    e_x = agnp.exp(x - agnp.max(x))
+    out = e_x / e_x.sum()
+    return out
 
 # =========================================================================
 # =========================================================================
@@ -192,32 +196,24 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=Fa
 	if w_init is None:
 		w_init = np.ones(npix)/np.float(npix)
 
-	if analytic:
-		w = T.dvector('w')
-		p = T.dmatrix('p')
-		ff = T.dot(T.nnet.softmax(w),p)
-		ffd = T.roll(ff,1)
+	if analytic: 
+		print 'Using Analytic Derivatives'
+		# only use first order, it appears to be strictly better
 
-		if order == 1:
-			diff = T.sum(T.abs_(ff-ffd))/T.mean(ff)
-		elif order == 2:
-			ffd2 = T.roll(ff,-1)
-			diff = T.sum(T.abs_(2*ff-ffd-ffd2))/T.mean(ff)
+		def tv_soft(weights):
+		    flux = agnp.dot(softmax(weights).T,pixelvector)
+		    diff = agnp.sum(agnp.abs(flux[1:] - flux[:-1]))
+		    return diff/agnp.mean(flux)
 
-		gw = T.grad(diff, w)
-		# hw = T.hessian(diff,w)
+		gradient = grad(tv_soft)
 
-		dtv = theano.function([w,In(p,value=pixelvector)],gw)
-		tvf = theano.function([w,In(p,value=pixelvector)],diff)
-		# hesstv = theano.function([w,In(p,value=pixelvector)],hw)
-
-		res = optimize.minimize(tvf, w_init, method='L-BFGS-B', jac=dtv, 
+		res = optimize.minimize(tv_soft, w_init, method='L-BFGS-B', jac=gradient, 
 			options={'disp': False,'maxiter':maxiter})
-		w_best = np.exp(res['x'])/np.sum(np.exp(res['x'])) # softmax
+
+		w_best = softmax(res['x']) # softmax
 
 		lc_first_try = np.dot(w_best.T,pixelvector)
 
-		
 		if sigclip:
 			print('Sigma clipping')
 
@@ -227,12 +223,17 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=Fa
 
 			pixels_masked = pixelvector[:,good]
 
-			dtv2 = theano.function([w,In(p,value=pixels_masked)],gw)
-			tvf2 = theano.function([w,In(p,value=pixels_masked)],diff)
+			def tv_masked(weights):
+			    flux = agnp.dot(softmax(weights).T,pixels_masked)
+			    diff = agnp.sum(agnp.abs(flux[1:] - flux[:-1]))
+			    return diff/agnp.mean(flux)
 
-			res = optimize.minimize(tvf2, w_init, method='L-BFGS-B', jac=dtv2, 
+			gradient_masked = grad(tv_masked)
+
+			res = optimize.minimize(tv_masked, w_init, method='L-BFGS-B', jac=gradient_masked, 
 				options={'disp': False,'maxiter':maxiter})
-			w_best = np.exp(res['x'])/np.sum(np.exp(res['x'])) # softmax
+
+			w_best = softmax(res['x']) # softmax
 		else:
 			pass
 
