@@ -18,9 +18,7 @@ We believe this is of practical use for Kepler targets brighter than  Kp ~ 6.
 
 First install with python setup.py install --user (or whichever other approach you prefer), and add the appropriate paths to your PYTHONPATH. Call halophot either as a library of functions (/src/halo_tools.py) or from the command line as, e.g.
 
-halo ktwo200007768-c04_lpd-targ.fits --data-dir /path/to/data/directory/ --name Atlas -c 4 --do-plot -sub 8
-
-where --sub is the subsampling parameter you would like to use (for science, use 1; for quick tests, it can be useful to run faster with subsampling) and -c is the campaign.
+halo ktwo200007768-c04_lpd-targ.fits --data-dir /path/to/data/directory/ --name Atlas -c 4 --do-plot, where --name is the star name you would like to save the outputs under, and -c is the campaign.
 
 ## License
 
