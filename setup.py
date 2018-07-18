@@ -6,7 +6,7 @@ from setuptools import setup
 long_description = ''
 
 setup(name='halophot',
-      version='0.6.1.2',
+      version='0.6.2',
       description='K2 halo photometry with total variation.',
       long_description=long_description,
       author='Tim White and Benjamin Pope',

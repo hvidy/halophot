@@ -6,6 +6,16 @@
 
 Tim White, Benjamin Pope
 
+## Installation
+
+Simply run
+
+  `pip install halophot`
+
+or else clone this git repo, enter the directory, and run
+
+  `python setup.py install`
+
 ## K2 Halo Photometry
 
 This is code that implements a Total Variation (TV) based regularization for Kepler/K2 photometry of very bright stars. 
