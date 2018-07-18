@@ -349,7 +349,7 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
 	### subsample
 	if consensus:			
 		assert sub>1, "Must be subsampled to use consensus"
-		print('Subsampling by a factor of', sub)
+		print('Subsampling by a factor of %d' % sub)
 
 		weights = np.zeros(pixels.shape[0])
 		opt_lcs = np.zeros((pixels[::sub,:].shape[1],sub))
@@ -372,7 +372,7 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
 
 	else:
 		pixels_sub = pixels[::sub,:]
-		print('Subsampling by a factor of', sub)
+		print('Subsampling by a factor of %d' % sub)
 
 		### now calculate the halo 
 
