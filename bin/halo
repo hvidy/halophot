@@ -176,9 +176,9 @@ if __name__ == '__main__':
 	tv1 = diff_1(opt_lc/np.nanmedian(opt_lc))/float(np.size(opt_lc))
 	tv2 = diff_2(opt_lc/np.nanmedian(opt_lc))/float(np.size(opt_lc))
 
-	print('Total variation per point (first order) %f ' % tv1)
+	print('Total variation per point (first order): %f ' % tv1)
 
-	print('Total variation per point (second order) % f' % tv2)
+	print('Total variation per point (second order): %f' % tv2)
 
 	### save your new light curve!
 
