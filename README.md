@@ -10,11 +10,11 @@ Tim White, Benjamin Pope
 
 Simply run
 
-  `pip install halophot`
+`pip install halophot`
 
 or else clone this git repo, enter the directory, and run
 
-  `python setup.py install`
+`python setup.py install`
 
 ## K2 Halo Photometry
 
