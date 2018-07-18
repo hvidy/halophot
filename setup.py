@@ -6,7 +6,7 @@ from setuptools import setup
 long_description = ''
 
 setup(name='halophot',
-      version='0.6.0',
+      version='0.6.1.2',
       description='K2 halo photometry with total variation.',
       long_description=long_description,
       author='Tim White and Benjamin Pope',
@@ -15,7 +15,7 @@ setup(name='halophot',
       package_dir={'halophot':'src'},
       scripts=['bin/halo'],
       packages=['halophot'],
-      install_requires=["numpy", "astropy", "scipy","autograd"],
+      install_requires=["numpy", "astropy", "scipy","autograd","future==0.16.0"],
       license='GPLv3',
       classifiers=[
           "Topic :: Scientific/Engineering",
