@@ -6,7 +6,7 @@ from setuptools import setup
 long_description = ''
 
 setup(name='halophot',
-      version='0.6.2.2',
+      version='0.6.2.3',
       description='K2 halo photometry with total variation.',
       long_description='A Python package for doing photometry of very bright stars in the Kepler/K2 mission using halo photometry, constructing the light curve as a linear combination of pixels.\
       We minimize total variation (TV) of the final light curve with respect to the weights of the individual pixels using analytic gradient descent.\
@@ -17,7 +17,7 @@ setup(name='halophot',
       package_dir={'halophot':'src'},
       scripts=['bin/halo'],
       packages=['halophot'],
-      install_requires=["numpy", "astropy", "scipy","autograd","future==0.16.0"],
+      install_requires=["numpy","matplotlib","astropy", "scipy","autograd","future==0.16.0"],
       license='GPLv3',
       classifiers=[
           "Topic :: Scientific/Engineering",
