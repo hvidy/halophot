@@ -8,7 +8,6 @@ import scipy.optimize as optimize
 from astropy.io import fits
 from time import time as clock
 import astropy.table
-from k2sc.utils import sigma_clip
 
 import warnings
 warnings.filterwarnings("ignore",category =RuntimeWarning)
@@ -30,6 +29,35 @@ def softmax(x):
 
 # =========================================================================
 # =========================================================================
+
+
+def sigma_clip(a, max_iter=10, max_sigma=5, separate_masks=False, mexc=None):
+    """Iterative sigma-clipping routine that separates not finite points, and down- and upwards outliers.
+
+    from k2sc, authors: Aigrain, Parviainen & Pope
+    """
+    mexc  = isfinite(a) if mexc is None else isfinite(a) & mexc
+    mhigh = ones_like(mexc)
+    mlow  = ones_like(mexc)
+    mask  = ones_like(mexc)
+
+    i, nm = 0, None
+    while (nm != mask.sum()) and (i < max_iter):
+        mask = mexc & mhigh & mlow
+        nm = mask.sum()
+        med, sig = medsig(a[mask])
+        mhigh[mexc] = a[mexc] - med <  max_sigma*sig
+        mlow[mexc]  = a[mexc] - med > -max_sigma*sig
+        i += 1
+
+    if separate_masks:
+        return mlow, mhigh
+    else:
+        return mlow & mhigh
+
+# =========================================================================
+# =========================================================================
+
 
 def print_time(t):
 		if t>3600:
@@ -60,6 +88,9 @@ def read_tpf(fname):
 
 
 	return tpf, ts
+
+# =========================================================================
+# =========================================================================
 
 def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=True):
 	'''Throw away bad pixels and bad cadences'''
@@ -112,8 +143,14 @@ def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=True):
 
 	return pixels,tsd, np.where(indic>60)
 
+# =========================================================================
+# =========================================================================
+
 def get_slice(tpf,ts,start,stop):
 	return tpf[start:stop,:,:], ts[start:stop]
+
+# =========================================================================
+# =========================================================================
 
 def get_annulus(tpf,rmin,rmax):
 	xs, ys = np.arange(tpf.shape[2])-tpf.shape[2]/2.,np.arange(tpf.shape[1])-tpf.shape[1]/2.
@@ -122,6 +159,9 @@ def get_annulus(tpf,rmin,rmax):
 	mask = (rr>rmax) + (rr<rmin)
 	tpf[:,mask] = np.nan
 	return tpf
+
+# =========================================================================
+# =========================================================================
 
 def stitch(tslist):
 	# key idea is to match GP values at the edge
@@ -146,6 +186,8 @@ def diff_1(z):
 def diff_2(z):
 	return np.sum(np.abs(2*z[1:-1]-np.roll(z[1:-1],1)-np.roll(z[1:-1],-1)))
 
+# =========================================================================
+# =========================================================================
 
 def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=False):
 	'''
@@ -280,6 +322,9 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=Fa
 
 	lc_opt = np.dot(w_best.T,pixelvector)
 	return w_best, lc_opt
+
+# =========================================================================
+# =========================================================================
 
 def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
 	thresh=0.8,minflux=100.,consensus=False,analytic=False,sigclip=False):

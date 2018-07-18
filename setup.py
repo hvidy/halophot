@@ -1,20 +1,22 @@
 from numpy.distutils.core import setup, Extension
 from numpy.distutils.misc_util import Configuration
 import distutils.sysconfig as ds
+from setuptools import setup
+l
 
 long_description = ''
 
 setup(name='halophot',
-      version='0.5',
+      version='0.6.0',
       description='K2 halo photometry with total variation.',
       long_description=long_description,
       author='Tim White and Benjamin Pope',
-      author_email='',
-      url='',
+      author_email='benjamin.pope@nyu.edu',
+      url='https://github.com/hvidy/halophot',
       package_dir={'halophot':'src'},
       scripts=['bin/halo'],
       packages=['halophot'],
-      install_requires=["numpy", "astropy", "scipy","autograd","k2sc"],
+      install_requires=["numpy", "astropy", "scipy","autograd"],
       license='GPLv3',
       classifiers=[
           "Topic :: Scientific/Engineering",
