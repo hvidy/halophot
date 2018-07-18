@@ -2,7 +2,6 @@ from numpy.distutils.core import setup, Extension
 from numpy.distutils.misc_util import Configuration
 import distutils.sysconfig as ds
 from setuptools import setup
-l
 
 long_description = ''
 
