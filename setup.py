@@ -6,9 +6,11 @@ from setuptools import setup
 long_description = ''
 
 setup(name='halophot',
-      version='0.6.2',
+      version='0.6.2.2',
       description='K2 halo photometry with total variation.',
-      long_description=long_description,
+      long_description='A Python package for doing photometry of very bright stars in the Kepler/K2 mission using halo photometry, constructing the light curve as a linear combination of pixels.\
+      We minimize total variation (TV) of the final light curve with respect to the weights of the individual pixels using analytic gradient descent.\
+      The full method is documented in our paper at http://arxiv.org/abs/1708.07462.',
       author='Tim White and Benjamin Pope',
       author_email='benjamin.pope@nyu.edu',
       url='https://github.com/hvidy/halophot',
