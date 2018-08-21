@@ -15,6 +15,7 @@ from bottleneck import replace, nanmedian, ss
 from sklearn.cluster import DBSCAN
 from skimage.feature import peak_local_max
 from skimage.morphology import watershed
+import lightkurve
 
 import warnings
 warnings.filterwarnings("ignore",category =RuntimeWarning)
@@ -763,3 +764,91 @@ The cuts for Campaign 4 are
 550:2200
 2200:
 -----------------------------------------------------------------'''
+
+class halo_tpf(lightkurve.KeplerTargetPixelFile):
+    
+    def halo(self, aperture_mask='pipeline',splits=(None,None),sub=1,order=1,
+        maxiter=101,w_init=None,random_init=False,
+        thresh=0.8,minflux=100.,consensus=False,
+        analytic=True,sigclip=False):
+        """Performs 'halo' TV-min weighted-aperture photometry.
+         Parameters
+        ----------
+        aperture_mask : array-like, 'pipeline', or 'all'
+            A boolean array describing the aperture such that `False` means
+            that the pixel will be masked out.
+            If the string 'all' is passed, all pixels will be used.
+            The default behaviour is to use the Kepler pipeline mask.
+         splits : tuple, (None, None) or (2152,2175) etc.
+            A tuple including two times at which to split the light curve and run halo 
+            separately outside these splits.
+         sub : int
+            Do you want to subsample every nth pixel in your light curve? Not advised, 
+            but can come in handy for very large TPFs.
+         order: int
+            Run nth order TV - ie first order is L1 norm on first derivative,
+            second order is L1 norm on second derivative, etc.
+            This is part of the Pock generalized TV scheme, so that
+            1st order gives you piecewise constant functions,
+            2nd order gives you piecewise affine functions, etc. 
+            Currently implemented only up to 2nd order in numerical, 1st in analytic!
+            We recommend first order very strongly.
+         maxiter: int
+            Number of iterations to optimize. 101 is default & usually sufficient.
+         w_init: None or array-like.
+            Initialize weights with a particular weight vector - useful if you have
+            already run TV-min and want to update, but otherwise set to None 
+            and it will have default initialization.
+         random_init: Boolean
+            If False, and w_init is None, it will initialize with uniform weights; if True, it
+            will initialize with random weights. False is usually better.
+         thresh: float
+            A float greater than 0. Pixels less than this fraction of the maximum
+            flux at any pixel will be masked out - this is to deal with saturation.
+            Because halo is usually intended for saturated stars, the default is 0.8, 
+            to deal with saturated pixels. If your star is not saturated, set this 
+            greater than 1.0. 
+         consensus: Boolean
+            If True, this will subsample the pixel space, separately calculate halo time 
+            series for eah set of pixels, and merge these at the end. This is to check
+            for validation, but is typically not useful, and is by default set False.
+         analytic: Boolean
+            If True, it will optimize the TV with autograd analytic derivatives, which is
+            several orders of magnitude faster than with numerical derivatives. This is 
+            by default True but you can run it numerically with False if you prefer.
+         sigclip: Boolean
+            If True, it will iteratively run the TV-min algorithm clipping outliers.
+            Use this for data with a lot of outliers, but by default it is set False.
+         Returns
+        -------
+        lc : KeplerLightCurve object
+            Array containing the TV-min flux within the aperture for each
+            cadence.
+        """
+        aperture_mask = self._parse_aperture_mask(aperture_mask)
+        centroid_col, centroid_row = self.centroids(aperture_mask)
+        x, y = self.hdu[1].data['POS_CORR1'][self.quality_mask], self.hdu[1].data['POS_CORR2'][self.quality_mask]
+        quality = self.quality
+        ts = Table({'time':self.time,
+                    'cadence':self.cadenceno,
+                    'x':x,
+                    'y':y,
+                    'quality':quality})
+        aperture_mask = self._parse_aperture_mask(aperture_mask)
+        self.flux[:,~aperture_mask] = np.nan
+        pf, ts, weights, weightmap, pixels_sub = do_lc(self.flux,
+                    ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
+            thresh=0.8,minflux=100.,consensus=False,analytic=True,sigclip=False)
+        nanmask = np.isfinite(ts['corr_flux'])
+         ### to do! Implement light curve POS_CORR1, POS_CORR2 attributes.
+        return weightmap, lightkurve.KeplerLightCurve(flux=ts['corr_flux'],
+                                time=ts['time'],
+                                flux_err=np.nan*ts['corr_flux'],
+                                centroid_col=ts['x'],
+                                centroid_row=ts['y'],
+                                quality=ts['quality'],
+                                channel=self.channel,
+                                campaign=self.campaign,
+                                quarter=self.quarter,
+                                mission=self.mission,
+                                cadenceno=ts['cadence'])
