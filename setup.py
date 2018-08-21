@@ -33,7 +33,7 @@ setup(name='halophot',
       package_dir={'halophot':'src'},
       scripts=['bin/halo'],
       packages=['halophot'],
-      install_requires=["numpy","matplotlib","astropy", "scipy","autograd","lightkurve","future==0.16.0"],
+      install_requires=["numpy","matplotlib","astropy", "scipy","autograd","lightkurve","bottleneck","statsmodels","sklearn","future==0.16.0"],
       license='GPLv3',
       classifiers=[
           "Topic :: Scientific/Engineering",
