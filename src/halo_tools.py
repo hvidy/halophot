@@ -110,31 +110,37 @@ def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=True):
     # find bad pixels
 
     if do_quality:
-
         m = (ts['quality'] == 0) # get bad quality 
-        dummy = dummy[m,:,:]
-        tsd = tsd[m]
+        # dummy = dummy[m,:,:]
+        # tsd = tsd[m]
+    else:
+    	m = np.ones_like(ts['quality'])
 
-    dummy[dummy<0] = 0 # just as a check!
+    dummy[m,:,:][dummy[m,:,:]<0] = 0 # just as a check!
 
-    saturated = np.nanmax(dummy,axis=0) > (thresh*maxflux)
+    saturated = np.nanmax(dummy[m,:,:],axis=0) > (thresh*maxflux)
+    print('%d saturated pixels' % np.sum(saturated))
     dummy[:,saturated] = np.nan 
     print('%d saturated pixels' %  np.sum(saturated))
 
-    no_flux = np.nanmin(dummy,axis=0) < minflux
+    no_flux = np.nanmin(dummy[m,:,:],axis=0) < minflux
     dummy[:,no_flux] = np.nan
     
-    xc, yc = np.nanmedian(ts['x']), np.nanmedian(ts['y'])
+    xc, yc = np.nanmedian(ts['x'][m]), np.nanmedian(ts['y'][m])
 
-    if np.sum(np.isfinite(ts['x']))>=0.8*tsd['x'].shape[0]:
-        rr = np.sqrt((tsd['x']-xc)**2 + (tsd['y']-yc)**2)
-        goodpos = (rr<5) * np.isfinite(tsd['x']) * np.isfinite(tsd['y'])
-        dummy = dummy[goodpos,:,:] # some campaigns have a few extremely bad cadences
-        print('Threw out %d bad cadences' % sum(~goodpos))
+
+    if np.sum(np.isfinite(ts['x']))>=0.8*tsd['x'][m].shape[0]:
+        rr = np.sqrt((tsd['x'][m]-xc)**2 + (tsd['y'][m]-yc)**2)
+        goodpos = (rr<5) * np.isfinite(tsd['x'][m]) * np.isfinite(tsd['y'][m])
+        m[m][~goodpos] = 0
+        if np.sum(~goodpos)>0:
+        	print('Throwing out %d bad cadences' % np.sum(~goodpos))
+        # dummy = dummy[goodpos,:,:] # some campaigns have a few extremely bad cadences
+        # tsd = tsd[goodpos]
 
     # then pick only pixels which are mostly good
 
-    pixels = np.reshape(dummy.T,((tpf.shape[1]*tpf.shape[2]),dummy.shape[0]))
+    pixels = np.reshape(dummy[m,:,:].T,((tpf.shape[1]*tpf.shape[2]),dummy[m,:,:].shape[0]))
     indic = np.array([np.sum(np.isfinite(pixels[j,:])) 
         for j in range(pixels.shape[0])])
     pixels = pixels[indic>60,:]
@@ -145,14 +151,15 @@ def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=True):
 
     # pixels = pixels[:,indic_cad>200]
     # ts = ts[indic_cad>200]
-    tsd = tsd[np.all(np.isfinite(pixels),axis=0)]
+    m[m][~np.all(np.isfinite(pixels),axis=0)] = 0
+    tsd = ts[m]
     pixels = pixels[:,np.all(np.isfinite(pixels),axis=0)]
+
     # this should get all the nans but if not just set them to 0
 
     pixels[~np.isfinite(pixels)] = 0
 
-
-    return pixels,tsd, np.where(indic>60)
+    return pixels, tsd, m, np.where(indic>60)
 
 # =========================================================================
 # =========================================================================
@@ -353,7 +360,7 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
 
     ### now throw away saturated columns, nan pixels and nan cadences
 
-    pixels, ts, mapping = censor_tpf(tpf,ts,thresh=thresh,minflux=minflux)
+    pixels, tsd, goodcad, mapping = censor_tpf(tpf,ts,thresh=thresh,minflux=minflux)
     pixelmap = np.zeros((tpf.shape[2],tpf.shape[1]))
     print('Censored TPF')
 
@@ -397,7 +404,8 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
         print('Calculated weights!')
 
     # opt_lc = np.dot(weights.T,pixels_sub)
-    ts['corr_flux'] = opt_lc
+    ts['corr_flux'] = np.nan*np.ones_like(ts['x'])
+    ts['corr_flux'][goodcad] = opt_lc
 
     if sub == 1:
         pixelmap.ravel()[mapping] = weights
@@ -840,11 +848,11 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
         aperture_mask = self._parse_aperture_mask(aperture_mask)
         self.flux[:,~aperture_mask] = np.nan
         pf, ts, weights, weightmap, pixels_sub = do_lc(self.flux,
-                    ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
-            thresh=0.8,minflux=100.,consensus=False,analytic=True,sigclip=False)
+                    ts,splits,sub,order,maxiter=101,w_init=w_init,random_init=random_init,
+            thresh=thresh,minflux=minflux,consensus=consensus,analytic=analytic,sigclip=sigclip)
         nanmask = np.isfinite(ts['corr_flux'])
          ### to do! Implement light curve POS_CORR1, POS_CORR2 attributes.
-        return weightmap, lightkurve.KeplerLightCurve(flux=ts['corr_flux'],
+        lc_out = lightkurve.KeplerLightCurve(flux=ts['corr_flux'],
                                 time=ts['time'],
                                 flux_err=np.nan*ts['corr_flux'],
                                 centroid_col=ts['x'],
@@ -855,3 +863,8 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
                                 quarter=self.quarter,
                                 mission=self.mission,
                                 cadenceno=ts['cadence'])
+        lc_out.pos_corr1 = self.pos_corr1
+        lc_out.pos_corr2 = self.pos_corr2
+        lc_out.primary_header = self.hdu[0].header
+        lc_out.data_header = self.hdu[1].header
+        return weightmap, lc_out
