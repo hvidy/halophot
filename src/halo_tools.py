@@ -113,6 +113,8 @@ def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=True):
         m = (ts['quality'] == 0) # get bad quality 
         # dummy = dummy[m,:,:]
         # tsd = tsd[m]
+    else:
+    	m = np.ones_like(ts['quality'])
 
     dummy[m,:,:][dummy[m,:,:]<0] = 0 # just as a check!
 
@@ -127,7 +129,7 @@ def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=True):
     if np.sum(np.isfinite(ts['x']))>=0.8*tsd['x'][m].shape[0]:
         rr = np.sqrt((tsd['x'][m]-xc)**2 + (tsd['y'][m]-yc)**2)
         goodpos = (rr<5) * np.isfinite(tsd['x'][m]) * np.isfinite(tsd['y'][m])
-        m[m][goodpos] = 0
+        m[m][~goodpos] = 0
         # dummy = dummy[goodpos,:,:] # some campaigns have a few extremely bad cadences
         # tsd = tsd[goodpos]
 
@@ -143,7 +145,7 @@ def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=True):
 
     # pixels = pixels[:,indic_cad>200]
     # ts = ts[indic_cad>200]
-    m[m][np.all(np.isfinite(pixels),axis=0)] = 0
+    m[m][~np.all(np.isfinite(pixels),axis=0)] = 0
     tsd = ts[m]
     pixels = pixels[:,np.all(np.isfinite(pixels),axis=0)]
     # this should get all the nans but if not just set them to 0
@@ -840,8 +842,9 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
         aperture_mask = self._parse_aperture_mask(aperture_mask)
         self.flux[:,~aperture_mask] = np.nan
         pf, ts, weights, weightmap, pixels_sub = do_lc(self.flux,
-                    ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
-            thresh=0.8,minflux=100.,consensus=False,analytic=True,sigclip=False)
+                    ts,splits,sub,order,maxiter=101,w_init=w_init,random_init=random_init,
+            thresh=thresh,minflux=minflux,consensus=consensus,analytic=analytic,sigclip=sigclip,
+            order=order)
         nanmask = np.isfinite(ts['corr_flux'])
          ### to do! Implement light curve POS_CORR1, POS_CORR2 attributes.
         return weightmap, lightkurve.KeplerLightCurve(flux=ts['corr_flux'],
