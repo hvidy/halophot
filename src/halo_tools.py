@@ -130,7 +130,8 @@ def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=True):
         rr = np.sqrt((tsd['x'][m]-xc)**2 + (tsd['y'][m]-yc)**2)
         goodpos = (rr<5) * np.isfinite(tsd['x'][m]) * np.isfinite(tsd['y'][m])
         m[m][~goodpos] = 0
-        print('Throwing out',np.sum(~goodpos),'bad cadences')
+        if np.sum(~goodpos)>0:
+        	print('Throwing out %d bad cadences' % np.sum(~goodpos))
         # dummy = dummy[goodpos,:,:] # some campaigns have a few extremely bad cadences
         # tsd = tsd[goodpos]
 
@@ -149,6 +150,7 @@ def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=True):
     m[m][~np.all(np.isfinite(pixels),axis=0)] = 0
     tsd = ts[m]
     pixels = pixels[:,np.all(np.isfinite(pixels),axis=0)]
+
     # this should get all the nans but if not just set them to 0
 
     pixels[~np.isfinite(pixels)] = 0
