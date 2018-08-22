@@ -110,29 +110,30 @@ def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=True):
     # find bad pixels
 
     if do_quality:
-
         m = (ts['quality'] == 0) # get bad quality 
-        dummy = dummy[m,:,:]
-        tsd = tsd[m]
+        # dummy = dummy[m,:,:]
+        # tsd = tsd[m]
 
-    dummy[dummy<0] = 0 # just as a check!
+    dummy[m,:,:][dummy[m,:,:]<0] = 0 # just as a check!
 
-    saturated = np.nanmax(dummy,axis=0) > (thresh*maxflux)
-    dummy[:,saturated] = np.nan 
+    saturated = np.nanmax(dummy[m,:,:],axis=0) > (thresh*maxflux)
+    dummy[m,:,:][:,saturated] = np.nan 
 
-    no_flux = np.nanmin(dummy,axis=0) < minflux
-    dummy[:,no_flux] = np.nan
+    no_flux = np.nanmin(dummy[m,:,:],axis=0) < minflux
+    dummy[m,:,:][:,no_flux] = np.nan
     
-    xc, yc = np.nanmedian(ts['x']), np.nanmedian(ts['y'])
+    xc, yc = np.nanmedian(ts['x'][m]), np.nanmedian(ts['y'][m])
 
-    if np.sum(np.isfinite(ts['x']))>=0.8*tsd['x'].shape[0]:
-        rr = np.sqrt((tsd['x']-xc)**2 + (tsd['y']-yc)**2)
-        goodpos = (rr<5) * np.isfinite(tsd['x']) * np.isfinite(tsd['y'])
-        dummy = dummy[goodpos,:,:] # some campaigns have a few extremely bad cadences
+    if np.sum(np.isfinite(ts['x']))>=0.8*tsd['x'][m].shape[0]:
+        rr = np.sqrt((tsd['x'][m]-xc)**2 + (tsd['y'][m]-yc)**2)
+        goodpos = (rr<5) * np.isfinite(tsd['x'][m]) * np.isfinite(tsd['y'][m])
+        m[m][goodpos] = 0
+        # dummy = dummy[goodpos,:,:] # some campaigns have a few extremely bad cadences
+        # tsd = tsd[goodpos]
 
     # then pick only pixels which are mostly good
 
-    pixels = np.reshape(dummy.T,((tpf.shape[1]*tpf.shape[2]),dummy.shape[0]))
+    pixels = np.reshape(dummy[m,:,:].T,((tpf.shape[1]*tpf.shape[2]),dummy[m,:,:].shape[0]))
     indic = np.array([np.sum(np.isfinite(pixels[j,:])) 
         for j in range(pixels.shape[0])])
     pixels = pixels[indic>60,:]
@@ -142,14 +143,15 @@ def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=True):
 
     # pixels = pixels[:,indic_cad>200]
     # ts = ts[indic_cad>200]
-    tsd = tsd[np.all(np.isfinite(pixels),axis=0)]
+    m[m][np.all(np.isfinite(pixels),axis=0)] = 0
+    tsd = ts[m]
     pixels = pixels[:,np.all(np.isfinite(pixels),axis=0)]
     # this should get all the nans but if not just set them to 0
 
     pixels[~np.isfinite(pixels)] = 0
 
 
-    return pixels,tsd, np.where(indic>60)
+    return pixels, tsd, m, np.where(indic>60)
 
 # =========================================================================
 # =========================================================================
@@ -350,7 +352,7 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
 
     ### now throw away saturated columns, nan pixels and nan cadences
 
-    pixels, ts, mapping = censor_tpf(tpf,ts,thresh=thresh,minflux=minflux)
+    pixels, tsd, goodcad, mapping = censor_tpf(tpf,ts,thresh=thresh,minflux=minflux)
     pixelmap = np.zeros((tpf.shape[2],tpf.shape[1]))
     print('Censored TPF')
 
@@ -394,7 +396,8 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
         print('Calculated weights!')
 
     # opt_lc = np.dot(weights.T,pixels_sub)
-    ts['corr_flux'] = opt_lc
+    ts['corr_flux'] = np.nan*np.ones_like(ts['x'])
+    ts['corr_flux'][goodcad] = opt_lc
 
     if sub == 1:
         pixelmap.ravel()[mapping] = weights
