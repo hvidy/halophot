@@ -120,10 +120,10 @@ def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=True):
 
     saturated = np.nanmax(dummy[m,:,:],axis=0) > (thresh*maxflux)
     print('%d saturated pixels' % np.sum(saturated))
-    dummy[m,:,:][:,saturated] = np.nan 
+    dummy[:,saturated] = np.nan 
 
     no_flux = np.nanmin(dummy[m,:,:],axis=0) < minflux
-    dummy[m,:,:][:,no_flux] = np.nan
+    dummy[:,no_flux] = np.nan
     
     xc, yc = np.nanmedian(ts['x'][m]), np.nanmedian(ts['y'][m])
 
@@ -851,7 +851,7 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
             thresh=thresh,minflux=minflux,consensus=consensus,analytic=analytic,sigclip=sigclip)
         nanmask = np.isfinite(ts['corr_flux'])
          ### to do! Implement light curve POS_CORR1, POS_CORR2 attributes.
-        return weightmap, lightkurve.KeplerLightCurve(flux=ts['corr_flux'],
+        lc_out = lightkurve.KeplerLightCurve(flux=ts['corr_flux'],
                                 time=ts['time'],
                                 flux_err=np.nan*ts['corr_flux'],
                                 centroid_col=ts['x'],
@@ -862,3 +862,6 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
                                 quarter=self.quarter,
                                 mission=self.mission,
                                 cadenceno=ts['cadence'])
+        lc_out.pos_corr1 = self.pos_corr1
+        lc_out.pos_corr2 = self.pos_corr2
+        return weightmap, lc_out
