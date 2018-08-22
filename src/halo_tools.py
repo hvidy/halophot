@@ -129,6 +129,7 @@ def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=True):
         rr = np.sqrt((tsd['x']-xc)**2 + (tsd['y']-yc)**2)
         goodpos = (rr<5) * np.isfinite(tsd['x']) * np.isfinite(tsd['y'])
         dummy = dummy[goodpos,:,:] # some campaigns have a few extremely bad cadences
+        print('Threw out %d bad cadences' % sum(~goodpos))
 
     # then pick only pixels which are mostly good
 
