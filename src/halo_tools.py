@@ -119,6 +119,7 @@ def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=True):
 
     saturated = np.nanmax(dummy,axis=0) > (thresh*maxflux)
     dummy[:,saturated] = np.nan 
+    print('%d saturated pixels' %  np.sum(saturated))
 
     no_flux = np.nanmin(dummy,axis=0) < minflux
     dummy[:,no_flux] = np.nan
