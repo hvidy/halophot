@@ -121,7 +121,6 @@ def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=True):
     saturated = np.nanmax(dummy[m,:,:],axis=0) > (thresh*maxflux)
     print('%d saturated pixels' % np.sum(saturated))
     dummy[:,saturated] = np.nan 
-    print('%d saturated pixels' %  np.sum(saturated))
 
     no_flux = np.nanmin(dummy[m,:,:],axis=0) < minflux
     dummy[:,no_flux] = np.nan
@@ -144,7 +143,6 @@ def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=True):
     indic = np.array([np.sum(np.isfinite(pixels[j,:])) 
         for j in range(pixels.shape[0])])
     pixels = pixels[indic>60,:]
-    print(pixels.shape)
 
     # indic_cad = np.array([np.sum(np.isfinite(pixels[:,j])) 
     #   for j in range(pixels.shape[1])])
