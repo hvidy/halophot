@@ -142,7 +142,6 @@ def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=True):
     indic = np.array([np.sum(np.isfinite(pixels[j,:])) 
         for j in range(pixels.shape[0])])
     pixels = pixels[indic>60,:]
-    print(pixels.shape)
 
     # indic_cad = np.array([np.sum(np.isfinite(pixels[:,j])) 
     #   for j in range(pixels.shape[1])])
@@ -156,7 +155,6 @@ def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=True):
     # this should get all the nans but if not just set them to 0
 
     pixels[~np.isfinite(pixels)] = 0
-
 
     return pixels, tsd, m, np.where(indic>60)
 
@@ -864,4 +862,6 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
                                 cadenceno=ts['cadence'])
         lc_out.pos_corr1 = self.pos_corr1
         lc_out.pos_corr2 = self.pos_corr2
+        lc_out.primary_header = self.hdu[0].header
+        lc_out.data_header = self.hdu[1].header
         return weightmap, lc_out
