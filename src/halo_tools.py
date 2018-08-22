@@ -130,6 +130,7 @@ def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=True):
         rr = np.sqrt((tsd['x'][m]-xc)**2 + (tsd['y'][m]-yc)**2)
         goodpos = (rr<5) * np.isfinite(tsd['x'][m]) * np.isfinite(tsd['y'][m])
         m[m][~goodpos] = 0
+        print('Throwing out',np.sum(~goodpos),'bad cadences')
         # dummy = dummy[goodpos,:,:] # some campaigns have a few extremely bad cadences
         # tsd = tsd[goodpos]
 
@@ -843,8 +844,7 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
         self.flux[:,~aperture_mask] = np.nan
         pf, ts, weights, weightmap, pixels_sub = do_lc(self.flux,
                     ts,splits,sub,order,maxiter=101,w_init=w_init,random_init=random_init,
-            thresh=thresh,minflux=minflux,consensus=consensus,analytic=analytic,sigclip=sigclip,
-            order=order)
+            thresh=thresh,minflux=minflux,consensus=consensus,analytic=analytic,sigclip=sigclip)
         nanmask = np.isfinite(ts['corr_flux'])
          ### to do! Implement light curve POS_CORR1, POS_CORR2 attributes.
         return weightmap, lightkurve.KeplerLightCurve(flux=ts['corr_flux'],
