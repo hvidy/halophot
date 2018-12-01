@@ -835,7 +835,7 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
             cadence.
         """
         aperture_mask = self._parse_aperture_mask(aperture_mask)
-        centroid_col, centroid_row = self.centroids(aperture_mask)
+        centroid_col, centroid_row = self.centroids()
         x, y = self.hdu[1].data['POS_CORR1'][self.quality_mask], self.hdu[1].data['POS_CORR2'][self.quality_mask]
         quality = self.quality
         ts = Table({'time':self.time,
