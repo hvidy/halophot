@@ -779,7 +779,7 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
     def halo(self, aperture_mask='pipeline',splits=(None,None),sub=1,order=1,
         maxiter=101,w_init=None,random_init=False,
         thresh=0.8,minflux=100.,consensus=False,
-        analytic=True,sigclip=False):
+        analytic=True,sigclip=False,mask=None):
         """Performs 'halo' TV-min weighted-aperture photometry.
          Parameters
         ----------
@@ -834,7 +834,12 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
             Array containing the TV-min flux within the aperture for each
             cadence.
         """
-        aperture_mask = self._parse_aperture_mask(aperture_mask)
+
+        if mask is None:
+            aperture_mask = self._parse_aperture_mask(aperture_mask)
+        else:
+            aperture_mask = mask
+
         centroid_col, centroid_row = self.centroids()
         x, y = self.hdu[1].data['POS_CORR1'][self.quality_mask], self.hdu[1].data['POS_CORR2'][self.quality_mask]
         quality = self.quality
@@ -843,9 +848,11 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
                     'x':x,
                     'y':y,
                     'quality':quality})
-        aperture_mask = self._parse_aperture_mask(aperture_mask)
-        self.flux[:,~aperture_mask] = np.nan
-        pf, ts, weights, weightmap, pixels_sub = do_lc(self.flux,
+
+        flux = np.copy(self.flux)
+
+        flux[:,~aperture_mask] = np.nan
+        pf, ts, weights, weightmap, pixels_sub = do_lc(flux,
                     ts,splits,sub,order,maxiter=101,w_init=w_init,random_init=random_init,
             thresh=thresh,minflux=minflux,consensus=consensus,analytic=analytic,sigclip=sigclip)
         nanmask = np.isfinite(ts['corr_flux'])
