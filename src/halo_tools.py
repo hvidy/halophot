@@ -100,7 +100,7 @@ def read_tpf(fname):
 # =========================================================================
 # =========================================================================
 
-def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=True):
+def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True):
     '''Throw away bad pixels and bad cadences'''
 
     dummy = tpf.copy()
@@ -118,9 +118,13 @@ def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=True):
 
     dummy[m,:,:][dummy[m,:,:]<0] = 0 # just as a check!
 
-    saturated = np.nanmax(dummy[m,:,:],axis=0) > (thresh*maxflux)
-    print('%d saturated pixels' % np.sum(saturated))
-    dummy[:,saturated] = np.nan 
+    if thresh > 0:
+        saturated = np.unravel_index((-np.nanmax(dummy[m,:,:],axis=0)).argsort(axis=None)[:thresh],np.nanmax(dummy[m,:,:],axis=0).shape)
+        # saturated=(flx_ord[0][-thresh:],flx_ord[1][-thresh:])
+        dummy[:,saturated[0],saturated[1]] = np.nan 
+        print('%d saturated pixels' % np.sum(saturated[0].shape))
+
+    # saturated = np.nanmax(dummy[m,:,:],axis=0) > thresh
 
     no_flux = np.nanmin(dummy[m,:,:],axis=0) < minflux
     dummy[:,no_flux] = np.nan
@@ -343,7 +347,7 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=Fa
 # =========================================================================
 
 def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
-    thresh=0.8,minflux=100.,consensus=False,analytic=False,sigclip=False):
+    thresh=-1.,minflux=-100.,consensus=False,analytic=False,sigclip=False):
     ### get a slice corresponding to the splits you want
     if splits[0] is None and splits[1] is not None:
         print('Taking cadences from beginning to',splits[1])
@@ -774,11 +778,11 @@ The cuts for Campaign 4 are
 2200:
 -----------------------------------------------------------------'''
 
-class halo_tpf(lightkurve.KeplerTargetPixelFile):
+class halo_tpf(lightkurve.TessTargetPixelFile):
     
-    def halo(self, aperture_mask='pipeline',splits=(None,None),sub=1,order=1,
-        maxiter=101,w_init=None,random_init=False,
-        thresh=0.8,minflux=100.,consensus=False,
+    def halo(self, aperture_mask='all',splits=(None,None),sub=1,order=1,
+        maxiter=101,w_init=None,random_init=False,mask=None,
+        thresh=-1,minflux=-100.,consensus=False,
         analytic=True,sigclip=False):
         """Performs 'halo' TV-min weighted-aperture photometry.
          Parameters
@@ -834,8 +838,12 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
             Array containing the TV-min flux within the aperture for each
             cadence.
         """
-        aperture_mask = self._parse_aperture_mask(aperture_mask)
-        centroid_col, centroid_row = self.centroids()
+        # if mask == None:
+        #     aperture_mask = self._parse_aperture_mask(aperture_mask)
+        # else:
+        #     aperture_mask = mask
+        #aperture_mask = self._parse_aperture_mask(aperture_mask)
+        centroid_col, centroid_row = self.estimate_centroids()
         x, y = self.hdu[1].data['POS_CORR1'][self.quality_mask], self.hdu[1].data['POS_CORR2'][self.quality_mask]
         quality = self.quality
         ts = Table({'time':self.time,
@@ -843,23 +851,28 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
                     'x':x,
                     'y':y,
                     'quality':quality})
-        aperture_mask = self._parse_aperture_mask(aperture_mask)
-        self.flux[:,~aperture_mask] = np.nan
-        pf, ts, weights, weightmap, pixels_sub = do_lc(self.flux,
+        # aperture_mask = mask
+        flx = self.flux
+        flx[:,~mask] = np.nan
+
+        pf, ts, weights, weightmap, pixels_sub = do_lc(flx,
                     ts,splits,sub,order,maxiter=101,w_init=w_init,random_init=random_init,
             thresh=thresh,minflux=minflux,consensus=consensus,analytic=analytic,sigclip=sigclip)
         nanmask = np.isfinite(ts['corr_flux'])
          ### to do! Implement light curve POS_CORR1, POS_CORR2 attributes.
-        lc_out = lightkurve.KeplerLightCurve(flux=ts['corr_flux'],
+        lc_out = lightkurve.TessLightCurve(flux=ts['corr_flux'],
                                 time=ts['time'],
                                 flux_err=np.nan*ts['corr_flux'],
                                 centroid_col=ts['x'],
                                 centroid_row=ts['y'],
                                 quality=ts['quality'],
-                                channel=self.channel,
-                                campaign=self.campaign,
-                                quarter=self.quarter,
-                                mission=self.mission,
+                                # channel=self.channel,
+                                # campaign=self.campaign,
+                                # quarter=self.quarter,
+                                targetid=self.targetid,
+                                ccd = self.ccd,
+                                sector=self.sector,
+                                # mission=self.mission,
                                 cadenceno=ts['cadence'])
         lc_out.pos_corr1 = self.pos_corr1
         lc_out.pos_corr2 = self.pos_corr2
