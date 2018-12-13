@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import matplotlib as mpl
 from astropy.table import Table
 import scipy.optimize as optimize
+from scipy.signal import savgol_filter
 from scipy import stats, ndimage
 from astropy.io import fits
 from time import time as clock
@@ -123,6 +124,44 @@ def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True):
         # saturated=(flx_ord[0][-thresh:],flx_ord[1][-thresh:])
         dummy[:,saturated[0],saturated[1]] = np.nan 
         print('%d saturated pixels' % np.sum(saturated[0].shape))
+
+    # automatic saturation threshold
+    if thresh < 0:
+        nstart = max(0,np.sum(np.nanmax(dummy[m,:,:],axis=0) > 7e4) - 20)
+        nfinish = np.sum(np.nanmax(dummy[m,:,:],axis=0) > 5e4)
+        print('Searching for number of saturated pixels to cut between %d and %d' % (nstart,nfinish))
+        stds=[]
+        threshs=np.arange(nstart,nfinish)
+        for thr in threshs:
+            pf, ts, weights, weightmap, pixels_sub = do_lc(dummy,tsd,(None,None),1,2,maxiter=101,w_init=None,random_init=False,
+            thresh=thr,minflux=-100,consensus=False,analytic=True,sigclip=False)
+            fl=ts['corr_flux']
+            fs=fl[~np.isnan(fl)]/np.nanmedian(fl)
+            sfs=savgol_filter(fs,(np.floor(len(fs)/2)*2-1).astype(int),1)
+            stds.append(np.std(fs/sfs))
+        d1 = np.r_[0,stds[1:]-stds[:-1]]
+        d2 = np.r_[0,stds[2:]-2*stds[1:-1]+stds[:-2],0]
+        i1=[]
+        cut=4
+        while len(i1) == 0:
+            ind = (stds > cut*stds[0]) & (d1 > 0) & np.r_[True, d2[1:] < d2[:-1]] & np.r_[d2[:-1] < d2[1:], True] & (d2 < 0)
+            i1=np.arange(len(ind))[ind]
+            cut -= 1
+
+        if len(i1) > 3: i1=i1[i1.argsort(axis=None)][0:3]
+
+        if threshs[i1[np.argmax(d1[i1])]] == threshs[i1[np.argmin(d2[i1])]]: 
+            pix=threshs[i1[np.argmax(d1[i1])]]
+        else: 
+            p1 = i1[np.argmax(d1[i1])]
+            p2 = i1[np.argmin(d2[i1])]
+            if abs(d1[p1]-d1[p2]) > abs(d2[p1]-d2[p2]):
+                pix=threshs[p1]
+            else:
+                pix=threshs[p2]
+        print('Finished optimization: %d saturated pixels' % pix)
+        saturated = np.unravel_index((-np.nanmax(dummy[m,:,:],axis=0)).argsort(axis=None)[:pix],np.nanmax(dummy[m,:,:],axis=0).shape)
+        dummy[:,saturated[0],saturated[1]] = np.nan 
 
     # saturated = np.nanmax(dummy[m,:,:],axis=0) > thresh
 
