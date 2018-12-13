@@ -137,8 +137,9 @@ def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True):
             thresh=thr,minflux=-100,consensus=False,analytic=True,sigclip=False)
             fl=ts['corr_flux']
             fs=fl[~np.isnan(fl)]/np.nanmedian(fl)
-            sfs=savgol_filter(fs,(np.floor(len(fs)/2)*2-1).astype(int),1)
+            sfs=savgol_filter(fs,(np.floor(len(fs)/8)*2-1).astype(int),1)
             stds.append(np.std(fs/sfs))
+        stds=np.asarray(stds)
         d1 = np.r_[0,stds[1:]-stds[:-1]]
         d2 = np.r_[0,stds[2:]-2*stds[1:-1]+stds[:-2],0]
         i1=[]
