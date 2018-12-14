@@ -831,26 +831,12 @@ The cuts for Campaign 4 are
 
 class halo_tpf(lightkurve.TessTargetPixelFile):
     
-<<<<<<< HEAD
-<<<<<<< HEAD
-    def halo(self, aperture_mask='all',splits=(None,None),sub=1,order=1,
-        maxiter=101,w_init=None,random_init=False,mask=None,
-        thresh=-1,minflux=-100.,consensus=False,
-        analytic=True,sigclip=False):
-=======
-=======
->>>>>>> afc8a17a34123e292eaa000d84c16f1ba7c7c984
     def halo(self, aperture_mask='pipeline',split_times=None,sub=1,order=1,
         maxiter=101,w_init=None,random_init=False,
         thresh=-1,minflux=-100.,consensus=False,
         analytic=True,sigclip=False,mask=None):
-<<<<<<< HEAD
->>>>>>> master
-        """Performs 'halo' TV-min weighted-aperture photometry.
-=======
 
     """Performs 'halo' TV-min weighted-aperture photometry.
->>>>>>> afc8a17a34123e292eaa000d84c16f1ba7c7c984
          Parameters
         ----------
         aperture_mask : array-like, 'pipeline', or 'all'
@@ -904,30 +890,14 @@ class halo_tpf(lightkurve.TessTargetPixelFile):
             Array containing the TV-min flux within the aperture for each
             cadence.
         """
-<<<<<<< HEAD
-<<<<<<< HEAD
-        # if mask == None:
-        #     aperture_mask = self._parse_aperture_mask(aperture_mask)
-        # else:
-        #     aperture_mask = mask
-        #aperture_mask = self._parse_aperture_mask(aperture_mask)
-        centroid_col, centroid_row = self.estimate_centroids()
-=======
-
-=======
     
->>>>>>> afc8a17a34123e292eaa000d84c16f1ba7c7c984
         if mask is None:
             aperture_mask = self._parse_aperture_mask(aperture_mask)
         else:
             aperture_mask = mask
 
         centroid_col, centroid_row = self.centroids()
-<<<<<<< HEAD
->>>>>>> master
-=======
 
->>>>>>> afc8a17a34123e292eaa000d84c16f1ba7c7c984
         x, y = self.hdu[1].data['POS_CORR1'][self.quality_mask], self.hdu[1].data['POS_CORR2'][self.quality_mask]
         quality = self.quality
         ts = Table({'time':self.time,
@@ -935,20 +905,8 @@ class halo_tpf(lightkurve.TessTargetPixelFile):
                     'x':x,
                     'y':y,
                     'quality':quality})
-<<<<<<< HEAD
-<<<<<<< HEAD
-        # aperture_mask = mask
-        flx = self.flux
-        flx[:,~mask] = np.nan
-
-        pf, ts, weights, weightmap, pixels_sub = do_lc(flx,
-                    ts,splits,sub,order,maxiter=101,w_init=w_init,random_init=random_init,
-            thresh=thresh,minflux=minflux,consensus=consensus,analytic=analytic,sigclip=sigclip)
-=======
-=======
 
         
->>>>>>> afc8a17a34123e292eaa000d84c16f1ba7c7c984
 
         flux = np.copy(self.flux)
 
@@ -972,11 +930,7 @@ class halo_tpf(lightkurve.TessTargetPixelFile):
             pf, ts, weights, weightmap, pixels_sub = do_lc(flux,
                         ts,(None,None),sub,order,maxiter=101,w_init=w_init,random_init=random_init,
                 thresh=thresh,minflux=minflux,consensus=consensus,analytic=analytic,sigclip=sigclip)
-<<<<<<< HEAD
->>>>>>> master
-=======
 
->>>>>>> afc8a17a34123e292eaa000d84c16f1ba7c7c984
         nanmask = np.isfinite(ts['corr_flux'])
          ### to do! Implement light curve POS_CORR1, POS_CORR2 attributes.
         lc_out = lightkurve.TessLightCurve(flux=ts['corr_flux'],
