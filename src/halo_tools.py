@@ -406,86 +406,105 @@ def print_flex(splits):
 # =========================================================================
 
 
-def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
+def do_lc(tpf,ts,splits,sub,order,maxiter=101,split_times=None,w_init=None,random_init=False,
     thresh=-1.,minflux=-100.,consensus=False,analytic=False,sigclip=False,verbose=True):
     ### get a slice corresponding to the splits you want
-    if verbose:
-        if splits[0] is None and splits[1] is not None:
-            print('Taking cadences from beginning to',splits[1])
-        elif splits[0] is not None and splits[1] is None:
-            print('Taking cadences from', splits[0],'to end')
-        elif splits[0] is None and splits[1] is None:
-            print('Taking cadences from beginning to end')
-        else:
-            print('Taking cadences from', splits[0],'to',splits[1])
 
-    tpf, ts = get_slice(tpf,ts,splits[0],splits[1])
+    if split_times is not None:
+        assert(np.min(split_times)>np.min(ts['time'])), "Minimum time split must be during campaign"
+        splits = [np.min(np.where(ts['time']>split)) for split in split_times]
+        all_splits = [None,*splits,None]
+        tss = []
+        
+        for j, low in enumerate(all_splits[:-1]):
+            high = all_splits[j+1]
+            pff, tsj, weights, pixelmap, pixels_sub = do_lc(tpf,
+                        ts,(low,high),sub,order,maxiter=101,split_times=None,w_init=w_init,random_init=random_init,
+                thresh=thresh,minflux=minflux,consensus=consensus,analytic=analytic,sigclip=sigclip,verbose=verbose)
+            tss.append(tsj)
+        ts = stitch(tss)
+        
+    else:
+        # pf, ts, weights, weightmap, pixels_sub = do_lc(flux,
+        #             ts,(None,None),sub,order,maxiter=101,split_times=None,w_init=w_init,random_init=random_init,
+        #     thresh=thresh,minflux=minflux,consensus=consensus,analytic=analytic,sigclip=sigclip,verbose=verbose)
 
-    ### now throw away saturated columns, nan pixels and nan cadences
-
-    pixels, tsd, goodcad, mapping = censor_tpf(tpf,ts,thresh=thresh,minflux=minflux,verbose=verbose)
-    pixelmap = np.zeros((tpf.shape[2],tpf.shape[1]))
-    if verbose:
-        print('Censored TPF')
-
-    ### subsample
-    if consensus:           
-        assert sub>1, "Must be subsampled to use consensus"
         if verbose:
-            print('Subsampling by a factor of %d' % sub)
+            if splits[0] is None and splits[1] is not None:
+                print('Taking cadences from beginning to',splits[1])
+            elif splits[0] is not None and splits[1] is None:
+                print('Taking cadences from', splits[0],'to end')
+            elif splits[0] is None and splits[1] is None:
+                print('Taking cadences from beginning to end')
+            else:
+                print('Taking cadences from', splits[0],'to',splits[1])
 
-        weights = np.zeros(pixels.shape[0])
-        opt_lcs = np.zeros((pixels[::sub,:].shape[1],sub))
+        tpf, ts = get_slice(tpf,ts,splits[0],splits[1])
 
-        if random_init:
-            w_init = np.random.rand(pixels[::sub,:].shape[0])
-            w_init /= np.sum(w_init)
+        ### now throw away saturated columns, nan pixels and nan cadences
 
-        for j in range(sub):
-            pixels_sub = pixels[j::sub,:]
+        pixels, tsd, goodcad, mapping = censor_tpf(tpf,ts,thresh=thresh,minflux=minflux,verbose=verbose)
+        pixelmap = np.zeros((tpf.shape[2],tpf.shape[1]))
+        if verbose:
+            print('Censored TPF')
+
+        ### subsample
+        if consensus:           
+            assert sub>1, "Must be subsampled to use consensus"
+            if verbose:
+                print('Subsampling by a factor of %d' % sub)
+
+            weights = np.zeros(pixels.shape[0])
+            opt_lcs = np.zeros((pixels[::sub,:].shape[1],sub))
+
+            if random_init:
+                w_init = np.random.rand(pixels[::sub,:].shape[0])
+                w_init /= np.sum(w_init)
+
+            for j in range(sub):
+                pixels_sub = pixels[j::sub,:]
+                ### now calculate the halo 
+                if verbose:
+                    print('Calculating weights')
+
+                weights[j::sub], opt_lcs[:,j] = tv_tpf(pixels_sub,order=order,
+                    maxiter=maxiter,w_init=w_init,analytic=analytic,sigclip=sigclip,verbose=verbose)
+                if verbose:
+                    print('Calculated weights!')
+
+            norm_lcs = opt_lcs/np.nanmedian(opt_lcs,axis=0)
+            opt_lc = np.nanmean(norm_lcs,axis=1)
+
+        else:
+            pixels_sub = pixels[::sub,:]
+            if verbose:
+                print('Subsampling by a factor of %d' % sub)
+
             ### now calculate the halo 
+
             if verbose:
                 print('Calculating weights')
+            if random_init:
+                w_init = np.random.rand(pixels_sub.shape[0])
+                w_init /= np.sum(w_init)
 
-            weights[j::sub], opt_lcs[:,j] = tv_tpf(pixels_sub,order=order,
-                maxiter=maxiter,w_init=w_init,analytic=analytic,sigclip=sigclip,verbose=verbose)
+            weights, opt_lc = tv_tpf(pixels_sub,order=order,maxiter=maxiter,
+                w_init=w_init,analytic=analytic,verbose=verbose)
             if verbose:
                 print('Calculated weights!')
 
-        norm_lcs = opt_lcs/np.nanmedian(opt_lcs,axis=0)
-        opt_lc = np.nanmean(norm_lcs,axis=1)
+        # opt_lc = np.dot(weights.T,pixels_sub)
+        ts['corr_flux'] = np.nan*np.ones_like(ts['x'])
+        ts['corr_flux'][goodcad] = opt_lc
 
-    else:
-        pixels_sub = pixels[::sub,:]
-        if verbose:
-            print('Subsampling by a factor of %d' % sub)
+        if sub == 1:
+            pixelmap.ravel()[mapping] = weights
 
-        ### now calculate the halo 
-
-        if verbose:
-            print('Calculating weights')
-        if random_init:
-            w_init = np.random.rand(pixels_sub.shape[0])
-            w_init /= np.sum(w_init)
-
-        weights, opt_lc = tv_tpf(pixels_sub,order=order,maxiter=maxiter,
-            w_init=w_init,analytic=analytic,verbose=verbose)
-        if verbose:
-            print('Calculated weights!')
-
-    # opt_lc = np.dot(weights.T,pixels_sub)
-    ts['corr_flux'] = np.nan*np.ones_like(ts['x'])
-    ts['corr_flux'][goodcad] = opt_lc
-
-    if sub == 1:
-        pixelmap.ravel()[mapping] = weights
-        return tpf, ts, weights, pixelmap, pixels_sub
-    elif consensus:
-        pixelmap.ravel()[mapping] = weights/float(sub)
-        return tpf, ts, weights, pixelmap, pixels_sub
-    else:
-        pixelmap.ravel()[mapping[0][::sub]] = weights
-        return tpf, ts, weights, pixelmap, pixels_sub
+        elif consensus:
+            pixelmap.ravel()[mapping] = weights/float(sub)
+        else:
+            pixelmap.ravel()[mapping[0][::sub]] = weights
+    return tpf, ts, weights, pixelmap, pixels_sub
 
 # =========================================================================
 # Remove background stars
@@ -913,7 +932,7 @@ class halo_tpf(lightkurve.TessTargetPixelFile):
         else:
             aperture_mask = mask
 
-        centroid_col, centroid_row = self.centroids()
+        centroid_col, centroid_row = self.estimate_centroids()
 
         x, y = self.hdu[1].data['POS_CORR1'][self.quality_mask], self.hdu[1].data['POS_CORR2'][self.quality_mask]
         quality = self.quality
@@ -928,26 +947,11 @@ class halo_tpf(lightkurve.TessTargetPixelFile):
         flux = np.copy(self.flux)
 
         flux[:,~aperture_mask] = np.nan
-        
-        if split_times is not None:
-            assert(np.min(split_times)>np.min(ts['time'])), "Minimum time split must be during campaign"
-            splits = [np.min(np.where(ts['time']>split)) for split in split_times]
-            all_splits = [None,*splits,None]
-            tss = []
-            
-            for j, low in enumerate(all_splits[:-1]):
-                high = all_splits[j+1]
-                pff, tsj, weights, weightmap, pixels_sub = do_lc(flux,
-                            ts,(low,high),sub,order,maxiter=101,w_init=w_init,random_init=random_init,
-                    thresh=thresh,minflux=minflux,consensus=consensus,analytic=analytic,sigclip=sigclip,verbose=verbose)
-                tss.append(tsj)
-            ts = stitch(tss)
-            
-        else:
-            pf, ts, weights, weightmap, pixels_sub = do_lc(flux,
-                        ts,(None,None),sub,order,maxiter=101,w_init=w_init,random_init=random_init,
-                thresh=thresh,minflux=minflux,consensus=consensus,analytic=analytic,sigclip=sigclip,verbose=verbose)
 
+        pf, ts, weights, weightmap, pixels_sub = do_lc(flux,
+                    ts,(None,None),sub,order,maxiter=101,split_times=split_times,w_init=w_init,random_init=random_init,
+            thresh=thresh,minflux=minflux,consensus=consensus,analytic=analytic,sigclip=sigclip,verbose=verbose)
+        
         nanmask = np.isfinite(ts['corr_flux'])
          ### to do! Implement light curve POS_CORR1, POS_CORR2 attributes.
         lc_out = lightkurve.TessLightCurve(flux=ts['corr_flux'],
