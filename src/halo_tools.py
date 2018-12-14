@@ -101,7 +101,7 @@ def read_tpf(fname):
 # =========================================================================
 # =========================================================================
 
-def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True):
+def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True,order=1,sub=1):
     '''Throw away bad pixels and bad cadences'''
 
     dummy = tpf.copy()
@@ -135,7 +135,7 @@ def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True):
         stds=[]
         threshs=np.arange(nstart,nfinish)
         for thr in threshs:
-            pf, ts, weights, weightmap, pixels_sub = do_lc(dummy,tsd,(None,None),1,2,maxiter=101,w_init=None,random_init=False,
+            pf, ts, weights, weightmap, pixels_sub = do_lc(dummy,tsd,(None,None),sub,order,maxiter=101,w_init=None,random_init=False,
             thresh=thr,minflux=-100,consensus=False,analytic=True,sigclip=False,verbose=False)
             fl=ts['corr_flux']
             fs=fl[~np.isnan(fl)]/np.nanmedian(fl)
@@ -443,7 +443,7 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,split_times=None,w_init=None,rando
 
         ### now throw away saturated columns, nan pixels and nan cadences
 
-        pixels, tsd, goodcad, mapping = censor_tpf(tpf,ts,thresh=thresh,minflux=minflux,verbose=verbose,order=order)
+        pixels, tsd, goodcad, mapping = censor_tpf(tpf,ts,thresh=thresh,minflux=minflux,verbose=verbose,order=order,sub=sub)
         pixelmap = np.zeros((tpf.shape[2],tpf.shape[1]))
         if verbose:
             print('Censored TPF')
