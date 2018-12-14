@@ -842,7 +842,7 @@ class halo_tpf(lightkurve.TessTargetPixelFile):
     def halo(self, aperture_mask='pipeline',split_times=None,sub=1,order=1,
         maxiter=101,w_init=None,random_init=False,
         thresh=-1,minflux=-100.,consensus=False,
-        analytic=True,sigclip=False,mask=None):
+        analytic=True,sigclip=False,mask=None,verbose=True):
 
         """Performs 'halo' TV-min weighted-aperture photometry.
              Parameters
@@ -930,14 +930,14 @@ class halo_tpf(lightkurve.TessTargetPixelFile):
                 high = all_splits[j+1]
                 pff, tsj, weights, weightmap, pixels_sub = do_lc(flux,
                             ts,(low,high),sub,order,maxiter=101,w_init=w_init,random_init=random_init,
-                    thresh=thresh,minflux=minflux,consensus=consensus,analytic=analytic,sigclip=sigclip)
+                    thresh=thresh,minflux=minflux,consensus=consensus,analytic=analytic,sigclip=sigclip,verbose=verbose)
                 tss.append(tsj)
             ts = stitch(tss)
             
         else:
             pf, ts, weights, weightmap, pixels_sub = do_lc(flux,
                         ts,(None,None),sub,order,maxiter=101,w_init=w_init,random_init=random_init,
-                thresh=thresh,minflux=minflux,consensus=consensus,analytic=analytic,sigclip=sigclip)
+                thresh=thresh,minflux=minflux,consensus=consensus,analytic=analytic,sigclip=sigclip,verbose=verbose)
 
         nanmask = np.isfinite(ts['corr_flux'])
          ### to do! Implement light curve POS_CORR1, POS_CORR2 attributes.
