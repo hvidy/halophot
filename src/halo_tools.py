@@ -101,7 +101,7 @@ def read_tpf(fname):
 # =========================================================================
 # =========================================================================
 
-def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True):
+def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True):
     '''Throw away bad pixels and bad cadences'''
 
     dummy = tpf.copy()
@@ -123,18 +123,20 @@ def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True):
         saturated = np.unravel_index((-np.nanmax(dummy[m,:,:],axis=0)).argsort(axis=None)[:thresh],np.nanmax(dummy[m,:,:],axis=0).shape)
         # saturated=(flx_ord[0][-thresh:],flx_ord[1][-thresh:])
         dummy[:,saturated[0],saturated[1]] = np.nan 
-        print('%d saturated pixels' % np.sum(saturated[0].shape))
+        if verbose:
+            print('%d saturated pixels' % np.sum(saturated[0].shape))
 
     # automatic saturation threshold
     if thresh < 0:
         nstart = max(0,np.sum(np.nanmax(dummy[m,:,:],axis=0) > 7e4) - 20)
         nfinish = np.sum(np.nanmax(dummy[m,:,:],axis=0) > 5e4)
-        print('Searching for number of saturated pixels to cut between %d and %d' % (nstart,nfinish))
+        if verbose:
+            print('Searching for number of saturated pixels to cut between %d and %d' % (nstart,nfinish))
         stds=[]
         threshs=np.arange(nstart,nfinish)
         for thr in threshs:
             pf, ts, weights, weightmap, pixels_sub = do_lc(dummy,tsd,(None,None),1,2,maxiter=101,w_init=None,random_init=False,
-            thresh=thr,minflux=-100,consensus=False,analytic=True,sigclip=False)
+            thresh=thr,minflux=-100,consensus=False,analytic=True,sigclip=False,verbose=False)
             fl=ts['corr_flux']
             fs=fl[~np.isnan(fl)]/np.nanmedian(fl)
             sfs=savgol_filter(fs,(np.floor(len(fs)/8)*2-1).astype(int),1)
@@ -160,7 +162,8 @@ def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True):
                 pix=threshs[p1]
             else:
                 pix=threshs[p2]
-        print('Finished optimization: %d saturated pixels' % pix)
+        if verbose:
+            print('Finished optimization: %d saturated pixels' % pix)
         saturated = np.unravel_index((-np.nanmax(dummy[m,:,:],axis=0)).argsort(axis=None)[:pix],np.nanmax(dummy[m,:,:],axis=0).shape)
         dummy[:,saturated[0],saturated[1]] = np.nan 
 
@@ -177,9 +180,11 @@ def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True):
         goodpos = (rr<5) * np.isfinite(tsd['x'][m]) * np.isfinite(tsd['y'][m])
         m[m][~goodpos] = 0
         if np.sum(~goodpos)>0:
-        	print('Throwing out %d bad cadences' % np.sum(~goodpos))
-        # dummy = dummy[goodpos,:,:] # some campaigns have a few extremely bad cadences
-        # tsd = tsd[goodpos]
+            if verbose:
+                print('Throwing out %d bad cadences' % np.sum(~goodpos))
+    
+    # dummy = dummy[goodpos,:,:] # some campaigns have a few extremely bad cadences
+    # tsd = tsd[goodpos]
 
     # then pick only pixels which are mostly good
 
@@ -249,7 +254,7 @@ def diff_2(z):
 # =========================================================================
 # =========================================================================
 
-def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=False):
+def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=False,verbose=True):
     '''
     This is the main function here - once you have loaded the data, pass it to this
     to do a TV-min light curve.
@@ -300,7 +305,8 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=Fa
         w_init = np.ones(npix)/np.float(npix)
 
     if analytic: 
-        print('Using Analytic Derivatives')
+        if verbose:
+            print('Using Analytic Derivatives')
         # only use first order, it appears to be strictly better
 
         def tv_soft(weights):
@@ -324,7 +330,8 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=Fa
 
 
             if np.sum(~good) > 0:
-                print('Clipping %d bad points' % np.sum(~good))
+                if verbose:
+                    print('Clipping %d bad points' % np.sum(~good))
 
                 pixels_masked = pixelvector[:,good]
 
@@ -340,7 +347,8 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=Fa
 
                 w_best = softmax(res['x']) # softmax
             else:
-                print('No outliers found, continuing')
+                if verbose:
+                    print('No outliers found, continuing')
         else:
             pass
 
@@ -361,7 +369,8 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=Fa
             bounds = bounds, options={'disp': True,'maxiter':maxiter})
 
         if 'Positive directional derivative for linesearch' in res['message']:
-            print('Failed to converge well! Rescaling.')
+            if verbose:
+                print('Failed to converge well! Rescaling.')
             if order==1:
                 def obj(weights):
                     flux = np.dot(weights.T,pixelvector)
@@ -398,29 +407,32 @@ def print_flex(splits):
 
 
 def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
-    thresh=-1.,minflux=-100.,consensus=False,analytic=False,sigclip=False):
+    thresh=-1.,minflux=-100.,consensus=False,analytic=False,sigclip=False,verbose=True):
     ### get a slice corresponding to the splits you want
-    if splits[0] is None and splits[1] is not None:
-        print('Taking cadences from beginning to',splits[1])
-    elif splits[0] is not None and splits[1] is None:
-        print('Taking cadences from', splits[0],'to end')
-    elif splits[0] is None and splits[1] is None:
-        print('Taking cadences from beginning to end')
-    else:
-        print('Taking cadences from', splits[0],'to',splits[1])
+    if verbose:
+        if splits[0] is None and splits[1] is not None:
+            print('Taking cadences from beginning to',splits[1])
+        elif splits[0] is not None and splits[1] is None:
+            print('Taking cadences from', splits[0],'to end')
+        elif splits[0] is None and splits[1] is None:
+            print('Taking cadences from beginning to end')
+        else:
+            print('Taking cadences from', splits[0],'to',splits[1])
 
     tpf, ts = get_slice(tpf,ts,splits[0],splits[1])
 
     ### now throw away saturated columns, nan pixels and nan cadences
 
-    pixels, tsd, goodcad, mapping = censor_tpf(tpf,ts,thresh=thresh,minflux=minflux)
+    pixels, tsd, goodcad, mapping = censor_tpf(tpf,ts,thresh=thresh,minflux=minflux,verbose=verbose)
     pixelmap = np.zeros((tpf.shape[2],tpf.shape[1]))
-    print('Censored TPF')
+    if verbose:
+        print('Censored TPF')
 
     ### subsample
     if consensus:           
         assert sub>1, "Must be subsampled to use consensus"
-        print('Subsampling by a factor of %d' % sub)
+        if verbose:
+            print('Subsampling by a factor of %d' % sub)
 
         weights = np.zeros(pixels.shape[0])
         opt_lcs = np.zeros((pixels[::sub,:].shape[1],sub))
@@ -432,29 +444,34 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
         for j in range(sub):
             pixels_sub = pixels[j::sub,:]
             ### now calculate the halo 
-            print('Calculating weights')
+            if verbose:
+                print('Calculating weights')
 
             weights[j::sub], opt_lcs[:,j] = tv_tpf(pixels_sub,order=order,
-                maxiter=maxiter,w_init=w_init,analytic=analytic,sigclip=sigclip)
-            print('Calculated weights!')
+                maxiter=maxiter,w_init=w_init,analytic=analytic,sigclip=sigclip,verbose=verbose)
+            if verbose:
+                print('Calculated weights!')
 
         norm_lcs = opt_lcs/np.nanmedian(opt_lcs,axis=0)
         opt_lc = np.nanmean(norm_lcs,axis=1)
 
     else:
         pixels_sub = pixels[::sub,:]
-        print('Subsampling by a factor of %d' % sub)
+        if verbose:
+            print('Subsampling by a factor of %d' % sub)
 
         ### now calculate the halo 
 
-        print('Calculating weights')
+        if verbose:
+            print('Calculating weights')
         if random_init:
             w_init = np.random.rand(pixels_sub.shape[0])
             w_init /= np.sum(w_init)
 
         weights, opt_lc = tv_tpf(pixels_sub,order=order,maxiter=maxiter,
-            w_init=w_init,analytic=analytic)
-        print('Calculated weights!')
+            w_init=w_init,analytic=analytic,verbose=verbose)
+        if verbose:
+            print('Calculated weights!')
 
     # opt_lc = np.dot(weights.T,pixels_sub)
     ts['corr_flux'] = np.nan*np.ones_like(ts['x'])
@@ -834,62 +851,62 @@ class halo_tpf(lightkurve.TessTargetPixelFile):
     def halo(self, aperture_mask='pipeline',split_times=None,sub=1,order=1,
         maxiter=101,w_init=None,random_init=False,
         thresh=-1,minflux=-100.,consensus=False,
-        analytic=True,sigclip=False,mask=None):
+        analytic=True,sigclip=False,mask=None,verbose=True):
 
-    """Performs 'halo' TV-min weighted-aperture photometry.
-         Parameters
-        ----------
-        aperture_mask : array-like, 'pipeline', or 'all'
-            A boolean array describing the aperture such that `False` means
-            that the pixel will be masked out.
-            If the string 'all' is passed, all pixels will be used.
-            The default behaviour is to use the Kepler pipeline mask.
-         splits : tuple, (None, None) or (2152,2175) etc.
-            A tuple including two times at which to split the light curve and run halo 
-            separately outside these splits.
-         sub : int
-            Do you want to subsample every nth pixel in your light curve? Not advised, 
-            but can come in handy for very large TPFs.
-         order: int
-            Run nth order TV - ie first order is L1 norm on first derivative,
-            second order is L1 norm on second derivative, etc.
-            This is part of the Pock generalized TV scheme, so that
-            1st order gives you piecewise constant functions,
-            2nd order gives you piecewise affine functions, etc. 
-            Currently implemented only up to 2nd order in numerical, 1st in analytic!
-            We recommend first order very strongly.
-         maxiter: int
-            Number of iterations to optimize. 101 is default & usually sufficient.
-         w_init: None or array-like.
-            Initialize weights with a particular weight vector - useful if you have
-            already run TV-min and want to update, but otherwise set to None 
-            and it will have default initialization.
-         random_init: Boolean
-            If False, and w_init is None, it will initialize with uniform weights; if True, it
-            will initialize with random weights. False is usually better.
-         thresh: float
-            A float greater than 0. Pixels less than this fraction of the maximum
-            flux at any pixel will be masked out - this is to deal with saturation.
-            Because halo is usually intended for saturated stars, the default is 0.8, 
-            to deal with saturated pixels. If your star is not saturated, set this 
-            greater than 1.0. 
-         consensus: Boolean
-            If True, this will subsample the pixel space, separately calculate halo time 
-            series for eah set of pixels, and merge these at the end. This is to check
-            for validation, but is typically not useful, and is by default set False.
-         analytic: Boolean
-            If True, it will optimize the TV with autograd analytic derivatives, which is
-            several orders of magnitude faster than with numerical derivatives. This is 
-            by default True but you can run it numerically with False if you prefer.
-         sigclip: Boolean
-            If True, it will iteratively run the TV-min algorithm clipping outliers.
-            Use this for data with a lot of outliers, but by default it is set False.
-         Returns
-        -------
-        lc : KeplerLightCurve object
-            Array containing the TV-min flux within the aperture for each
-            cadence.
-        """
+        """Performs 'halo' TV-min weighted-aperture photometry.
+             Parameters
+            ----------
+            aperture_mask : array-like, 'pipeline', or 'all'
+                A boolean array describing the aperture such that `False` means
+                that the pixel will be masked out.
+                If the string 'all' is passed, all pixels will be used.
+                The default behaviour is to use the Kepler pipeline mask.
+             splits : tuple, (None, None) or (2152,2175) etc.
+                A tuple including two times at which to split the light curve and run halo 
+                separately outside these splits.
+             sub : int
+                Do you want to subsample every nth pixel in your light curve? Not advised, 
+                but can come in handy for very large TPFs.
+             order: int
+                Run nth order TV - ie first order is L1 norm on first derivative,
+                second order is L1 norm on second derivative, etc.
+                This is part of the Pock generalized TV scheme, so that
+                1st order gives you piecewise constant functions,
+                2nd order gives you piecewise affine functions, etc. 
+                Currently implemented only up to 2nd order in numerical, 1st in analytic!
+                We recommend first order very strongly.
+             maxiter: int
+                Number of iterations to optimize. 101 is default & usually sufficient.
+             w_init: None or array-like.
+                Initialize weights with a particular weight vector - useful if you have
+                already run TV-min and want to update, but otherwise set to None 
+                and it will have default initialization.
+             random_init: Boolean
+                If False, and w_init is None, it will initialize with uniform weights; if True, it
+                will initialize with random weights. False is usually better.
+             thresh: float
+                A float greater than 0. Pixels less than this fraction of the maximum
+                flux at any pixel will be masked out - this is to deal with saturation.
+                Because halo is usually intended for saturated stars, the default is 0.8, 
+                to deal with saturated pixels. If your star is not saturated, set this 
+                greater than 1.0. 
+             consensus: Boolean
+                If True, this will subsample the pixel space, separately calculate halo time 
+                series for eah set of pixels, and merge these at the end. This is to check
+                for validation, but is typically not useful, and is by default set False.
+             analytic: Boolean
+                If True, it will optimize the TV with autograd analytic derivatives, which is
+                several orders of magnitude faster than with numerical derivatives. This is 
+                by default True but you can run it numerically with False if you prefer.
+             sigclip: Boolean
+                If True, it will iteratively run the TV-min algorithm clipping outliers.
+                Use this for data with a lot of outliers, but by default it is set False.
+             Returns
+            -------
+            lc : KeplerLightCurve object
+                Array containing the TV-min flux within the aperture for each
+                cadence.
+            """
     
         if mask is None:
             aperture_mask = self._parse_aperture_mask(aperture_mask)
@@ -922,14 +939,14 @@ class halo_tpf(lightkurve.TessTargetPixelFile):
                 high = all_splits[j+1]
                 pff, tsj, weights, weightmap, pixels_sub = do_lc(flux,
                             ts,(low,high),sub,order,maxiter=101,w_init=w_init,random_init=random_init,
-                    thresh=thresh,minflux=minflux,consensus=consensus,analytic=analytic,sigclip=sigclip)
+                    thresh=thresh,minflux=minflux,consensus=consensus,analytic=analytic,sigclip=sigclip,verbose=verbose)
                 tss.append(tsj)
             ts = stitch(tss)
             
         else:
             pf, ts, weights, weightmap, pixels_sub = do_lc(flux,
                         ts,(None,None),sub,order,maxiter=101,w_init=w_init,random_init=random_init,
-                thresh=thresh,minflux=minflux,consensus=consensus,analytic=analytic,sigclip=sigclip)
+                thresh=thresh,minflux=minflux,consensus=consensus,analytic=analytic,sigclip=sigclip,verbose=verbose)
 
         nanmask = np.isfinite(ts['corr_flux'])
          ### to do! Implement light curve POS_CORR1, POS_CORR2 attributes.
