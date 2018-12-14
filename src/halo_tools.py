@@ -101,7 +101,11 @@ def read_tpf(fname):
 # =========================================================================
 # =========================================================================
 
+<<<<<<< HEAD
 def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True,order=1,sub=1):
+=======
+def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True,order=1):
+>>>>>>> ac8834f1fad2aba9f8888455af47dbd63da80766
     '''Throw away bad pixels and bad cadences'''
 
     dummy = tpf.copy()
@@ -135,7 +139,11 @@ def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True,order
         stds=[]
         threshs=np.arange(nstart,nfinish)
         for thr in threshs:
+<<<<<<< HEAD
             pf, ts, weights, weightmap, pixels_sub = do_lc(dummy,tsd,(None,None),sub,order,maxiter=101,w_init=None,random_init=False,
+=======
+            pf, ts, weights, weightmap, pixels_sub = do_lc(dummy,tsd,(None,None),1,order,maxiter=101,w_init=None,random_init=False,
+>>>>>>> ac8834f1fad2aba9f8888455af47dbd63da80766
             thresh=thr,minflux=-100,consensus=False,analytic=True,sigclip=False,verbose=False)
             fl=ts['corr_flux']
             fs=fl[~np.isnan(fl)]/np.nanmedian(fl)
@@ -307,12 +315,18 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=Fa
     if analytic: 
         if verbose:
             print('Using Analytic Derivatives')
-        # only use first order, it appears to be strictly better
 
-        def tv_soft(weights):
-            flux = agnp.dot(softmax(weights).T,pixelvector)
-            diff = agnp.sum(agnp.abs(flux[1:] - flux[:-1]))
-            return diff/agnp.mean(flux)
+        if order == 1:
+            # only use first order, it appears to be strictly better
+            def tv_soft(weights):
+                flux = agnp.dot(softmax(weights).T,pixelvector)
+                diff = agnp.sum(agnp.abs(flux[1:] - flux[:-1]))
+                return diff/agnp.mean(flux)
+        elif order == 2:
+            def tv_soft(weights):
+                flux = agnp.dot(softmax(weights).T,pixelvector)
+                diff = agnp.sum(agnp.abs(2.*flux[1:-1] - flux[2:] - flux[:-2]))
+                return diff/agnp.mean(flux)
 
         gradient = grad(tv_soft)
 
@@ -364,6 +378,9 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=Fa
                 flux = np.dot(weights.T,pixelvector)
                 flux/= np.nanmedian(flux)
                 return diff_2(flux)
+
+        else:
+            print('Order must be 1 or 2')
 
         res = optimize.minimize(obj, w_init, method='SLSQP', constraints=cons, 
             bounds = bounds, options={'disp': True,'maxiter':maxiter})
