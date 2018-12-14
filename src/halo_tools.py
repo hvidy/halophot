@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import matplotlib as mpl
 from astropy.table import Table
 import scipy.optimize as optimize
+from scipy.signal import savgol_filter
 from scipy import stats, ndimage
 from astropy.io import fits
 from time import time as clock
@@ -100,7 +101,7 @@ def read_tpf(fname):
 # =========================================================================
 # =========================================================================
 
-def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=True):
+def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True):
     '''Throw away bad pixels and bad cadences'''
 
     dummy = tpf.copy()
@@ -118,9 +119,52 @@ def censor_tpf(tpf,ts,thresh=0.8,minflux=100.,do_quality=True):
 
     dummy[m,:,:][dummy[m,:,:]<0] = 0 # just as a check!
 
-    saturated = np.nanmax(dummy[m,:,:],axis=0) > (thresh*maxflux)
-    print('%d saturated pixels' % np.sum(saturated))
-    dummy[:,saturated] = np.nan 
+    if thresh > 0:
+        saturated = np.unravel_index((-np.nanmax(dummy[m,:,:],axis=0)).argsort(axis=None)[:thresh],np.nanmax(dummy[m,:,:],axis=0).shape)
+        # saturated=(flx_ord[0][-thresh:],flx_ord[1][-thresh:])
+        dummy[:,saturated[0],saturated[1]] = np.nan 
+        print('%d saturated pixels' % np.sum(saturated[0].shape))
+
+    # automatic saturation threshold
+    if thresh < 0:
+        nstart = max(0,np.sum(np.nanmax(dummy[m,:,:],axis=0) > 7e4) - 20)
+        nfinish = np.sum(np.nanmax(dummy[m,:,:],axis=0) > 5e4)
+        print('Searching for number of saturated pixels to cut between %d and %d' % (nstart,nfinish))
+        stds=[]
+        threshs=np.arange(nstart,nfinish)
+        for thr in threshs:
+            pf, ts, weights, weightmap, pixels_sub = do_lc(dummy,tsd,(None,None),1,2,maxiter=101,w_init=None,random_init=False,
+            thresh=thr,minflux=-100,consensus=False,analytic=True,sigclip=False)
+            fl=ts['corr_flux']
+            fs=fl[~np.isnan(fl)]/np.nanmedian(fl)
+            sfs=savgol_filter(fs,(np.floor(len(fs)/8)*2-1).astype(int),1)
+            stds.append(np.std(fs/sfs))
+        stds=np.asarray(stds)
+        d1 = np.r_[0,stds[1:]-stds[:-1]]
+        d2 = np.r_[0,stds[2:]-2*stds[1:-1]+stds[:-2],0]
+        i1=[]
+        cut=4
+        while len(i1) == 0:
+            ind = (stds > cut*stds[0]) & (d1 > 0) & np.r_[True, d2[1:] < d2[:-1]] & np.r_[d2[:-1] < d2[1:], True] & (d2 < 0)
+            i1=np.arange(len(ind))[ind]
+            cut -= 1
+
+        if len(i1) > 3: i1=i1[i1.argsort(axis=None)][0:3]
+
+        if threshs[i1[np.argmax(d1[i1])]] == threshs[i1[np.argmin(d2[i1])]]: 
+            pix=threshs[i1[np.argmax(d1[i1])]]
+        else: 
+            p1 = i1[np.argmax(d1[i1])]
+            p2 = i1[np.argmin(d2[i1])]
+            if abs(d1[p1]-d1[p2]) > abs(d2[p1]-d2[p2]):
+                pix=threshs[p1]
+            else:
+                pix=threshs[p2]
+        print('Finished optimization: %d saturated pixels' % pix)
+        saturated = np.unravel_index((-np.nanmax(dummy[m,:,:],axis=0)).argsort(axis=None)[:pix],np.nanmax(dummy[m,:,:],axis=0).shape)
+        dummy[:,saturated[0],saturated[1]] = np.nan 
+
+    # saturated = np.nanmax(dummy[m,:,:],axis=0) > thresh
 
     no_flux = np.nanmin(dummy[m,:,:],axis=0) < minflux
     dummy[:,no_flux] = np.nan
@@ -354,7 +398,7 @@ def print_flex(splits):
 
 
 def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
-    thresh=0.8,minflux=100.,consensus=False,analytic=False,sigclip=False):
+    thresh=-1.,minflux=-100.,consensus=False,analytic=False,sigclip=False):
     ### get a slice corresponding to the splits you want
     if splits[0] is None and splits[1] is not None:
         print('Taking cadences from beginning to',splits[1])
@@ -785,13 +829,14 @@ The cuts for Campaign 4 are
 2200:
 -----------------------------------------------------------------'''
 
-class halo_tpf(lightkurve.KeplerTargetPixelFile):
+class halo_tpf(lightkurve.TessTargetPixelFile):
     
     def halo(self, aperture_mask='pipeline',split_times=None,sub=1,order=1,
         maxiter=101,w_init=None,random_init=False,
-        thresh=0.8,minflux=100.,consensus=False,
+        thresh=-1,minflux=-100.,consensus=False,
         analytic=True,sigclip=False,mask=None):
-        """Performs 'halo' TV-min weighted-aperture photometry.
+
+    """Performs 'halo' TV-min weighted-aperture photometry.
          Parameters
         ----------
         aperture_mask : array-like, 'pipeline', or 'all'
@@ -845,13 +890,14 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
             Array containing the TV-min flux within the aperture for each
             cadence.
         """
-
+    
         if mask is None:
             aperture_mask = self._parse_aperture_mask(aperture_mask)
         else:
             aperture_mask = mask
 
         centroid_col, centroid_row = self.centroids()
+
         x, y = self.hdu[1].data['POS_CORR1'][self.quality_mask], self.hdu[1].data['POS_CORR2'][self.quality_mask]
         quality = self.quality
         ts = Table({'time':self.time,
@@ -859,6 +905,8 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
                     'x':x,
                     'y':y,
                     'quality':quality})
+
+        
 
         flux = np.copy(self.flux)
 
@@ -882,18 +930,22 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
             pf, ts, weights, weightmap, pixels_sub = do_lc(flux,
                         ts,(None,None),sub,order,maxiter=101,w_init=w_init,random_init=random_init,
                 thresh=thresh,minflux=minflux,consensus=consensus,analytic=analytic,sigclip=sigclip)
+
         nanmask = np.isfinite(ts['corr_flux'])
          ### to do! Implement light curve POS_CORR1, POS_CORR2 attributes.
-        lc_out = lightkurve.KeplerLightCurve(flux=ts['corr_flux'],
+        lc_out = lightkurve.TessLightCurve(flux=ts['corr_flux'],
                                 time=ts['time'],
                                 flux_err=np.nan*ts['corr_flux'],
                                 centroid_col=ts['x'],
                                 centroid_row=ts['y'],
                                 quality=ts['quality'],
-                                channel=self.channel,
-                                campaign=self.campaign,
-                                quarter=self.quarter,
-                                mission=self.mission,
+                                # channel=self.channel,
+                                # campaign=self.campaign,
+                                # quarter=self.quarter,
+                                targetid=self.targetid,
+                                ccd = self.ccd,
+                                sector=self.sector,
+                                # mission=self.mission,
                                 cadenceno=ts['cadence'])
         lc_out.pos_corr1 = self.pos_corr1
         lc_out.pos_corr2 = self.pos_corr2
