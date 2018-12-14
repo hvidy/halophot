@@ -443,7 +443,7 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,split_times=None,w_init=None,rando
 
         ### now throw away saturated columns, nan pixels and nan cadences
 
-        pixels, tsd, goodcad, mapping = censor_tpf(tpf,ts,thresh=thresh,minflux=minflux,verbose=verbose)
+        pixels, tsd, goodcad, mapping = censor_tpf(tpf,ts,thresh=thresh,minflux=minflux,verbose=verbose,order=order)
         pixelmap = np.zeros((tpf.shape[2],tpf.shape[1]))
         if verbose:
             print('Censored TPF')
