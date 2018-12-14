@@ -101,7 +101,7 @@ def read_tpf(fname):
 # =========================================================================
 # =========================================================================
 
-def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True):
+def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True):
     '''Throw away bad pixels and bad cadences'''
 
     dummy = tpf.copy()
@@ -123,13 +123,15 @@ def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True):
         saturated = np.unravel_index((-np.nanmax(dummy[m,:,:],axis=0)).argsort(axis=None)[:thresh],np.nanmax(dummy[m,:,:],axis=0).shape)
         # saturated=(flx_ord[0][-thresh:],flx_ord[1][-thresh:])
         dummy[:,saturated[0],saturated[1]] = np.nan 
-        print('%d saturated pixels' % np.sum(saturated[0].shape))
+        if verbose:
+            print('%d saturated pixels' % np.sum(saturated[0].shape))
 
     # automatic saturation threshold
     if thresh < 0:
         nstart = max(0,np.sum(np.nanmax(dummy[m,:,:],axis=0) > 7e4) - 20)
         nfinish = np.sum(np.nanmax(dummy[m,:,:],axis=0) > 5e4)
-        print('Searching for number of saturated pixels to cut between %d and %d' % (nstart,nfinish))
+        if verbose:
+            print('Searching for number of saturated pixels to cut between %d and %d' % (nstart,nfinish))
         stds=[]
         threshs=np.arange(nstart,nfinish)
         for thr in threshs:
@@ -160,7 +162,8 @@ def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True):
                 pix=threshs[p1]
             else:
                 pix=threshs[p2]
-        print('Finished optimization: %d saturated pixels' % pix)
+        if verbose:
+            print('Finished optimization: %d saturated pixels' % pix)
         saturated = np.unravel_index((-np.nanmax(dummy[m,:,:],axis=0)).argsort(axis=None)[:pix],np.nanmax(dummy[m,:,:],axis=0).shape)
         dummy[:,saturated[0],saturated[1]] = np.nan 
 
@@ -177,9 +180,11 @@ def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True):
         goodpos = (rr<5) * np.isfinite(tsd['x'][m]) * np.isfinite(tsd['y'][m])
         m[m][~goodpos] = 0
         if np.sum(~goodpos)>0:
-        	print('Throwing out %d bad cadences' % np.sum(~goodpos))
-        # dummy = dummy[goodpos,:,:] # some campaigns have a few extremely bad cadences
-        # tsd = tsd[goodpos]
+            if verbose:
+                print('Throwing out %d bad cadences' % np.sum(~goodpos))
+    
+    # dummy = dummy[goodpos,:,:] # some campaigns have a few extremely bad cadences
+    # tsd = tsd[goodpos]
 
     # then pick only pixels which are mostly good
 
@@ -249,7 +254,7 @@ def diff_2(z):
 # =========================================================================
 # =========================================================================
 
-def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=False):
+def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=False,verbose=True):
     '''
     This is the main function here - once you have loaded the data, pass it to this
     to do a TV-min light curve.
@@ -300,7 +305,8 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=Fa
         w_init = np.ones(npix)/np.float(npix)
 
     if analytic: 
-        print('Using Analytic Derivatives')
+        if verbose:
+            print('Using Analytic Derivatives')
         # only use first order, it appears to be strictly better
 
         def tv_soft(weights):
@@ -324,7 +330,8 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=Fa
 
 
             if np.sum(~good) > 0:
-                print('Clipping %d bad points' % np.sum(~good))
+                if verbose:
+                    print('Clipping %d bad points' % np.sum(~good))
 
                 pixels_masked = pixelvector[:,good]
 
@@ -340,7 +347,8 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=Fa
 
                 w_best = softmax(res['x']) # softmax
             else:
-                print('No outliers found, continuing')
+                if verbose:
+                    print('No outliers found, continuing')
         else:
             pass
 
@@ -361,7 +369,8 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=Fa
             bounds = bounds, options={'disp': True,'maxiter':maxiter})
 
         if 'Positive directional derivative for linesearch' in res['message']:
-            print('Failed to converge well! Rescaling.')
+            if verbose:
+                print('Failed to converge well! Rescaling.')
             if order==1:
                 def obj(weights):
                     flux = np.dot(weights.T,pixelvector)
@@ -414,7 +423,7 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
 
     ### now throw away saturated columns, nan pixels and nan cadences
 
-    pixels, tsd, goodcad, mapping = censor_tpf(tpf,ts,thresh=thresh,minflux=minflux)
+    pixels, tsd, goodcad, mapping = censor_tpf(tpf,ts,thresh=thresh,minflux=minflux,verbose=verbose)
     pixelmap = np.zeros((tpf.shape[2],tpf.shape[1]))
     if verbose:
         print('Censored TPF')
@@ -439,7 +448,7 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
                 print('Calculating weights')
 
             weights[j::sub], opt_lcs[:,j] = tv_tpf(pixels_sub,order=order,
-                maxiter=maxiter,w_init=w_init,analytic=analytic,sigclip=sigclip)
+                maxiter=maxiter,w_init=w_init,analytic=analytic,sigclip=sigclip,verbose=verbose)
             if verbose:
                 print('Calculated weights!')
 
@@ -460,7 +469,7 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
             w_init /= np.sum(w_init)
 
         weights, opt_lc = tv_tpf(pixels_sub,order=order,maxiter=maxiter,
-            w_init=w_init,analytic=analytic)
+            w_init=w_init,analytic=analytic,verbose=verbose)
         if verbose:
             print('Calculated weights!')
 
