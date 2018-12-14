@@ -386,6 +386,17 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=Fa
 # =========================================================================
 # =========================================================================
 
+def print_flex(splits):
+    s = 'Taking cadences from: beginning to '
+    for split in splits:
+        s += ('%.1f; to ' % split)
+    s += 'end'
+    print(s)
+
+# =========================================================================
+# =========================================================================
+
+
 def do_lc(tpf,ts,splits,sub,order,maxiter=101,w_init=None,random_init=False,
     thresh=-1.,minflux=-100.,consensus=False,analytic=False,sigclip=False):
     ### get a slice corresponding to the splits you want
@@ -820,11 +831,12 @@ The cuts for Campaign 4 are
 
 class halo_tpf(lightkurve.TessTargetPixelFile):
     
-    def halo(self, aperture_mask='all',splits=(None,None),sub=1,order=1,
-        maxiter=101,w_init=None,random_init=False,mask=None,
+    def halo(self, aperture_mask='pipeline',split_times=None,sub=1,order=1,
+        maxiter=101,w_init=None,random_init=False,
         thresh=-1,minflux=-100.,consensus=False,
-        analytic=True,sigclip=False):
-        """Performs 'halo' TV-min weighted-aperture photometry.
+        analytic=True,sigclip=False,mask=None):
+
+    """Performs 'halo' TV-min weighted-aperture photometry.
          Parameters
         ----------
         aperture_mask : array-like, 'pipeline', or 'all'
@@ -878,12 +890,14 @@ class halo_tpf(lightkurve.TessTargetPixelFile):
             Array containing the TV-min flux within the aperture for each
             cadence.
         """
-        # if mask == None:
-        #     aperture_mask = self._parse_aperture_mask(aperture_mask)
-        # else:
-        #     aperture_mask = mask
-        #aperture_mask = self._parse_aperture_mask(aperture_mask)
-        centroid_col, centroid_row = self.estimate_centroids()
+    
+        if mask is None:
+            aperture_mask = self._parse_aperture_mask(aperture_mask)
+        else:
+            aperture_mask = mask
+
+        centroid_col, centroid_row = self.centroids()
+
         x, y = self.hdu[1].data['POS_CORR1'][self.quality_mask], self.hdu[1].data['POS_CORR2'][self.quality_mask]
         quality = self.quality
         ts = Table({'time':self.time,
@@ -891,13 +905,32 @@ class halo_tpf(lightkurve.TessTargetPixelFile):
                     'x':x,
                     'y':y,
                     'quality':quality})
-        # aperture_mask = mask
-        flx = self.flux
-        flx[:,~mask] = np.nan
 
-        pf, ts, weights, weightmap, pixels_sub = do_lc(flx,
-                    ts,splits,sub,order,maxiter=101,w_init=w_init,random_init=random_init,
-            thresh=thresh,minflux=minflux,consensus=consensus,analytic=analytic,sigclip=sigclip)
+        
+
+        flux = np.copy(self.flux)
+
+        flux[:,~aperture_mask] = np.nan
+        
+        if split_times is not None:
+            assert(np.min(split_times)>np.min(ts['time'])), "Minimum time split must be during campaign"
+            splits = [np.min(np.where(ts['time']>split)) for split in split_times]
+            all_splits = [None,*splits,None]
+            tss = []
+            
+            for j, low in enumerate(all_splits[:-1]):
+                high = all_splits[j+1]
+                pff, tsj, weights, weightmap, pixels_sub = do_lc(flux,
+                            ts,(low,high),sub,order,maxiter=101,w_init=w_init,random_init=random_init,
+                    thresh=thresh,minflux=minflux,consensus=consensus,analytic=analytic,sigclip=sigclip)
+                tss.append(tsj)
+            ts = stitch(tss)
+            
+        else:
+            pf, ts, weights, weightmap, pixels_sub = do_lc(flux,
+                        ts,(None,None),sub,order,maxiter=101,w_init=w_init,random_init=random_init,
+                thresh=thresh,minflux=minflux,consensus=consensus,analytic=analytic,sigclip=sigclip)
+
         nanmask = np.isfinite(ts['corr_flux'])
          ### to do! Implement light curve POS_CORR1, POS_CORR2 attributes.
         lc_out = lightkurve.TessLightCurve(flux=ts['corr_flux'],
