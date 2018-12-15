@@ -440,7 +440,7 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,split_times=None,w_init=None,rando
             else:
                 cad1.append(ts['cadence'][low])
             if high is None:
-                cad1.append(ts['cadence'][-1])
+                cad2.append(ts['cadence'][-1])
             else:
                 cad2.append(ts['cadence'][high])
             sat.append(pmap["sat_pixels"])
