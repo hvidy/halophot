@@ -139,13 +139,13 @@ def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True,order
             thresh=thr,minflux=-100,consensus=False,analytic=True,sigclip=False,verbose=False)
             fl=ts['corr_flux']
             fs=fl[~np.isnan(fl)]/np.nanmedian(fl)
-            sfs=savgol_filter(fs,(np.floor(len(fs)/8)*2-1).astype(int),1)
+            sfs=savgol_filter(fs,(np.floor(len(fs)/8)*2-1).astype(int),3)
             stds.append(np.std(fs/sfs))
         stds=np.asarray(stds)
         d1 = np.r_[0,stds[1:]-stds[:-1]]
         d2 = np.r_[0,stds[2:]-2*stds[1:-1]+stds[:-2],0]
         i1=[]
-        cut=4
+        cut = 3
         while len(i1) == 0:
             ind = (stds > cut*stds[0]) & (d1 > 0) & np.r_[True, d2[1:] < d2[:-1]] & np.r_[d2[:-1] < d2[1:], True] & (d2 < 0)
             i1=np.arange(len(ind))[ind]
@@ -206,7 +206,7 @@ def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True,order
 
     pixels[~np.isfinite(pixels)] = 0
 
-    return pixels, tsd, m, np.where(indic>60)
+    return pixels, tsd, m, np.where(indic>60), np.sum(saturated[0].shape)
 
 # =========================================================================
 # =========================================================================
@@ -424,19 +424,52 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,split_times=None,w_init=None,rando
         splits = [np.min(np.where(ts['time']>split)) for split in split_times]
         all_splits = [None,*splits,None]
         tss = []
+        cad1 = []
+        cad2 = []
+        sat = []
+        weightmap = []
         
         for j, low in enumerate(all_splits[:-1]):
             high = all_splits[j+1]
-            pff, tsj, weights, pixelmap, pixels_sub = do_lc(tpf,
+            pff, tsj, weights, pmap, pixels_sub = do_lc(tpf,
                         ts,(low,high),sub,order,maxiter=101,split_times=None,w_init=w_init,random_init=random_init,
                 thresh=thresh,minflux=minflux,consensus=consensus,analytic=analytic,sigclip=sigclip,verbose=verbose)
             tss.append(tsj)
+            if low is None:
+                cad1.append(ts['cadence'][0])
+            else:
+                cad1.append(ts['cadence'][low])
+            if high is None:
+                cad1.append(ts['cadence'][-1])
+            else:
+                cad2.append(ts['cadence'][high])
+            sat.append(pmap["sat_pixels"])
+            weightmap.append(pmap["weightmap"])
+        wmap = {
+        "initial_cadence": c1,
+        "final_cadence": c2,
+        "sat_pixels": sat,
+        "weightmap": weightmap
+        }
         ts = stitch(tss)
         
     else:
         # pf, ts, weights, weightmap, pixels_sub = do_lc(flux,
         #             ts,(None,None),sub,order,maxiter=101,split_times=None,w_init=w_init,random_init=random_init,
         #     thresh=thresh,minflux=minflux,consensus=consensus,analytic=analytic,sigclip=sigclip,verbose=verbose)
+
+        if splits[0] is None and splits[1] is not None:
+            c1 = ts['cadence'][0]
+            c2 = ts['cadence'][splits[1]]
+        elif splits[0] is not None and splits[1] is None:
+            c1 = ts['cadence'][splits[0]]
+            c2 = ts['cadence'][-1]
+        elif splits[0] is None and splits[1] is None:
+            c1 = ts['cadence'][0]
+            c2 = ts['cadence'][-1]
+        else:
+            c1 = ts['cadence'][splits[0]]
+            c2 = ts['cadence'][splits[1]]
 
         if verbose:
             if splits[0] is None and splits[1] is not None:
@@ -452,7 +485,7 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,split_times=None,w_init=None,rando
 
         ### now throw away saturated columns, nan pixels and nan cadences
 
-        pixels, tsd, goodcad, mapping = censor_tpf(tpf,ts,thresh=thresh,minflux=minflux,verbose=verbose,order=order,sub=sub)
+        pixels, tsd, goodcad, mapping, sat = censor_tpf(tpf,ts,thresh=thresh,minflux=minflux,verbose=verbose,order=order,sub=sub)
         pixelmap = np.zeros((tpf.shape[2],tpf.shape[1]))
         if verbose:
             print('Censored TPF')
@@ -513,7 +546,13 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,split_times=None,w_init=None,rando
             pixelmap.ravel()[mapping] = weights/float(sub)
         else:
             pixelmap.ravel()[mapping[0][::sub]] = weights
-    return tpf, ts, weights, pixelmap, pixels_sub
+        wmap = {
+        "initial_cadence": c1,
+        "final_cadence": c2,
+        "sat_pixels": sat,
+        "weightmap": pixelmap
+        }
+    return tpf, ts, weights, wmap, pixels_sub
 
 # =========================================================================
 # Remove background stars
