@@ -446,8 +446,8 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,split_times=None,w_init=None,rando
             sat.append(pmap["sat_pixels"])
             weightmap.append(pmap["weightmap"])
         wmap = {
-        "initial_cadence": c1,
-        "final_cadence": c2,
+        "initial_cadence": cad1,
+        "final_cadence": cad2,
         "sat_pixels": sat,
         "weightmap": weightmap
         }
