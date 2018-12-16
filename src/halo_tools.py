@@ -119,7 +119,7 @@ def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True,order
 
     dummy[m,:,:][dummy[m,:,:]<0] = 0 # just as a check!
 
-    if thresh > 0:
+    if thresh >= 0:
         saturated = np.unravel_index((-np.nanmax(dummy[m,:,:],axis=0)).argsort(axis=None)[:thresh],np.nanmax(dummy[m,:,:],axis=0).shape)
         # saturated=(flx_ord[0][-thresh:],flx_ord[1][-thresh:])
         dummy[:,saturated[0],saturated[1]] = np.nan 
@@ -230,14 +230,26 @@ def get_annulus(tpf,rmin,rmax):
 
 def stitch(tslist):
     # key idea is to match GP values at the edge
-    m = np.isfinite(tslist[0]['corr_flux'])
-    final = np.nanmedian(tslist[0]['corr_flux'][m][-5:])
+    # m = np.isfinite(tslist[0]['corr_flux'])
+    # final = np.nanmedian(tslist[0]['corr_flux'][m][-5:])
+    # newts = tslist[0].copy()
+    # for tsj in tslist[1:]:
+    #     mm = np.isfinite(tsj['corr_flux'])
+    #     initial = np.nanmedian(tsj['corr_flux'][mm][:5])
+    #     tsj['corr_flux'] += final-initial
+    #     final = np.nanmedian(tsj['corr_flux'][mm][-5:])
+    #     newts = astropy.table.vstack([newts,tsj])
+    # return newts 
+
+    # m = np.isfinite(tslist[0]['corr_flux'])
+    # final = np.nanmedian(tslist[0]['corr_flux'][m][-5:])
     newts = tslist[0].copy()
+    newts['corr_flux'] /= np.nanmedian(tslist[0]['corr_flux'])
     for tsj in tslist[1:]:
-        mm = np.isfinite(tsj['corr_flux'])
-        initial = np.nanmedian(tsj['corr_flux'][mm][:5])
-        tsj['corr_flux'] += final-initial
-        final = np.nanmedian(tsj['corr_flux'][mm][-5:])
+        # mm = np.isfinite(tsj['corr_flux'])
+        # initial = np.nanmedian(tsj['corr_flux'][mm][:5])
+        tsj['corr_flux'] /= np.nanmedian(tsj['corr_flux'])
+        # final = np.nanmedian(tsj['corr_flux'][mm][-5:])
         newts = astropy.table.vstack([newts,tsj])
     return newts 
 
