@@ -120,11 +120,10 @@ def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True,order
     dummy[m,:,:][dummy[m,:,:]<0] = 0 # just as a check!
 
     if thresh >= 0:
-        saturated = np.unravel_index((-np.nanmax(dummy[m,:,:],axis=0)).argsort(axis=None)[:thresh],np.nanmax(dummy[m,:,:],axis=0).shape)
-        # saturated=(flx_ord[0][-thresh:],flx_ord[1][-thresh:])
-        dummy[:,saturated[0],saturated[1]] = np.nan 
+        saturated = np.nanmax(dummy[m,:,:],axis=0) > (thresh*maxflux)
+        dummy[:,saturated] = np.nan 
         if verbose:
-            print('%d saturated pixels' % np.sum(saturated[0].shape))
+            print('%d saturated pixels' % np.sum(saturated))
 
     # automatic saturation threshold
     if thresh < 0:

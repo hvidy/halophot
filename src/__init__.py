@@ -1,4 +1,4 @@
 name = "halophot"
-__version__ = "0.6.6.2"
+__version__ = "0.6.6.3"
 
 from halophot import halo_tools
