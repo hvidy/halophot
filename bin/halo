@@ -155,7 +155,7 @@ if __name__ == '__main__':
             maxiter=args.maxiter,w_init=weights,random_init=args.random_init,
             thresh=args.thresh,minflux=args.minflux,consensus=args.consensus,sigclip=args.sigclip)
 
-        tpf3, ts3, w3, weightmap, pixelvector = do_lc(tpf, ts, (splits[1],None), args.sub, args.order,
+        tpf3, ts3, w3, wmap, pixelvector = do_lc(tpf, ts, (splits[1],None), args.sub, args.order,
             maxiter=args.maxiter,w_init=weights,random_init=args.random_init,
             thresh=args.thresh,minflux=args.minflux,consensus=args.consensus,analytic=args.analytic,
             sigclip=args.sigclip)
@@ -165,11 +165,12 @@ if __name__ == '__main__':
         newts = stitch([ts1,ts2,ts3])
     else:
         print('Not splitting')
-        tpf, newts, weights, weightmap, pixelvector = do_lc(tpf,ts,(None,None),args.sub, args.order,
+        tpf, newts, weights, wmap, pixelvector = do_lc(tpf,ts,(None,None),args.sub, args.order,
             maxiter=args.maxiter,random_init=args.random_init,
             thresh=args.thresh,minflux=args.minflux,consensus=args.consensus,analytic=args.analytic,
             sigclip=args.sigclip)
 
+    weightmap = wmap['weightmap']
     print_time(clock()-start)
 
     time, opt_lc = newts['time'][:], newts['corr_flux'][:]
@@ -181,8 +182,9 @@ if __name__ == '__main__':
         pixelvector, newts = pixelvector[:,good], newts[good]
         opt_lc = np.dot(weights,pixelvector)
 
-    tv1 = diff_1(opt_lc/np.nanmedian(opt_lc))/float(np.size(opt_lc))
-    tv2 = diff_2(opt_lc/np.nanmedian(opt_lc))/float(np.size(opt_lc))
+
+    tv1 = diff_1(opt_lc[np.isfinite(opt_lc)]/np.nanmedian(opt_lc))/float(np.size(opt_lc[np.isfinite(opt_lc)]))
+    tv2 = diff_2(opt_lc[np.isfinite(opt_lc)]/np.nanmedian(opt_lc))/float(np.size(opt_lc[np.isfinite(opt_lc)]))
 
     print('Total variation per point (first order): %f ' % tv1)
 

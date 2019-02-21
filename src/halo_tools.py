@@ -259,10 +259,10 @@ In this section we include the actual detrending code.
 ## it seems to be faster than using np.diff?
 
 def diff_1(z):
-    return np.sum(np.abs(z[1:-1]-np.roll(z[1:-1],1)))
+    return np.sum(np.abs(z[1:] - z[:-1]))
 
 def diff_2(z):
-    return np.sum(np.abs(2*z[1:-1]-np.roll(z[1:-1],1)-np.roll(z[1:-1],-1)))
+    return np.sum(np.abs(2.*z[1:-1] - z[2:] - z[:-2]))
 
 # =========================================================================
 # =========================================================================
