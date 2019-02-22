@@ -27,6 +27,7 @@ mpl.rcParams['xtick.labelsize'] = 12
 mpl.rcParams['ytick.labelsize'] = 12
 
 
+
 '''-----------------------------------------------------------------
 halo
 
@@ -194,30 +195,46 @@ if __name__ == '__main__':
 
     norm = np.size(weightmap)
     # weightmap = np.ma.array(weightmap,mask=np.isnan(weightmap))
+    finite = np.isfinite(newts['corr_flux'])
+    scf = savgol_filter(newts['corr_flux'][finite],201,1)
+
+    smooth = newts['corr_flux'][finite]-scf+np.nanmedian(scf)
+    smooth /= np.nanmedian(smooth)
+
+    newts['trend'] = np.nan*np.zeros_like(newts['corr_flux'])
+    newts['trend'][finite] = scf
+
+    newts['whitened'] = np.nan*np.zeros_like(newts['corr_flux'])
+    newts['whitened'][finite] = smooth
 
     hdu = fits.PrimaryHDU(weightmap.T) # can't save a masked array yet so just using pixelmap
     cols = [fits.Column(name=key,format="D",array=newts[key]) for key in newts.keys()]
     tab = fits.BinTableHDU.from_columns(cols)
 
     hdul = fits.HDUList([hdu, tab])
-    hdul.writeto('%s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order),overwrite=True)
+    hdul.writeto('%s/%s_halo_lc_o%s.fits' % (args.save_dir,args.name,args.order),overwrite=True)
 
     # newts.write('%s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order),overwrite=True)
-    print('Saved halo-corrected light curve to %s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order))
+    print('Saved halo-corrected light curve to %s/%s_halo_lc_o%s.fits' % (args.save_dir,args.name,args.order))
 
     weightmap = np.ma.array(weightmap,mask=np.isnan(weightmap))
 
     if args.do_plot:
+
+        min_p,max_p=1./24.,20.
+        frequency, power, spower = get_pgram(newts['time'],newts['whitened'],min_p=min_p,max_p=max_p)
+        formal_name = translate_greek(args.name).replace('_',' ')
+
         m = (opt_lc>0.)
         plt.figure(1)
         plt.clf()
         plt.plot(newts['time'][m],opt_lc[m]/np.nanmedian(opt_lc[m]),'-')
         plt.xlabel('Time')
         plt.ylabel('Relative Flux')
-        plt.title(args.name)
-        plt.savefig('%s/%shalo_lc_o%s.png' % (args.save_dir,args.name,args.order))
+        plt.title(r'%s' % formal_name)
+        plt.savefig('%s/%s_halo_lc_o%s.png' % (args.save_dir,args.name,args.order))
         # plt.show()
-        print('Saved halo-corrected light curve plot to %s/%shalo_lc_o%s.png' % (args.save_dir,args.name,args.order))
+        print('Saved halo-corrected light curve plot to %s/%s_halo_lc_o%s.png' % (args.save_dir,args.name,args.order))
 
         plt.figure(2)
         plt.clf()
@@ -228,7 +245,7 @@ if __name__ == '__main__':
         plt.imshow(im,cmap=cmap, vmin=-2*np.nanmax(im),vmax=2*np.nanmax(im),
             interpolation='None',origin='lower')
         plt.colorbar()
-        plt.title('TV-min Weightmap %s' % args.name)
+        plt.title(r'TV-min Weightmap %s' % formal_name)
         plt.savefig('%s/%s_weightmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
         # plt.show()
         print('Weight map saved to %s/%s_weightmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
@@ -241,7 +258,60 @@ if __name__ == '__main__':
         plt.imshow(im,cmap=cmap, vmax=np.nanmax(im),
             interpolation='None',origin='lower')
         plt.colorbar()
-        plt.title('%s Flux Map' % args.name)
+        plt.title(r'%s Flux Map' % formal_name)
         plt.savefig('%s/%s_fluxmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
         # plt.show()
         print('Flux map saved to %s/%s_fluxmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
+
+        plt.figure(4)
+        ax1 = plt.axes()
+
+        ax1.plot(frequency*11.57,power,'0.8',label='Raw')
+        ax1.plot(frequency*11.57,spower,linewidth=3.0,label='Smoothed')
+        ax1.set_xlim(1./max_p*11.57,1./min_p*11.57)
+        ax1.set_xlabel(r'Frequency ($\mu$Hz)')
+        ax1.set_ylabel(r'Power (ppm$^2/{\mu}Hz)$')
+
+        ax2 = ax1.twiny()
+        ax2.tick_params(axis="x",direction="in", pad=-20)
+
+        ax2.set_xlim(1./max_p,1./min_p)
+        ax2.set_xlabel('c/d',labelpad=-20)
+        plt.ylim(0,np.max(power));
+        plt.title(r'%s Power Spectrum' % formal_name,y=1.01)
+        ax1.legend()
+        plt.savefig('%s/%s_pspec_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
+        print('Periodogram saved to %s/%s_pspec_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
+
+        plt.figure(5)
+        ax1 = plt.axes()
+
+        ax1.plot(frequency*11.57,power,'0.8',label='Raw')
+        ax1.plot(frequency*11.57,spower,linewidth=3.0,label='Smoothed')
+        ax1.set_xlim(1./max_p*11.57,1./min_p*11.57)
+        ax1.set_xlabel(r'Frequency ($\mu$Hz)')
+        ax1.set_ylabel(r'Power (ppm$^2/{\mu}Hz)$')
+
+        ax2 = ax1.twiny()
+        ax2.tick_params(axis="x",direction="in", pad=-20)
+
+        ax2.set_xlim(1./max_p,1./min_p)
+        ax2.set_xlabel('c/d',labelpad=-35)
+
+        plt.ylim(np.min(spower),np.max(power))
+        ax1.set_xscale('log')
+        ax2.set_xscale('log')
+
+        plt.yscale('log')
+        plt.title(r'%s Power Spectrum' % formal_name,y=1.01)
+        ax1.legend()
+        plt.savefig('%s/%s_log_pspec_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
+        print('Log periodogram saved to %s/%s_log_pspec_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
+
+        plt.figure(6)
+        plt.plot(newts['time'],newts['whitened'],'.')
+        plt.xlabel('BJD')
+        plt.ylabel('Normalized Flux')
+        plt.title(r'%s Light Curve' % formal_name,y=1.01)
+        plt.savefig('%s/%s_whitened_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
+        print('Whitened curve saved to %s/%s_whitened_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))

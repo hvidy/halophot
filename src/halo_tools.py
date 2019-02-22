@@ -17,6 +17,8 @@ from sklearn.cluster import DBSCAN
 from skimage.feature import peak_local_max
 from skimage.morphology import watershed
 import lightkurve
+from scipy.signal import savgol_filter
+from astropy.stats import LombScargle
 
 import warnings
 warnings.filterwarnings("ignore",category =RuntimeWarning)
@@ -30,11 +32,40 @@ halo photometry in Python.
 
 -----------------------------------------------------------------'''
 
+simbadgreek = ['alf','bet','gam','del','eps','zet','eta','tet','iot','kap','lam','mu','nu','ksi','omi','pi','rho','sig','tau','ups','phi','khi','psi','ome']
+latexgreek = ['\\alpha', '\\beta', '\\gamma','\\delta','\\epsilon','\\zeta','\\eta','\\theta','\\iota','\\kappa','\\lambda','\\mu','\\nu','\\xi','o','\\pi','\\rho','\\sigma','\\tau','\\upsilon','\\phi','\\chi','\\psi','\\omega']
+
+def translate_greek(word):
+    for j, letter in enumerate(simbadgreek):
+        if letter in word:
+            word = word.replace(letter,'$%s$' % latexgreek[j])
+            return(word)
+    return(word)
+
+# =========================================================================
+# =========================================================================
+
 def softmax(x):
     '''From https://gist.github.com/stober/1946926'''
     e_x = agnp.exp(x - agnp.max(x))
     out = e_x / e_x.sum()
     return out
+
+def get_pgram(time,flux, min_p=1./24., max_p = 20.):
+    finite = np.isfinite(flux)
+    ls = LombScargle(time[finite],flux[finite],normalization='psd')
+    
+    frequency, power = ls.autopower(minimum_frequency=1./max_p,maximum_frequency=1./min_p,samples_per_peak=5)
+
+    norm = np.nanstd(flux * 1e6)**2 / np.sum(power) # normalize according to Parseval's theorem - same form used by Oliver Hall in lightkurve
+    fs = np.mean(np.diff(frequency*11.57)) # ppm^/muHz
+
+    power *= norm/fs
+
+    spower = savgol_filter(power,51,1)
+
+    return frequency, power, spower 
+
 
 # =========================================================================
 # =========================================================================
