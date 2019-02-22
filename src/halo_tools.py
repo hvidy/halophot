@@ -20,6 +20,24 @@ import lightkurve
 from scipy.signal import savgol_filter
 from astropy.stats import LombScargle
 
+
+import matplotlib as mpl
+
+mpl.style.use('seaborn-colorblind')
+
+#To make sure we have always the same matplotlib settings
+#(the ones in comments are the ipython notebook settings)
+
+mpl.rcParams['figure.figsize']=(8.0,6.0)    #(6.0,4.0)
+mpl.rcParams['font.size']=18               #10 
+mpl.rcParams['savefig.dpi']= 200             #72 
+mpl.rcParams['axes.labelsize'] = 16
+mpl.rcParams['axes.labelsize'] = 16
+mpl.rcParams['xtick.labelsize'] = 12
+mpl.rcParams['ytick.labelsize'] = 12
+
+colours = mpl.rcParams['axes.prop_cycle'].by_key()['color']
+
 import warnings
 warnings.filterwarnings("ignore",category =RuntimeWarning)
 warnings.filterwarnings('ignore', category=FutureWarning)
@@ -50,6 +68,10 @@ def softmax(x):
     e_x = agnp.exp(x - agnp.max(x))
     out = e_x / e_x.sum()
     return out
+
+# =========================================================================
+# =========================================================================
+
 
 def get_pgram(time,flux, min_p=1./24., max_p = 20.):
     finite = np.isfinite(flux)
@@ -597,6 +619,83 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,split_times=None,w_init=None,rando
         "weightmap": pixelmap
         }
     return tpf, ts, weights, wmap, pixels_sub
+
+# =========================================================================
+# Make Plots
+# =========================================================================
+
+def plot_lc(ax1,time,lc,name,trend=None):
+        m = (lc>0.) * (np.isfinite(lc))
+
+        ax1.plot(time[m],lc[m]/np.nanmedian(lc[m]),'.')
+        if trend is not None:
+            ax1.plot(time[m],trend[m]/np.nanmedian(trend[m]),'-',color=colours[2])
+            plt.legend(labels=['Flux','Trend'])
+        ax1.set_xlabel('Time')
+        ax1.set_ylabel('Relative Flux')
+        plt.title(r'%s' % name)
+
+def plot_fluxmap(ax1,image,name):
+
+        cmap = mpl.cm.hot
+        cmap.set_bad('k',1.)
+        im = np.log10(image)
+        pic = ax1.imshow(im,cmap=cmap, vmax=np.nanmax(im),
+            interpolation='None',origin='lower')
+        plt.colorbar(pic)
+        plt.title(r'%s Flux Map' % name)
+        
+def plot_weightmap(ax1,weightmap,name):
+        norm = np.size(weightmap)
+
+        cmap = mpl.cm.seismic
+        cmap.set_bad('k',1.)
+
+        im = np.log10(weightmap.T*norm)
+        pic = ax1.imshow(im,cmap=cmap, vmin=-2*np.nanmax(im),vmax=2*np.nanmax(im),
+            interpolation='None',origin='lower')
+
+        plt.colorbar(pic)
+        plt.title(r'TV-min Weightmap %s' % name)
+
+def plot_pgram(ax1,frequency,power,spower,name,min_p=1./24.,max_p=20.):
+
+    ax1.plot(frequency*11.57,power,'0.8',label='Raw')
+    ax1.plot(frequency*11.57,spower,linewidth=3.0,label='Smoothed')
+    ax1.set_xlim(1./max_p*11.57,1./min_p*11.57)
+    ax1.set_xlabel(r'Frequency ($\mu$Hz)')
+    ax1.set_ylabel(r'Power (ppm$^2/{\mu}Hz)$')
+
+    ax2 = ax1.twiny()
+    ax2.tick_params(axis="x",direction="in", pad=-20)
+
+    ax2.set_xlim(1./max_p,1./min_p)
+    ax2.set_xlabel('c/d',labelpad=-20)
+    plt.ylim(0,np.max(power));
+    plt.title(r'%s Power Spectrum' % name,y=1.01)
+    ax1.legend()
+
+def plot_log_pgram(ax1,frequency,power,spower,name,min_p=1./24.,max_p=20.):
+
+    ax1.plot(frequency*11.57,power,'0.8',label='Raw')
+    ax1.plot(frequency*11.57,spower,linewidth=3.0,label='Smoothed')
+    ax1.set_xlim(1./max_p*11.57,1./min_p*11.57)
+    ax1.set_xlabel(r'Frequency ($\mu$Hz)')
+    ax1.set_ylabel(r'Power (ppm$^2/{\mu}Hz)$')
+
+    ax2 = ax1.twiny()
+    ax2.tick_params(axis="x",direction="in", pad=-20)
+
+    ax2.set_xlim(1./max_p,1./min_p)
+    ax2.set_xlabel('c/d',labelpad=-35)
+
+    plt.ylim(np.min(spower),np.max(power))
+    ax1.set_xscale('log')
+    ax2.set_xscale('log')
+
+    plt.yscale('log')
+    plt.title(r'%s Power Spectrum' % name,y=1.01)
+    ax1.legend()
 
 # =========================================================================
 # Remove background stars
