@@ -642,8 +642,13 @@ def plot_fluxmap(ax1,image,name):
         im = np.log10(image)
         pic = ax1.imshow(im,cmap=cmap, vmax=np.nanmax(im),
             interpolation='None',origin='lower')
-        plt.colorbar(pic)
         plt.title(r'%s Flux Map' % name)
+
+        cbaraxes, kw = mpl.colorbar.make_axes(ax1,location='left',pad=0.01)
+        plt.colorbar(pic,cax=cbaraxes)
+
+        cbaraxes.yaxis.set_ticks_position('left')
+        ax1.yaxis.set_ticks_position('right')
         
 def plot_weightmap(ax1,weightmap,name):
         norm = np.size(weightmap)
