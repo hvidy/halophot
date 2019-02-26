@@ -22,6 +22,10 @@ from astropy.stats import LombScargle
 
 
 import matplotlib as mpl
+from matplotlib import rc
+from matplotlib.gridspec import GridSpec
+from matplotlib.pyplot import figure, subplots, subplot
+from mpl_toolkits.axes_grid1 import make_axes_locatable, axes_size
 
 mpl.style.use('seaborn-colorblind')
 
@@ -54,11 +58,14 @@ simbadgreek = ['alf','bet','gam','del','eps','zet','eta','tet','iot','kap','lam'
 latexgreek = ['\\alpha', '\\beta', '\\gamma','\\delta','\\epsilon','\\zeta','\\eta','\\theta','\\iota','\\kappa','\\lambda','\\mu','\\nu','\\xi','o','\\pi','\\rho','\\sigma','\\tau','\\upsilon','\\phi','\\chi','\\psi','\\omega']
 
 def translate_greek(word):
-    for j, letter in enumerate(simbadgreek):
-        if letter in word:
-            word = word.replace(letter,'$%s$' % latexgreek[j])
-            return(word)
-    return(word)
+    if word[0].isupper():
+        return(word)
+    else:
+        for j, letter in enumerate(simbadgreek):
+            if letter in word:
+                word = word.replace(letter,'$%s$' % latexgreek[j])
+                return(word)
+        return(word)
 
 # =========================================================================
 # =========================================================================
@@ -624,7 +631,7 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,split_times=None,w_init=None,rando
 # Make Plots
 # =========================================================================
 
-def plot_lc(ax1,time,lc,name,trend=None):
+def plot_lc(ax1,time,lc,name,trend=None,title=False):
         m = (lc>0.) * (np.isfinite(lc))
 
         ax1.plot(time[m],lc[m]/np.nanmedian(lc[m]),'.')
@@ -633,24 +640,33 @@ def plot_lc(ax1,time,lc,name,trend=None):
             plt.legend(labels=['Flux','Trend'])
         ax1.set_xlabel('Time')
         ax1.set_ylabel('Relative Flux')
-        plt.title(r'%s' % name)
+        if title:
+            plt.title(r'%s' % name)
 
-def plot_fluxmap(ax1,image,name):
+def plot_fluxmap(ax1,image,name,title=False):
 
         cmap = mpl.cm.hot
         cmap.set_bad('k',1.)
         im = np.log10(image)
         pic = ax1.imshow(im,cmap=cmap, vmax=np.nanmax(im),
             interpolation='None',origin='lower')
-        plt.title(r'%s Flux Map' % name)
+        if title:
+            plt.title(r'%s Flux Map' % name)
 
-        cbaraxes, kw = mpl.colorbar.make_axes(ax1,location='left',pad=0.01)
-        plt.colorbar(pic,cax=cbaraxes)
+        aspect = 20
+        pad_fraction = 0.5
 
-        cbaraxes.yaxis.set_ticks_position('left')
+        divider = make_axes_locatable(ax1)
+        width = axes_size.AxesY(ax1, aspect=1./aspect)
+        pad = axes_size.Fraction(pad_fraction, width)
+        cax = divider.append_axes("left", size=width, pad=pad)
+        plt.colorbar(pic, cax=cax)
+
         ax1.yaxis.set_ticks_position('right')
         
-def plot_weightmap(ax1,weightmap,name):
+        cax.yaxis.set_ticks_position('left')
+        
+def plot_weightmap(ax1,weightmap,name,title=False):
         norm = np.size(weightmap)
 
         cmap = mpl.cm.seismic
@@ -659,11 +675,25 @@ def plot_weightmap(ax1,weightmap,name):
         im = np.log10(weightmap.T*norm)
         pic = ax1.imshow(im,cmap=cmap, vmin=-2*np.nanmax(im),vmax=2*np.nanmax(im),
             interpolation='None',origin='lower')
+        if title:
+            plt.title(r'TV-min Weightmap %s' % name)
 
-        plt.colorbar(pic)
-        plt.title(r'TV-min Weightmap %s' % name)
+        # cbaraxes, kw = mpl.colorbar.make_axes(ax1,location='right',pad=0.01)
+        # plt.colorbar(pic,cax=cbaraxes)
 
-def plot_pgram(ax1,frequency,power,spower,name,min_p=1./24.,max_p=20.):
+        # cbaraxes.yaxis.set_ticks_position('right')
+        aspect = 20
+        pad_fraction = 0.5
+
+        divider = make_axes_locatable(ax1)
+        width = axes_size.AxesY(ax1, aspect=1./aspect)
+        pad = axes_size.Fraction(pad_fraction, width)
+        cax = divider.append_axes("right", size=width, pad=pad)
+        plt.colorbar(pic, cax=cax)
+
+        ax1.yaxis.set_ticks_position('left')
+
+def plot_pgram(ax1,frequency,power,spower,name,min_p=1./24.,max_p=20.,title=False):
 
     ax1.plot(frequency*11.57,power,'0.8',label='Raw')
     ax1.plot(frequency*11.57,spower,linewidth=3.0,label='Smoothed')
@@ -677,10 +707,11 @@ def plot_pgram(ax1,frequency,power,spower,name,min_p=1./24.,max_p=20.):
     ax2.set_xlim(1./max_p,1./min_p)
     ax2.set_xlabel('c/d',labelpad=-20)
     plt.ylim(0,np.max(power));
-    plt.title(r'%s Power Spectrum' % name,y=1.01)
+    if title:
+        plt.title(r'%s Power Spectrum' % name,y=1.01)
     ax1.legend()
 
-def plot_log_pgram(ax1,frequency,power,spower,name,min_p=1./24.,max_p=20.):
+def plot_log_pgram(ax1,frequency,power,spower,name,min_p=1./24.,max_p=20.,title=False):
 
     ax1.plot(frequency*11.57,power,'0.8',label='Raw')
     ax1.plot(frequency*11.57,spower,linewidth=3.0,label='Smoothed')
@@ -699,8 +730,51 @@ def plot_log_pgram(ax1,frequency,power,spower,name,min_p=1./24.,max_p=20.):
     ax2.set_xscale('log')
 
     plt.yscale('log')
-    plt.title(r'%s Power Spectrum' % name,y=1.01)
+    if title:
+        plt.title(r'%s Power Spectrum' % name,y=1.01)
     ax1.legend()
+
+def plot_all(ts,image,weightmap,save_file=None,formal_name='test'):
+    min_p,max_p=1./24.,20.
+
+    PW,PH = 8.27, 11.69
+    
+    frequency, power, spower = get_pgram(ts['time'],ts['whitened'],min_p=min_p,max_p=max_p)
+    
+    rc('axes', labelsize=7, titlesize=8)
+    rc('font', size=6)
+    rc('xtick', labelsize=7)
+    rc('ytick', labelsize=7)
+    rc('lines', linewidth=1)
+    fig = plt.figure(figsize=(PW,PH))
+    gs1 = GridSpec(2,2)
+    gs1.update(top=0.95, bottom = 2/3.*1.05,hspace=0.0,left=0.09,right=0.96)
+    gs2 = GridSpec(1,2)
+    gs2.update(top=2/3.*0.97,bottom=1/3.*1.07,hspace=0.35,left=0.09,right=0.96)
+    gs3 = GridSpec(2,2)
+    gs3.update(top=1/3.*0.96,bottom=0.04,hspace=0.07,left=0.09,right=0.96)
+
+    ax_lctime = subplot(gs1[0,:])
+    ax_lcwhite = subplot(gs1[1,:],sharex=ax_lctime)
+    ax_fluxmap = subplot(gs2[0,0])
+    ax_weightmap = subplot(gs2[0,1])
+    ax_periodogram   = subplot(gs3[0,:])
+    ax_logpgram    = subplot(gs3[1,:])
+
+    plot_lc(ax_lctime,ts['time'],ts['corr_flux'],formal_name,trend=ts['trend'])
+    plot_lc(ax_lcwhite,ts['time'],ts['whitened'],formal_name+': Whitened')
+    plot_weightmap(ax_weightmap,weightmap,formal_name)
+    plot_fluxmap(ax_fluxmap,image,formal_name)
+    plot_pgram(ax_periodogram,frequency,power,spower,formal_name)        
+    plot_log_pgram(ax_logpgram,frequency,power,spower,formal_name)  
+
+    fig.suptitle(formal_name,y=0.99,fontsize=20)
+    ax_periodogram.set_title('Periodograms')
+    ax_fluxmap.set_title('Flux Map')
+    ax_weightmap.set_title('TV-Min Weight Map')
+
+    if save_file is not None:
+        plt.savefig(save_file)
 
 # =========================================================================
 # Remove background stars

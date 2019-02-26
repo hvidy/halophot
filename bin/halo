@@ -220,54 +220,10 @@ if __name__ == '__main__':
 
     if args.do_plot:
 
-        min_p,max_p=1./24.,20.
-        frequency, power, spower = get_pgram(newts['time'],newts['whitened'],min_p=min_p,max_p=max_p)
         formal_name = translate_greek(args.name).replace('_',' ')
-
-        plt.figure(1)
-        ax1 = plt.axes()
-
-        plot_lc(ax1,newts['time'],opt_lc,formal_name,trend=newts['trend'])
-        plt.savefig('%s/%s_halo_lc_o%s.png' % (args.save_dir,args.name,args.order))
-        print('Saved halo-corrected light curve plot to %s/%s_halo_lc_o%s.png' % (args.save_dir,args.name,args.order))
-
-        plt.figure(2)
-        ax1 = plt.axes()
-
-        plot_weightmap(ax1,weightmap,formal_name)
-        plt.savefig('%s/%s_weightmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
-        print('Weight map saved to %s/%s_weightmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
-        
-        plt.figure(3)
-        ax1 = plt.axes()
-
         image = np.nansum(tpf,axis=0)
-        plot_fluxmap(ax1,image,formal_name)
-        plt.savefig('%s/%s_fluxmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
-        print('Flux map saved to %s/%s_fluxmap_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
 
+        plt.figure(0)
 
-        ### Do periodogram
-        plt.figure(4)
-        ax1 = plt.axes()
-
-        plot_pgram(ax1,frequency,power,spower,formal_name)        
-        plt.savefig('%s/%s_pspec_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
-        print('Periodogram saved to %s/%s_pspec_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
-
-        ### Do logspace periodogram
-
-        plt.figure(5)
-        ax1 = plt.axes()
-
-        plot_log_pgram(ax1,frequency,power,spower,formal_name)        
-        plt.savefig('%s/%s_log_pspec_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
-        print('Logspace periodogram saved to %s/%s_log_pspec_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
-
-        plt.figure(6)
-        ax1 = plt.axes()
-
-        plot_lc(ax1,newts['time'],newts['whitened'],formal_name+': Whitened')
-        plt.title(r'%s Light Curve' % formal_name,y=1.01)
-        plt.savefig('%s/%s_whitened_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
-        print('Whitened curve saved to %s/%s_whitened_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
+        plot_all(newts,image,weightmap,formal_name=formal_name+' - C%02d' % args.campaign,save_file='%s/%s_all_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
+        print('Everything saved to %s/%s_all_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
