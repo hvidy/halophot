@@ -709,7 +709,7 @@ def plot_log_pgram(ax1,frequency,power,spower,name,min_p=1./24.,max_p=20.,title=
     ax2.set_xlim(1./max_p,1./min_p)
     ax2.set_xlabel('c/d',labelpad=-35)
 
-    plt.ylim(np.min(spower),np.max(power))
+    plt.ylim(np.percentile(spower,5),np.max(power))
     ax1.set_xscale('log')
     ax2.set_xscale('log')
 
