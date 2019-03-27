@@ -17,8 +17,9 @@ from sklearn.cluster import DBSCAN
 from skimage.feature import peak_local_max
 from skimage.morphology import watershed
 import lightkurve
+from lightkurve.utils import KeplerQualityFlags, TessQualityFlags
 from scipy.signal import savgol_filter
-from astropy.stats import LombScargle
+from astropy.stats import LombScargle, sigma_clip
 
 
 import matplotlib as mpl
@@ -100,34 +101,6 @@ def get_pgram(time,flux, min_p=1./24., max_p = 20.):
 # =========================================================================
 
 
-def sigma_clip(a, max_iter=10, max_sigma=5, separate_masks=False, mexc=None):
-    """Iterative sigma-clipping routine that separates not finite points, and down- and upwards outliers.
-
-    from k2sc, authors: Aigrain, Parviainen & Pope
-    """
-    mexc  = isfinite(a) if mexc is None else isfinite(a) & mexc
-    mhigh = ones_like(mexc)
-    mlow  = ones_like(mexc)
-    mask  = ones_like(mexc)
-
-    i, nm = 0, None
-    while (nm != mask.sum()) and (i < max_iter):
-        mask = mexc & mhigh & mlow
-        nm = mask.sum()
-        med, sig = medsig(a[mask])
-        mhigh[mexc] = a[mexc] - med <  max_sigma*sig
-        mlow[mexc]  = a[mexc] - med > -max_sigma*sig
-        i += 1
-
-    if separate_masks:
-        return mlow, mhigh
-    else:
-        return mlow & mhigh
-
-# =========================================================================
-# =========================================================================
-
-
 def print_time(t):
         if t>3600:
             print('Time taken: %d h %d m %3f s'\
@@ -161,7 +134,7 @@ def read_tpf(fname):
 # =========================================================================
 # =========================================================================
 
-def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True,order=1,sub=1):
+def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True,order=1,sub=1,mission='kepler'):
     '''Throw away bad pixels and bad cadences'''
 
     dummy = tpf.copy()
@@ -171,7 +144,14 @@ def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True,order
     # find bad pixels
 
     if do_quality:
-        m = (ts['quality'] == 0) # get bad quality 
+        if mission == 'kepler':
+            qf = KeplerQualityFlags()
+            m = qf.create_quality_mask(ts['quality'],bitmask='default')
+        elif mission == 'tess':
+            qf = TessQualityFlags()
+            m = qf.create_quality_mask(ts['quality'],bitmask='default')
+        else:
+            m = (ts['quality'] == 0) # get bad quality 
         # dummy = dummy[m,:,:]
         # tsd = tsd[m]
     else:
@@ -403,10 +383,10 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=Fa
         lc_first_try = np.dot(w_best.T,pixelvector)
 
         if sigclip:
-            print('Sigma clipping')
+            if verbose:
+                print('Sigma clipping')
 
-            good = sigma_clip(lc_first_try,max_sigma=3.5)
-
+            good = ~sigma_clip(lc_first_try-savgol_filter(lc_first_try,51,1),sigma=6.0).mask
 
             if np.sum(~good) > 0:
                 if verbose:
@@ -429,6 +409,7 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=Fa
                 if verbose:
                     print('No outliers found, continuing')
         else:
+            good = np.isfinite(lc_first_try)
             pass
 
     else:
@@ -472,6 +453,7 @@ def tv_tpf(pixelvector,order=1,w_init=None,maxiter=101,analytic=False,sigclip=Fa
         w_best = res['x']
 
     lc_opt = np.dot(w_best.T,pixelvector)
+    lc_opt[~good] = np.nan
     return w_best, lc_opt
 
 # =========================================================================
@@ -604,11 +586,11 @@ def do_lc(tpf,ts,splits,sub,order,maxiter=101,split_times=None,w_init=None,rando
                 w_init /= np.sum(w_init)
 
             weights, opt_lc = tv_tpf(pixels_sub,order=order,maxiter=maxiter,
-                w_init=w_init,analytic=analytic,verbose=verbose)
+                w_init=w_init,analytic=analytic,verbose=verbose,sigclip=sigclip)
             if verbose:
                 print('Calculated weights!')
 
-        # opt_lc = np.dot(weights.T,pixels_sub)
+
         ts['corr_flux'] = np.nan*np.ones_like(ts['x'])
         ts['corr_flux'][goodcad] = opt_lc
 
@@ -635,6 +617,8 @@ def plot_lc(ax1,time,lc,name,trend=None,title=False):
         m = (lc>0.) * (np.isfinite(lc))
 
         ax1.plot(time[m],lc[m]/np.nanmedian(lc[m]),'.')
+        dt = np.nanmedian(time[m][1:]-time[m][:-1])
+        ax1.set_xlim(time[m].min()-dt,time[m].max()+dt)
         if trend is not None:
             ax1.plot(time[m],trend[m]/np.nanmedian(trend[m]),'-',color=colours[2])
             plt.legend(labels=['Flux','Trend'])
