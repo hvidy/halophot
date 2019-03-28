@@ -51,8 +51,7 @@ if __name__ == '__main__':
     ap.add_argument('--name', default='test',type=str,help='Target name')
     ap.add_argument('-c', '--campaign', metavar='C',default=4, type=int, 
         help='Campaign number')
-    ap.add_argument('-o', '--order', metavar='O', type=int,default=1, 
-        help='TV Order: 1 for gradient, 2 for concavity')
+    ap.add_argument('--objective', default='tv',type=str,help='Objective function: can be tv, tv_o2, l2v, or l3v')
     ap.add_argument('-sub',  type=int,default=1, help='Subsampling parameter')
     ap.add_argument('-maxiter',  type=int,default=151, help='Maximum # iterations')
     ap.add_argument('--splits', default=None, type=lambda s:np.fromstring(s.strip('[]'), 
@@ -71,8 +70,6 @@ if __name__ == '__main__':
                     help = 'initialize search with random seed')
     ap.add_argument('--minflux', type=float,default=100., help='Minimum flux to include')
     ap.add_argument('--thresh', type=float,default=0.8, help='What fraction of saturation to throw away')
-    ap.add_argument('--consensus', action = 'store_true', default = False, \
-                    help = 'use with subsampling to run fast and avoid overfitting')
     ap.add_argument('--analytic', action = 'store_true', default = True, \
                     help = 'use analytic derivatives; orders of magnitude faster')
     ap.add_argument('--sigclip', action = 'store_true', default = True, \
@@ -144,37 +141,37 @@ if __name__ == '__main__':
     if args.do_split:
         print('First doing one run to establish weights')
 
-        tpf, newts, weights, weightmap, pixelvector = do_lc(tpf,ts,(None,None),args.sub, args.order,
+        tpf, newts, weights, weightmap, pixelvector = do_lc(tpf,ts,(None,None),args.sub, 
             maxiter=args.maxiter,random_init=args.random_init,
-            thresh=args.thresh,minflux=args.minflux,consensus=args.consensus,analytic=args.analytic,
-            sigclip=args.sigclip)
+            thresh=args.thresh,minflux=args.minflux,analytic=args.analytic,
+            sigclip=args.sigclip,objective=args.objective)
 
         'Splitting at',splits
         # do first segment
-        tpf1, ts1, w1, wm1, pv1 = do_lc(tpf, ts, (None,splits[0]), args.sub, args.order,
+        tpf1, ts1, w1, wm1, pv1 = do_lc(tpf, ts, (None,splits[0]), args.sub, 
             maxiter=args.maxiter,w_init=weights,random_init=args.random_init,
-            thresh=args.thresh,minflux=args.minflux,consensus=args.consensus,analytic=args.analytic,
-            sigclip=args.sigclip)
+            thresh=args.thresh,minflux=args.minflux,analytic=args.analytic,
+            sigclip=args.sigclip,objective=args.objective)
 
         # do others
-        tpf2, ts2, w2, wm2, pv2 = do_lc(tpf, ts, (splits[0],splits[1]), args.sub, args.order,
+        tpf2, ts2, w2, wm2, pv2 = do_lc(tpf, ts, (splits[0],splits[1]), args.sub, 
             maxiter=args.maxiter,w_init=weights,random_init=args.random_init,
-            thresh=args.thresh,minflux=args.minflux,consensus=args.consensus,sigclip=args.sigclip)
+            thresh=args.thresh,minflux=args.minflux,sigclip=args.sigclip,objective=args.objective)
 
-        tpf3, ts3, w3, wmap, pixelvector = do_lc(tpf, ts, (splits[1],None), args.sub, args.order,
+        tpf3, ts3, w3, wmap, pixelvector = do_lc(tpf, ts, (splits[1],None), args.sub, 
             maxiter=args.maxiter,w_init=weights,random_init=args.random_init,
-            thresh=args.thresh,minflux=args.minflux,consensus=args.consensus,analytic=args.analytic,
-            sigclip=args.sigclip)
+            thresh=args.thresh,minflux=args.minflux,analytic=args.analytic,
+            sigclip=args.sigclip,objective=args.objective)
 
         ## now stitch these
 
         newts = stitch([ts1,ts2,ts3])
     else:
         print('Not splitting')
-        tpf, newts, weights, wmap, pixelvector = do_lc(tpf,ts,(None,None),args.sub, args.order,
+        tpf, newts, weights, wmap, pixelvector = do_lc(tpf,ts,(None,None),args.sub, 
             maxiter=args.maxiter,random_init=args.random_init,
-            thresh=args.thresh,minflux=args.minflux,consensus=args.consensus,analytic=args.analytic,
-            sigclip=args.sigclip)
+            thresh=args.thresh,minflux=args.minflux,analytic=args.analytic,
+            sigclip=args.sigclip,objective=args.objective)
 
     weightmap = wmap['weightmap']
     print_time(clock()-start)
@@ -190,11 +187,9 @@ if __name__ == '__main__':
 
 
     tv1 = diff_1(opt_lc[np.isfinite(opt_lc)]/np.nanmedian(opt_lc))/float(np.size(opt_lc[np.isfinite(opt_lc)]))
-    tv2 = diff_2(opt_lc[np.isfinite(opt_lc)]/np.nanmedian(opt_lc))/float(np.size(opt_lc[np.isfinite(opt_lc)]))
+
 
     print('Total variation per point (first order): %f ' % tv1)
-
-    print('Total variation per point (second order): %f' % tv2)
 
     ### save your new light curve!
 
@@ -217,10 +212,10 @@ if __name__ == '__main__':
     tab = fits.BinTableHDU.from_columns(cols)
 
     hdul = fits.HDUList([hdu, tab])
-    hdul.writeto('%s/%s_halo_lc_o%s.fits' % (args.save_dir,args.name,args.order),overwrite=True)
+    hdul.writeto('%s/%s_halo_lc_%s.fits' % (args.save_dir,args.name,args.objective),overwrite=True)
 
-    # newts.write('%s/%shalo_lc_o%s.fits' % (args.save_dir,args.name,args.order),overwrite=True)
-    print('Saved halo-corrected light curve to %s/%s_halo_lc_o%s.fits' % (args.save_dir,args.name,args.order))
+    # newts.write('%s/%shalo_lc.fits' % (args.save_dir,args.name),overwrite=True)
+    print('Saved halo-corrected light curve to %s/%s_halo_lc_%s.fits' % (args.save_dir,args.name,args.objective))
 
     weightmap = np.ma.array(weightmap,mask=np.isnan(weightmap))
 
@@ -231,5 +226,5 @@ if __name__ == '__main__':
 
         plt.figure(0)
 
-        plot_all(newts,image,weightmap,formal_name=formal_name+' - C%02d' % args.campaign,save_file='%s/%s_all_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
-        print('Everything saved to %s/%s_all_o%s_sub%s.png' % (args.save_dir,args.name,args.order,args.sub))
+        plot_all(newts,image,weightmap,formal_name=formal_name+' - C%02d' % args.campaign,save_file='%s/%s_all_%s.png' % (args.save_dir,args.nameargs.objective))
+        print('Everything saved to %s/%s_all_%s.png' % (args.save_dir,args.name,args.objective))

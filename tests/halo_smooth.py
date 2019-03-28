@@ -111,7 +111,7 @@ xbest_1 = res1['x']
 
 toc = clock()
 
-print 'Time taken for TV1:',(toc-tic)
+print('Time taken for TV1:',(toc-tic))
 
 lc_opt_1 = np.dot(xbest_1.T,pixelvectors)
 
@@ -123,13 +123,13 @@ lc_opt_1 /= np.nanmedian(lc_opt_1)
 ssr = cdpp(t,raw_lc-f/np.nanmedian(f)+1)
 ss1 = cdpp(t,lc_opt_1-f/np.nanmedian(f)+1)
 
-print 'Raw Light Curve Noise (ppm):',ssr
-print 'TV1 Light Curve Noise (ppm):',ss1
+print('Raw Light Curve Noise (ppm):',ssr)
+print('TV1 Light Curve Noise (ppm):',ss1)
 
 
 finish = clock()
-print 'Done'
-print 'Time elapsed:',finish-start
+print('Done')
+print('Time elapsed:',finish-start)
 
 
 plt.figure(0)
