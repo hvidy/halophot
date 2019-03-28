@@ -1092,7 +1092,7 @@ class halo_tpf(lightkurve.TessTargetPixelFile):
         flux = np.copy(self.flux)
 
         flux[:,~aperture_mask] = np.nan
-        if .rr is not None:
+        if rr is not None:
             rmin, rmax = rr
             print('Getting annulus from',rmin,'to',rmax)
             flux = get_annulus(flux,rmin,rmax)

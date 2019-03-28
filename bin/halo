@@ -53,6 +53,7 @@ if __name__ == '__main__':
         help='Campaign number')
     ap.add_argument('--objective', default='tv',type=str,help='Objective function: can be tv, tv_o2, l2v, or l3v')
     ap.add_argument('-sub',  type=int,default=1, help='Subsampling parameter')
+    ap.add_argument('-lag',  type=int,default=1, help='Lag parameter')
     ap.add_argument('-maxiter',  type=int,default=151, help='Maximum # iterations')
     ap.add_argument('--splits', default=None, type=lambda s:np.fromstring(s.strip('[]'), 
         sep=','), help='List of time values for kernel splits')
@@ -144,23 +145,23 @@ if __name__ == '__main__':
         tpf, newts, weights, weightmap, pixelvector = do_lc(tpf,ts,(None,None),args.sub, 
             maxiter=args.maxiter,random_init=args.random_init,
             thresh=args.thresh,minflux=args.minflux,analytic=args.analytic,
-            sigclip=args.sigclip,objective=args.objective)
+            sigclip=args.sigclip,objective=args.objective,lag=args.lag)
 
         'Splitting at',splits
         # do first segment
         tpf1, ts1, w1, wm1, pv1 = do_lc(tpf, ts, (None,splits[0]), args.sub, 
             maxiter=args.maxiter,w_init=weights,random_init=args.random_init,
             thresh=args.thresh,minflux=args.minflux,analytic=args.analytic,
-            sigclip=args.sigclip,objective=args.objective)
+            sigclip=args.sigclip,objective=args.objective,lag=args.lag)
 
         # do others
         tpf2, ts2, w2, wm2, pv2 = do_lc(tpf, ts, (splits[0],splits[1]), args.sub, 
             maxiter=args.maxiter,w_init=weights,random_init=args.random_init,
-            thresh=args.thresh,minflux=args.minflux,sigclip=args.sigclip,objective=args.objective)
+            thresh=args.thresh,minflux=args.minflux,sigclip=args.sigclip,objective=args.objective,lag=args.lag)
 
         tpf3, ts3, w3, wmap, pixelvector = do_lc(tpf, ts, (splits[1],None), args.sub, 
             maxiter=args.maxiter,w_init=weights,random_init=args.random_init,
-            thresh=args.thresh,minflux=args.minflux,analytic=args.analytic,
+            thresh=args.thresh,minflux=args.minflux,analytic=args.analytic,lag=args.lag,
             sigclip=args.sigclip,objective=args.objective)
 
         ## now stitch these
@@ -171,7 +172,7 @@ if __name__ == '__main__':
         tpf, newts, weights, wmap, pixelvector = do_lc(tpf,ts,(None,None),args.sub, 
             maxiter=args.maxiter,random_init=args.random_init,
             thresh=args.thresh,minflux=args.minflux,analytic=args.analytic,
-            sigclip=args.sigclip,objective=args.objective)
+            sigclip=args.sigclip,objective=args.objective,lag=args.lag)
 
     weightmap = wmap['weightmap']
     print_time(clock()-start)
