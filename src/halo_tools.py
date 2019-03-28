@@ -403,7 +403,7 @@ def print_flex(splits):
 
 
 def do_lc(tpf,ts,splits,sub,maxiter=101,split_times=None,w_init=None,random_init=False,
-    thresh=-1.,minflux=-100.,analytic=False,sigclip=False,verbose=True,lag=1,objective='tv'):
+    thresh=-1.,minflux=-100.,analytic=False,sigclip=False,verbose=True,lag=1,objective='tv',mission='kepler'):
     ### get a slice corresponding to the splits you want
 
     if split_times is not None:
@@ -472,7 +472,7 @@ def do_lc(tpf,ts,splits,sub,maxiter=101,split_times=None,w_init=None,random_init
 
         ### now throw away saturated columns, nan pixels and nan cadences
 
-        pixels, tsd, goodcad, mapping, sat = censor_tpf(tpf,ts,thresh=thresh,minflux=minflux,verbose=verbose,sub=sub)
+        pixels, tsd, goodcad, mapping, sat = censor_tpf(tpf,ts,thresh=thresh,minflux=minflux,verbose=verbose,sub=sub,mission=mission)
         pixelmap = np.zeros((tpf.shape[2],tpf.shape[1]))
         if verbose:
             print('Censored TPF')
@@ -1077,6 +1077,11 @@ class halo_tpf(lightkurve.TessTargetPixelFile):
         else:
             aperture_mask = mask
 
+        if tpf.mission == 'TESS':
+            mission = 'tess'
+        else:
+            mission = 'kepler'
+
         centroid_col, centroid_row = self.estimate_centroids()
 
         x, y = self.hdu[1].data['POS_CORR1'][self.quality_mask], self.hdu[1].data['POS_CORR2'][self.quality_mask]
@@ -1100,7 +1105,7 @@ class halo_tpf(lightkurve.TessTargetPixelFile):
 
         pf, ts, weights, weightmap, pixels_sub = do_lc(flux,
                     ts,(None,None),sub,maxiter=101,split_times=split_times,w_init=w_init,random_init=random_init,
-            thresh=thresh,minflux=minflux,analytic=analytic,sigclip=sigclip,verbose=verbose,lag=lag,objective=objective)
+            thresh=thresh,minflux=minflux,analytic=analytic,sigclip=sigclip,verbose=verbose,lag=lag,objective=objective,mission=mission)
         
         nanmask = np.isfinite(ts['corr_flux'])
          ### to do! Implement light curve POS_CORR1, POS_CORR2 attributes.
