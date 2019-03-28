@@ -53,7 +53,7 @@ if __name__ == '__main__':
         help='Campaign number')
     ap.add_argument('--objective', default='tv',type=str,help='Objective function: can be tv, tv_o2, l2v, or l3v')
     ap.add_argument('-sub',  type=int,default=1, help='Subsampling parameter')
-    ap.add_argument('-lag',  type=int,default=1, help='Lag parameter')
+    ap.add_argument('--lag',  type=int,default=1, help='Lag parameter')
     ap.add_argument('-maxiter',  type=int,default=151, help='Maximum # iterations')
     ap.add_argument('--splits', default=None, type=lambda s:np.fromstring(s.strip('[]'), 
         sep=','), help='List of time values for kernel splits')
