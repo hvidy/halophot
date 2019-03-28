@@ -226,5 +226,5 @@ if __name__ == '__main__':
 
         plt.figure(0)
 
-        plot_all(newts,image,weightmap,formal_name=formal_name+' - C%02d' % args.campaign,save_file='%s/%s_all_%s.png' % (args.save_dir,args.nameargs.objective))
+        plot_all(newts,image,weightmap,formal_name=formal_name+' - C%02d' % args.campaign,save_file='%s/%s_all_%s.png' % (args.save_dir,args.name,args.objective))
         print('Everything saved to %s/%s_all_%s.png' % (args.save_dir,args.name,args.objective))
