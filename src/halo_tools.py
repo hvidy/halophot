@@ -1026,7 +1026,7 @@ class halo_tpf(lightkurve.TessTargetPixelFile):
     
     def halo(self, aperture_mask='pipeline',split_times=None,sub=1,
         maxiter=101,w_init=None,random_init=False,
-        thresh=-1,minflux=-100.,objective='tv',
+        thresh=-1,minflux=-100.,objective='tv',rr=None,
         analytic=True,sigclip=False,mask=None,verbose=True,lag=1):
 
         """Performs 'halo' TV-min weighted-aperture photometry.
@@ -1092,6 +1092,11 @@ class halo_tpf(lightkurve.TessTargetPixelFile):
         flux = np.copy(self.flux)
 
         flux[:,~aperture_mask] = np.nan
+        if .rr is not None:
+            rmin, rmax = rr
+            print('Getting annulus from',rmin,'to',rmax)
+            flux = get_annulus(flux,rmin,rmax)
+            print('Using',np.sum(np.isfinite(flux[0,:,:])),'pixels')
 
         pf, ts, weights, weightmap, pixels_sub = do_lc(flux,
                     ts,(None,None),sub,maxiter=101,split_times=split_times,w_init=w_init,random_init=random_init,
