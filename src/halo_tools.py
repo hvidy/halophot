@@ -1077,7 +1077,7 @@ class halo_tpf(lightkurve.TessTargetPixelFile):
         else:
             aperture_mask = mask
 
-        if tpf.mission == 'TESS':
+        if self.mission == 'TESS':
             mission = 'tess'
         else:
             mission = 'kepler'
