@@ -128,7 +128,7 @@ if __name__ == '__main__':
         tpf, ts = tpf[~m,:,:], ts[~m]
 
 
-    print('Data loaded!')
+    print('Loaded %s!'  % args.fname)
 
     start = clock()
 
