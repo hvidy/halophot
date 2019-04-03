@@ -517,15 +517,16 @@ def do_lc(tpf,ts,splits,sub,maxiter=101,split_times=None,w_init=None,random_init
 # Make Plots
 # =========================================================================
 
-def plot_lc(ax1,time,lc,name,trend=None,title=False):
+def plot_lc(ax1,time,lc,name,trends=None,title=False):
         m = (lc>0.) * (np.isfinite(lc))
 
         ax1.plot(time[m],lc[m]/np.nanmedian(lc[m]),'.')
         dt = np.nanmedian(time[m][1:]-time[m][:-1])
         ax1.set_xlim(time[m].min()-dt,time[m].max()+dt)
-        if trend is not None:
-            ax1.plot(time[m],trend[m]/np.nanmedian(trend[m]),'-',color=colours[2])
-            plt.legend(labels=['Flux','Trend'])
+        if trends is not None:
+            for trend in trends:
+                ax1.plot(time[m],trend[m]/np.nanmedian(trend[m]),'-',color=colours[2])
+                # plt.legend(labels=['Flux','Trend'])
         ax1.set_xlabel('Time')
         ax1.set_ylabel('Relative Flux')
         if title:
@@ -649,7 +650,7 @@ def plot_all(ts,image,weightmap,save_file=None,formal_name='test'):
     ax_periodogram   = subplot(gs3[0,:])
     ax_logpgram    = subplot(gs3[1,:])
 
-    plot_lc(ax_lctime,ts['time'],ts['corr_flux'],formal_name,trend=ts['trend'])
+    plot_lc(ax_lctime,ts['time'],ts['corr_flux'],formal_name,trends=[ts['trend']])
     plot_lc(ax_lcwhite,ts['time'],ts['whitened'],formal_name+': Whitened')
     plot_weightmap(ax_weightmap,weightmap,formal_name)
     plot_fluxmap(ax_fluxmap,image,formal_name)
