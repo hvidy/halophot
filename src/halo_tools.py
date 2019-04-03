@@ -42,6 +42,7 @@ mpl.rcParams['xtick.labelsize'] = 12
 mpl.rcParams['ytick.labelsize'] = 12
 
 colours = mpl.rcParams['axes.prop_cycle'].by_key()['color']
+mpl.rcParams["font.family"] = "Times New Roman"
 
 import warnings
 warnings.filterwarnings("ignore",category =RuntimeWarning)
@@ -134,7 +135,7 @@ def read_tpf(fname):
 # =========================================================================
 # =========================================================================
 
-def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True,sub=1,mission='kepler'):
+def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True,sub=1,mission='kepler',bitmask='default'):
     '''Throw away bad pixels and bad cadences'''
 
     dummy = tpf.copy()
@@ -146,10 +147,10 @@ def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True,sub=1
     if do_quality:
         if mission == 'kepler':
             qf = KeplerQualityFlags()
-            m = qf.create_quality_mask(ts['quality'],bitmask='default')
+            m = qf.create_quality_mask(ts['quality'],bitmask=bitmask)
         elif mission == 'tess':
             qf = TessQualityFlags()
-            m = qf.create_quality_mask(ts['quality'],bitmask='default')
+            m = qf.create_quality_mask(ts['quality'],bitmask=bitmask)
         else:
             m = (ts['quality'] == 0) # get bad quality 
         # dummy = dummy[m,:,:]
@@ -364,7 +365,7 @@ def tv_tpf(pixelvector,w_init=None,maxiter=101,analytic=False,sigclip=False,verb
         if verbose:
             print('Sigma clipping')
 
-        good = ~sigma_clip(lc_first_try-savgol_filter(lc_first_try,51,1),sigma=6.0).mask
+        good = ~sigma_clip(lc_first_try-savgol_filter(lc_first_try,51,1),sigma=5.0).mask
 
         if np.sum(~good) > 0:
             if verbose:
@@ -403,7 +404,7 @@ def print_flex(splits):
 
 
 def do_lc(tpf,ts,splits,sub,maxiter=101,split_times=None,w_init=None,random_init=False,
-    thresh=-1.,minflux=-100.,analytic=False,sigclip=False,verbose=True,lag=1,objective='tv',mission='kepler'):
+    thresh=-1.,minflux=-100.,analytic=False,sigclip=False,verbose=True,lag=1,objective='tv',mission='kepler',bitmask='default'):
     ### get a slice corresponding to the splits you want
 
     if split_times is not None:
@@ -472,7 +473,7 @@ def do_lc(tpf,ts,splits,sub,maxiter=101,split_times=None,w_init=None,random_init
 
         ### now throw away saturated columns, nan pixels and nan cadences
 
-        pixels, tsd, goodcad, mapping, sat = censor_tpf(tpf,ts,thresh=thresh,minflux=minflux,verbose=verbose,sub=sub,mission=mission)
+        pixels, tsd, goodcad, mapping, sat = censor_tpf(tpf,ts,thresh=thresh,minflux=minflux,verbose=verbose,sub=sub,mission=mission,bitmask=bitmask)
         pixelmap = np.zeros((tpf.shape[2],tpf.shape[1]))
         if verbose:
             print('Censored TPF')
@@ -536,7 +537,7 @@ def plot_fluxmap(ax1,image,name,title=False):
         cmap.set_bad('k',1.)
         im = np.log10(image)
         pic = ax1.imshow(im,cmap=cmap, vmax=np.nanmax(im),
-            interpolation='None',origin='lower')
+            interpolation='nearest',origin='lower')
         if title:
             plt.title(r'%s Flux Map' % name)
 
@@ -561,7 +562,7 @@ def plot_weightmap(ax1,weightmap,name,title=False):
 
         im = np.log10(weightmap.T*norm)
         pic = ax1.imshow(im,cmap=cmap, vmin=-2*np.nanmax(im),vmax=2*np.nanmax(im),
-            interpolation='None',origin='lower')
+            interpolation='nearest',origin='lower')
         if title:
             plt.title(r'TV-min Weightmap %s' % name)
 
@@ -1027,7 +1028,7 @@ class halo_tpf(lightkurve.TessTargetPixelFile):
     def halo(self, aperture_mask='pipeline',split_times=None,sub=1,
         maxiter=101,w_init=None,random_init=False,
         thresh=-1,minflux=-100.,objective='tv',rr=None,
-        analytic=True,sigclip=False,mask=None,verbose=True,lag=1):
+        analytic=True,sigclip=False,mask=None,verbose=True,lag=1,bitmask='default'):
 
         """Performs 'halo' TV-min weighted-aperture photometry.
              Parameters
@@ -1105,7 +1106,7 @@ class halo_tpf(lightkurve.TessTargetPixelFile):
 
         pf, ts, weights, weightmap, pixels_sub = do_lc(flux,
                     ts,(None,None),sub,maxiter=101,split_times=split_times,w_init=w_init,random_init=random_init,
-            thresh=thresh,minflux=minflux,analytic=analytic,sigclip=sigclip,verbose=verbose,lag=lag,objective=objective,mission=mission)
+            thresh=thresh,minflux=minflux,analytic=analytic,sigclip=sigclip,verbose=verbose,lag=lag,objective=objective,mission=mission,bitmask=bitmask)
         
         nanmask = np.isfinite(ts['corr_flux'])
          ### to do! Implement light curve POS_CORR1, POS_CORR2 attributes.

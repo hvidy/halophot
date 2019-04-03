@@ -52,6 +52,7 @@ if __name__ == '__main__':
     ap.add_argument('-c', '--campaign', metavar='C',default=4, type=int, 
         help='Campaign number')
     ap.add_argument('--objective', default='tv',type=str,help='Objective function: can be tv, tv_o2, l2v, or l3v')
+    ap.add_argument('--bitmask', default='default',type=str,help='Quality bitmask: can be default, hard, or hardest')
     ap.add_argument('-sub',  type=int,default=1, help='Subsampling parameter')
     ap.add_argument('--lag',  type=int,default=1, help='Lag parameter')
     ap.add_argument('-maxiter',  type=int,default=151, help='Maximum # iterations')
@@ -73,7 +74,7 @@ if __name__ == '__main__':
     ap.add_argument('--thresh', type=float,default=0.8, help='What fraction of saturation to throw away')
     ap.add_argument('--analytic', action = 'store_true', default = True, \
                     help = 'use analytic derivatives; orders of magnitude faster')
-    ap.add_argument('--sigclip', action = 'store_true', default = True, \
+    ap.add_argument('--sigclip', action = 'store_true', default = False, \
                     help = 'sigma-clip the final light curve')
     ap.add_argument('--deathstar', action = 'store_true', default = False, \
                     help = 'remove background star pixels')
@@ -122,6 +123,11 @@ if __name__ == '__main__':
         m = ts['time']>2470
         tpf, ts = tpf[m,:,:], ts[m]
 
+    if args.campaign == 12:
+        m = (ts['time']>2937.75)*(ts['time']<2938.8)
+        tpf, ts = tpf[~m,:,:], ts[~m]
+
+
     print('Data loaded!')
 
     start = clock()
@@ -145,24 +151,24 @@ if __name__ == '__main__':
         tpf, newts, weights, weightmap, pixelvector = do_lc(tpf,ts,(None,None),args.sub, 
             maxiter=args.maxiter,random_init=args.random_init,
             thresh=args.thresh,minflux=args.minflux,analytic=args.analytic,
-            sigclip=args.sigclip,objective=args.objective,lag=args.lag)
+            sigclip=args.sigclip,objective=args.objective,lag=args.lag,bitmask=args.bitmask)
 
         'Splitting at',splits
         # do first segment
         tpf1, ts1, w1, wm1, pv1 = do_lc(tpf, ts, (None,splits[0]), args.sub, 
             maxiter=args.maxiter,w_init=weights,random_init=args.random_init,
             thresh=args.thresh,minflux=args.minflux,analytic=args.analytic,
-            sigclip=args.sigclip,objective=args.objective,lag=args.lag)
+            sigclip=args.sigclip,objective=args.objective,lag=args.lag,bitmask=args.bitmask)
 
         # do others
         tpf2, ts2, w2, wm2, pv2 = do_lc(tpf, ts, (splits[0],splits[1]), args.sub, 
             maxiter=args.maxiter,w_init=weights,random_init=args.random_init,
-            thresh=args.thresh,minflux=args.minflux,sigclip=args.sigclip,objective=args.objective,lag=args.lag)
+            thresh=args.thresh,minflux=args.minflux,sigclip=args.sigclip,objective=args.objective,lag=args.lag,bitmask=args.bitmask)
 
         tpf3, ts3, w3, wmap, pixelvector = do_lc(tpf, ts, (splits[1],None), args.sub, 
             maxiter=args.maxiter,w_init=weights,random_init=args.random_init,
             thresh=args.thresh,minflux=args.minflux,analytic=args.analytic,lag=args.lag,
-            sigclip=args.sigclip,objective=args.objective)
+            sigclip=args.sigclip,objective=args.objective,bitmask=args.bitmask)
 
         ## now stitch these
 
@@ -172,7 +178,7 @@ if __name__ == '__main__':
         tpf, newts, weights, wmap, pixelvector = do_lc(tpf,ts,(None,None),args.sub, 
             maxiter=args.maxiter,random_init=args.random_init,
             thresh=args.thresh,minflux=args.minflux,analytic=args.analytic,
-            sigclip=args.sigclip,objective=args.objective,lag=args.lag)
+            sigclip=args.sigclip,objective=args.objective,lag=args.lag,bitmask=args.bitmask)
 
     weightmap = wmap['weightmap']
     print_time(clock()-start)
