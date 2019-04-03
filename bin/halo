@@ -74,7 +74,7 @@ if __name__ == '__main__':
     ap.add_argument('--thresh', type=float,default=0.8, help='What fraction of saturation to throw away')
     ap.add_argument('--analytic', action = 'store_true', default = True, \
                     help = 'use analytic derivatives; orders of magnitude faster')
-    ap.add_argument('--sigclip', action = 'store_true', default = False, \
+    ap.add_argument('--sigclip', action = 'store_true', default = True, \
                     help = 'sigma-clip the final light curve')
     ap.add_argument('--deathstar', action = 'store_true', default = False, \
                     help = 'remove background star pixels')
