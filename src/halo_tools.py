@@ -525,7 +525,7 @@ def plot_lc(ax1,time,lc,name,trends=None,title=False):
         ax1.set_xlim(time[m].min()-dt,time[m].max()+dt)
         if trends is not None:
             for j, trend in enumerate(trends):
-                ax1.plot(time[m],trend[m]/np.nanmedian(trend[m]),'-',color=colours[2+j])
+                ax1.plot(time[m],trend[m]/np.nanmedian(trend[m]),'-',color=colours[2-j])
                 # plt.legend(labels=['Flux','Trend'])
         ax1.set_xlabel('Time')
         ax1.set_ylabel('Relative Flux')
