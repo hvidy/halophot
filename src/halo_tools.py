@@ -365,7 +365,7 @@ def tv_tpf(pixelvector,w_init=None,maxiter=101,analytic=False,sigclip=False,verb
         if verbose:
             print('Sigma clipping')
 
-        good = ~sigma_clip(lc_first_try-savgol_filter(lc_first_try,51,1),sigma=5.0).mask
+        good = ~sigma_clip(lc_first_try-savgol_filter(lc_first_try,51,1),sigma=6.0).mask
 
         if np.sum(~good) > 0:
             if verbose:
