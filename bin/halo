@@ -202,8 +202,10 @@ if __name__ == '__main__':
 
     norm = np.size(weightmap)
     # weightmap = np.ma.array(weightmap,mask=np.isnan(weightmap))
-    finite = np.isfinite(newts['corr_flux'])
+    # finite = np.isfinite(newts['corr_flux'])
     scf = savgol_filter(newts['corr_flux'][finite],201,1)
+    poly = np.poly1d(np.polyfit(newts['time'][finite],newts['corr_flux'][finite],15))
+    scf = poly(newts['time'][finite])
 
     smooth = newts['corr_flux'][finite]-scf+np.nanmedian(scf)
     smooth /= np.nanmedian(smooth)
