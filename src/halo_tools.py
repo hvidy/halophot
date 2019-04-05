@@ -599,7 +599,7 @@ def plot_pgram(ax1,frequency,power,spower,name,min_p=1./24.,max_p=20.,title=Fals
     if title:
         plt.title(r'%s Power Spectrum' % name,y=1.01)
     ax1.legend()
-    ax1.text(frequency[np.argmax(power)]*11.57*1.1,np.nanmax(power)*0.8,'P = %.2f d' % (1./frequency[np.argmax(power)]))
+    ax1.text(frequency[np.argmax(power)]*11.57*1.1,np.nanmax(power)*0.8,'P = %.3f d' % (1./frequency[np.argmax(power)]))
 
 def plot_log_pgram(ax1,frequency,power,spower,name,min_p=1./24.,max_p=20.,title=False):
 
