@@ -8,11 +8,6 @@ jobs:
       name: test-k2sc
       # This job runs on Linux
       runs-on: ubuntu-latest
-
-      strategy:
-        matrix:
-          Python37:
-
       steps:
         - name: run-tests
           uses: actions/checkout@v1
