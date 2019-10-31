@@ -12,8 +12,10 @@ jobs:
       strategy:
         matrix:
           Python37:
-            python.version: '3.7'
 
-  steps:
-  - uses: actions/checkout@v1
-  - template: .workflow-template.yml
+      steps:
+        - name: run-tests
+          uses: actions/checkout@v1
+          with: 
+            python.version: '3.7'
+          template: .workflow-template.yml
