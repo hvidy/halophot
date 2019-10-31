@@ -1,0 +1,17 @@
+name: Integration
+# This workflow is triggered on pushes to the repository.
+on: [push]
+
+jobs:
+    build:
+      # Job name is test-k2sc
+      name: test-k2sc
+      # This job runs on Linux
+      runs-on: ubuntu-latest
+      strategy:
+        matrix:
+          Python37:
+            python.version: '3.7'
+
+  steps:
+  - template: .workflow-template.yml
