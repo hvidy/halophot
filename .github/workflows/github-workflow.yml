@@ -8,10 +8,12 @@ jobs:
       name: test-k2sc
       # This job runs on Linux
       runs-on: ubuntu-latest
+
       strategy:
         matrix:
           Python37:
             python.version: '3.7'
 
   steps:
+  - uses: actions/checkout@v1
   - template: .workflow-template.yml
