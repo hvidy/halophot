@@ -38,8 +38,7 @@ def tv_tpf(pixelvector):
     lc_opt_1 = np.dot(xbest_1.T,pixelvector)
     return xbest_1, lc_opt_1
 
-def do_sim(xs, ys, fs,params={'width':3,'nx':10,'ny':10,'white':0,'sensitivity':None}):
-
+def make_data(xs,ys,fs,params={'width':3,'nx':10,'ny':10,'white':0,'sensitivity':None}):
     nx = params['nx']
     ny = params['ny']
 
@@ -53,6 +52,8 @@ def do_sim(xs, ys, fs,params={'width':3,'nx':10,'ny':10,'white':0,'sensitivity':
 
     if params['sensitivity'] is None:
         sensitivity=1-0.1*np.random.rand(nx,ny)
+    else:
+        sensitivity = params['sensitivity']
 
     '''------------------------
     Simulate data
@@ -64,6 +65,13 @@ def do_sim(xs, ys, fs,params={'width':3,'nx':10,'ny':10,'white':0,'sensitivity':
         tpf[:,:,j] = fs[j]*gaussian_psf(pixels,xs[j],ys[j],width)*sensitivity + np.random.randn(nx,ny)*white
 
     pixelvectors = np.reshape(tpf,(nx*ny,ncad))
+    return pixelvectors
+
+
+def do_sim(xs, ys, fs,params={'width':3,'nx':10,'ny':10,'white':0,'sensitivity':None}):
+
+
+    pixelvectors = make_data(xs,ys,fs,params)
 
     '''------------------------
     Define objectives

@@ -20,7 +20,9 @@ import lightkurve
 from lightkurve.utils import KeplerQualityFlags, TessQualityFlags
 from scipy.signal import savgol_filter
 from astropy.stats import LombScargle, sigma_clip
+from tqdm import tqdm
 
+from scipy.ndimage import gaussian_filter1d as gaussfilt
 from . import halo_objectives as objectives 
 import matplotlib as mpl
 from matplotlib import rc
@@ -93,7 +95,7 @@ def get_pgram(time,flux, min_p=1./24., max_p = 20.):
 
     power *= norm/fs
 
-    spower = savgol_filter(power,51,1)
+    spower = gaussfilt(power,15)
 
     return frequency, power, spower 
 
@@ -174,9 +176,13 @@ def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True,sub=1
             print('Searching for number of saturated pixels to cut between %d and %d' % (nstart,nfinish))
         stds=[]
         threshs=np.arange(nstart,nfinish)
-        for thr in threshs:
-            pf, ts, weights, weightmap, pixels_sub = do_lc(dummy,tsd,(None,None),sub,maxiter=101,w_init=None,random_init=False,
-            thresh=thr,minflux=-100,analytic=True,sigclip=False,verbose=False)
+        for thr in tqdm(threshs,desc='thresholds'):
+            saturated = np.unravel_index((-np.nanmax(dummy[m,:,:],axis=0)).argsort(axis=None)[:thr],np.nanmax(dummy[m,:,:],axis=0).shape)
+            # saturated=(flx_ord[0][-thresh:],flx_ord[1][-thresh:])
+            dummy2 = dummy.copy()
+            dummy2[:,saturated[0],saturated[1]] = np.nan 
+            pf, ts, weights, weightmap, pixels_sub = do_lc(dummy2,tsd,(None,None),sub,maxiter=101,w_init=None,random_init=False,
+            thresh=1.0,minflux=-100,analytic=True,sigclip=False,verbose=False)
             fl=ts['corr_flux']
             fs=fl[~np.isnan(fl)]/np.nanmedian(fl)
             sfs=savgol_filter(fs,(np.floor(len(fs)/8)*2-1).astype(int),3)
@@ -185,11 +191,11 @@ def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True,sub=1
         d1 = np.r_[0,stds[1:]-stds[:-1]]
         d2 = np.r_[0,stds[2:]-2*stds[1:-1]+stds[:-2],0]
         i1=[]
-        cut = 3
-        while len(i1) == 0:
+        for cut in [3,2,1,0]: # no while loop!!
             ind = (stds > cut*stds[0]) & (d1 > 0) & np.r_[True, d2[1:] < d2[:-1]] & np.r_[d2[:-1] < d2[1:], True] & (d2 < 0)
             i1=np.arange(len(ind))[ind]
-            cut -= 1
+            if len(i1)!=0:
+                break
 
         if len(i1) > 3: i1=i1[i1.argsort(axis=None)][0:3]
 
@@ -625,7 +631,7 @@ def plot_log_pgram(ax1,frequency,power,spower,name,min_p=1./24.,max_p=20.,title=
         plt.title(r'%s Power Spectrum' % name,y=1.01)
     ax1.legend()
 
-def plot_all(ts,image,weightmap,save_file=None,formal_name='test'):
+def plot_all(ts,image,weightmap,save_file=None,formal_name='test',title=True):
     min_p,max_p=1./24.,20.
 
     PW,PH = 8.27, 11.69
@@ -659,7 +665,8 @@ def plot_all(ts,image,weightmap,save_file=None,formal_name='test'):
     plot_pgram(ax_periodogram,frequency,power,spower,formal_name)        
     plot_log_pgram(ax_logpgram,frequency,power,spower,formal_name)  
 
-    fig.suptitle(formal_name,y=0.99,fontsize=20)
+    if title:
+        fig.suptitle(formal_name,y=0.99,fontsize=20)
     ax_periodogram.set_title('Periodograms')
     ax_fluxmap.set_title('Flux Map')
     ax_weightmap.set_title('TV-Min Weight Map')

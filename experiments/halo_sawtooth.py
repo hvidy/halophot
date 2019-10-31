@@ -7,6 +7,7 @@ from time import time as clock
 from SuzPyUtils.norm import medsig
 from psf_sim import *
 from k2sc.cdpp import cdpp
+from tqdm import tqdm
 
 import matplotlib as mpl
 
@@ -22,7 +23,8 @@ mpl.rcParams['axes.labelsize'] = 16
 mpl.rcParams['axes.labelsize'] = 16
 mpl.rcParams['xtick.labelsize'] = 12
 mpl.rcParams['ytick.labelsize'] = 12
-colours = mpl.rcParams['axes.color_cycle']
+colours = mpl.rcParams['axes.prop_cycle'].by_key()['color']
+mpl.rcParams["font.family"] = "Times New Roman"
 
 
 fname = '../EPIC_211309989_mast.fits' # point this path to your favourite K2SC light curve
@@ -52,93 +54,93 @@ sigs_raw = 1.*np.zeros_like(periods)
 sigs_1 = 1.*np.zeros_like(periods)
 
 
-for jj, period in enumerate(periods):
-	# print 'Doing period',period
+for jj, period in enumerate(tqdm(periods,desc='periods')):
+    # print('Doing period',period)
 
-	# x, y = amplitude*np.sin(2*np.pi*t/period), amplitude*np.cos(2*np.pi*t/period) # smooth
-	folded = t % period
-	x, y = amplitude*(folded/folded.max()),amplitude*(0.5 + folded/folded.max()) # sharp
+    # x, y = amplitude*np.sin(2*np.pi*t/period), amplitude*np.cos(2*np.pi*t/period) # smooth
+    folded = t % period
+    x, y = amplitude*(folded/folded.max()),amplitude*(0.5 + folded/folded.max()) # sharp
 
-	f = 20*np.ones(ncad) + np.sin(t) # make this whatever function you like! 
-	f[400:500] *= 0.9 # toy transit
-
-
-	'''------------------------
-	Define a PSF and aperture
-	------------------------'''
-
-	width = 3.
-	start = clock()
-
-	nx, ny = 10, 10
-	npix = nx*ny
-	pixels = np.zeros((nx,ny))
-
-	'''------------------------
-	Simulate data
-	------------------------'''
-
-	tpf = np.zeros((nx,ny,ncad))
-	sensitivity = 1-0.1*np.random.rand(nx,ny)
-	white = 0
-
-	for j in range(ncad):
-	    tpf[:,:,j] = f[j]*gaussian_psf(pixels,x[j],y[j],width)*sensitivity + np.random.randn(nx,ny)*white
-
-	pixelvectors = np.reshape(tpf,(nx*ny,ncad))
-
-	'''------------------------
-	Define objectives
-	------------------------'''
+    f = 20*np.ones(ncad) + np.sin(t) # make this whatever function you like! 
+    f[400:500] *= 0.9 # toy transit
 
 
-	def obj_1(weights):
-	    flux = np.dot(weights.T,pixelvectors)
-	    return diff_1(flux)/np.nanmedian(flux)
+    '''------------------------
+    Define a PSF and aperture
+    ------------------------'''
 
-	def obj_2(weights):
-	#     return np.dot(w.T,sigma_flux,w)
-	    flux = np.dot(weights.T,pixelvectors)
-	    return diff_2(flux)/np.nanmedian(flux)
+    width = 3.
+    start = clock()
 
-	'''------------------------
-	Reconstruct lightcurves
-	------------------------'''
+    nx, ny = 10, 10
+    npix = nx*ny
+    pixels = np.zeros((nx,ny))
 
-	cons = ({'type': 'eq', 'fun': lambda z: z.sum() - 1.})
-	bounds = (npix)*((0,1),)
+    '''------------------------
+    Simulate data
+    ------------------------'''
 
-	w_init = np.random.rand(npix)
-	w_init /= np.sum(w_init)
-	# w_init = np.ones(180)/180.
+    tpf = np.zeros((nx,ny,ncad))
+    sensitivity = 1-0.1*np.random.rand(nx,ny)
+    white = 0
 
-	tic = clock()
-	    
-	res1 = optimize.minimize(obj_1, w_init, method='SLSQP', constraints=cons, bounds = bounds,
-	                        options={'disp': False})
-	xbest_1 = res1['x']
+    for j in range(ncad):
+        tpf[:,:,j] = f[j]*gaussian_psf(pixels,x[j],y[j],width)*sensitivity + np.random.randn(nx,ny)*white
 
-	toc = clock()
+    pixelvectors = np.reshape(tpf,(nx*ny,ncad))
 
-	# print 'Time taken for TV1:',(toc-tic)
+    '''------------------------
+    Define objectives
+    ------------------------'''
 
-	lc_opt_1 = np.dot(xbest_1.T,pixelvectors)
 
-	raw_lc = np.sum(pixelvectors,axis=0)
+    def obj_1(weights):
+        flux = np.dot(weights.T,pixelvectors)
+        return diff_1(flux)/np.nanmedian(flux)
 
-	raw_lc /= np.nanmedian(raw_lc)
-	lc_opt_1 /= np.nanmedian(lc_opt_1)
+    def obj_2(weights):
+    #     return np.dot(w.T,sigma_flux,w)
+        flux = np.dot(weights.T,pixelvectors)
+        return diff_2(flux)/np.nanmedian(flux)
 
-	ssr = cdpp(t,raw_lc-f/np.nanmedian(f)+1)
-	ss1 = cdpp(t,lc_opt_1-f/np.nanmedian(f)+1)
+    '''------------------------
+    Reconstruct lightcurves
+    ------------------------'''
 
-	sigs_raw[jj] = ssr
-	sigs_1[jj] = ss1
+    cons = ({'type': 'eq', 'fun': lambda z: z.sum() - 1.})
+    bounds = (npix)*((0,1),)
+
+    w_init = np.random.rand(npix)
+    w_init /= np.sum(w_init)
+    # w_init = np.ones(180)/180.
+
+    tic = clock()
+        
+    res1 = optimize.minimize(obj_1, w_init, method='SLSQP', constraints=cons, bounds = bounds,
+                            options={'disp': False})
+    xbest_1 = res1['x']
+
+    toc = clock()
+
+    # print('Time taken for TV1:',(toc-tic))
+
+    lc_opt_1 = np.dot(xbest_1.T,pixelvectors)
+
+    raw_lc = np.sum(pixelvectors,axis=0)
+
+    raw_lc /= np.nanmedian(raw_lc)
+    lc_opt_1 /= np.nanmedian(lc_opt_1)
+
+    ssr = cdpp(t,raw_lc-f/np.nanmedian(f)+1)
+    ss1 = cdpp(t,lc_opt_1-f/np.nanmedian(f)+1)
+
+    sigs_raw[jj] = ssr
+    sigs_1[jj] = ss1
 
 
 finish = clock()
-print 'Done'
-print 'Time elapsed:',finish-start
+print('Done')
+print('Time elapsed:',finish-start)
 
 plt.figure(0)
 plt.clf()
