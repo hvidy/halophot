@@ -9,8 +9,9 @@ jobs:
       # This job runs on Linux
       runs-on: ubuntu-latest
       steps:
-        - name: run-tests
+        - name: checkout
           uses: actions/checkout@v1
+        - name: run-tests
           with: 
             python.version: '3.7'
           uses: .workflow-template.yml
