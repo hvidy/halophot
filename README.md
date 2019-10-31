@@ -1,7 +1,7 @@
 # halophot
 [![Licence](http://img.shields.io/badge/license-GPLv3-blue.svg?style=flat)](http://www.gnu.org/licenses/gpl-3.0.html)
 [![arXiv](http://img.shields.io/badge/arXiv-1708.07462-blue.svg?style=flat)](http://arxiv.org/abs/1708.07462)
-
+[![arXiv](http://img.shields.io/badge/arXiv-1908.06981-blue.svg?style=flat)](http://arxiv.org/abs/1908.06981)
 ## Contributors
 
 Tim White, Benjamin Pope
@@ -44,7 +44,11 @@ If you use our code, please cite
 
     White et al. (2017), MNRAS, 471, 2882-2901, arXiv:1708.07462 
 
-Or use this this BibTeX entry:
+and 
+
+    Pope et al. (2019), arXiv: 1908.06981
+
+Or use this these BibTeX entries:
 
     @ARTICLE{White2017,
        author = {{White}, T.~R. and {Pope}, B.~J.~S. and {Antoci}, V. and {P{\'a}pics}, P.~I. and 
@@ -68,4 +72,25 @@ Or use this this BibTeX entry:
        adsurl = {http://adsabs.harvard.edu/abs/2017MNRAS.471.2882W},
       adsnote = {Provided by the SAO/NASA Astrophysics Data System}
     }
+
+    @ARTICLE{2019arXiv190806981P,
+       author = {{Pope}, Benjamin J.~S. and {White}, Timothy R. and {Farr}, Will M. and
+         {Yu}, Jie and {Greklek-McKeon}, Michael and {Huber}, Daniel and
+         {Aerts}, Conny and {Aigrain}, Suzanne and {Bedding}, Timothy R. and
+         {Boyajian}, Tabetha and {Creevey}, Orlagh L. and {Hogg}, David W.},
+        title = "{The K2 Bright Star Survey I: Methodology and Data Release}",
+      journal = {arXiv e-prints},
+     keywords = {Astrophysics - Solar and Stellar Astrophysics, Astrophysics - Instrumentation and Methods for Astrophysics},
+         year = "2019",
+        month = "Aug",
+          eid = {arXiv:1908.06981},
+        pages = {arXiv:1908.06981},
+    archivePrefix = {arXiv},
+       eprint = {1908.06981},
+     primaryClass = {astro-ph.SR},
+       adsurl = {https://ui.adsabs.harvard.edu/abs/2019arXiv190806981P},
+      adsnote = {Provided by the SAO/NASA Astrophysics Data System}
+    }
+
+
 
