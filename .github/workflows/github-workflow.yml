@@ -17,7 +17,7 @@ jobs:
           with:
             python-version: '3.6' # Version range or exact version of a Python version to use, using semvers version range syntax.
             architecture: 'x64' # (x64 or x86)
-        - run: pip install --upgrade pip setuptools wheel
+        - run: pip install --upgrade pip setuptools wheel numpy
           name: 'install setuptools'
         - run:
             python setup.py install
