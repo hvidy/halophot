@@ -13,4 +13,4 @@ jobs:
           uses: actions/checkout@v1
           with: 
             python.version: '3.7'
-          template: .workflow-template.yml
+          uses: .workflow-template.yml
