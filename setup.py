@@ -22,6 +22,13 @@ def find_version(*file_paths):
         return version_match.group(1)
     raise RuntimeError("Unable to find version string.")
 
+# DEPENDENCIES
+# 1. What are the required dependencies?
+with open('requirements.txt') as f:
+    install_requires = f.read().splitlines()
+# 2. What dependencies required to run the unit tests? (i.e. `pytest --remote-data`)
+tests_require = ['pytest', 'pytest-cov', 'pytest-remotedata', 'codecov', 'pytest-doctestplus', 'codacy-coverage']
+
 
 setup(name='halophot',
       version=find_version("src", "__init__.py"),
@@ -33,7 +40,8 @@ setup(name='halophot',
       package_dir={'halophot':'src'},
       scripts=['bin/halo'],
       packages=['halophot'],
-      install_requires=["numpy","matplotlib","astropy", "scipy","autograd","lightkurve","bottleneck","statsmodels","sklearn","future==0.16.0"],
+      install_requires=install_requires,
+      tests_require=tests_require,
       license='GPLv3',
       classifiers=[
           "Topic :: Scientific/Engineering",
