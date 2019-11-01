@@ -9,4 +9,4 @@ statsmodels
 sklearn
 future==0.16.0
 k2sc
-skimage
+scikit-image
