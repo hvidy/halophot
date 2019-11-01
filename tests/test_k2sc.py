@@ -1,7 +1,7 @@
 import halophot
 from halophot.halo_tools import halo_tpf
 import lightkurve 
-from halophot import PACKAGEDIR
+
 import os
 TESTDIR = os.path.abspath(os.path.dirname(__file__))
 ddir = os.path.join(TESTDIR,'../data/')
@@ -11,7 +11,7 @@ def test_k2sc():
 	import k2sc
 	from k2sc import standalone
 
-	fname = ddir+"ktwo200173843-c13_lpd-targ.fits" # aldebaran
+	fname = ddir+"ktwo200128910-c111_lpd-targ.fits.gz" 
 
 	tpf = halo_tpf(fname)
 
@@ -28,7 +28,7 @@ def test_k2sc():
 def test_saturation():
 	print('testing')
 
-	fname = ddir+"ktwo200173843-c13_lpd-targ.fits" # aldebaran
+	fname = ddir+"ktwo200128910-c111_lpd-targ.fits.gz" 
 
 	tpf = halo_tpf(fname)
 
