@@ -428,7 +428,7 @@ def do_lc(tpf,ts,splits,sub,maxiter=101,split_times=None,w_init=None,random_init
         for j, low in enumerate(all_splits[:-1]):
             high = all_splits[j+1]
             pff, tsj, weights, pmap, pixels_sub = do_lc(tpf,
-                        ts,(low,high),sub,maxiter=101,split_times=None,w_init=w_init,random_init=random_init,
+                        ts,(low,high),sub,maxiter=maxiter,split_times=None,w_init=w_init,random_init=random_init,
                 thresh=thresh,minflux=minflux,analytic=analytic,sigclip=sigclip,verbose=verbose,objective=objective)
             tss.append(tsj)
             if low is None:
