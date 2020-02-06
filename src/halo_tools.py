@@ -224,7 +224,8 @@ def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True,sub=1
     if np.sum(np.isfinite(ts['x']))>=0.8*tsd['x'][m].shape[0]:
         rr = np.sqrt((tsd['x'][m]-xc)**2 + (tsd['y'][m]-yc)**2)
         goodpos = (rr<5) * np.isfinite(tsd['x'][m]) * np.isfinite(tsd['y'][m])
-        m[m][~goodpos] = 0
+        # m[m][~goodpos] = 0
+        m[[a[~goodpos] for a in np.where(m)]] = 0
         if np.sum(~goodpos)>0:
             if verbose:
                 print('Throwing out %d bad cadences' % np.sum(~goodpos))
@@ -244,7 +245,8 @@ def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True,sub=1
 
     # pixels = pixels[:,indic_cad>200]
     # ts = ts[indic_cad>200]
-    m[m][~np.all(np.isfinite(pixels),axis=0)] = 0
+    # m[m][~np.all(np.isfinite(pixels),axis=0)] = 0
+    m[[a[~np.all(np.isfinite(pixels),axis=0)] for a in np.where(m)]] = 0
     tsd = ts[m]
     pixels = pixels[:,np.all(np.isfinite(pixels),axis=0)]
 
@@ -1239,3 +1241,33 @@ class halo_tpf_tess(lightkurve.TessTargetPixelFile):
         lc_out.primary_header = self.hdu[0].header
         lc_out.data_header = self.hdu[1].header
         return weightmap, lc_out
+
+    # @property
+    # def flux(self):
+    #     """Returns the flux for all good-quality cadences."""
+    #     return self.hdu[1].data['FLUX'][self.quality_mask]
+
+    # @flux.setter
+    # def flux(self,value):
+    #     self.hdu[1].data['FLUX'][self.quality_mask] = value
+
+    # @property
+    # def flux_bkg(self):
+    #     """Returns the background flux for all good-quality cadences"""
+    #     return self.hdu[1].data['FLUX_BKG'][self.quality_mask]
+
+    # @flux_bkg.setter
+    # def flux_bkg(self,value):
+    #     self.hdu[1].data['FLUX_BKG'][self.quality_mask] = value
+
+    # @property
+    # def raw_cnts(self):
+    #     """Returns the raw counts for all good-quality cadences."""
+    #     return self.hdu[1].data['RAW_CNTS'][self.quality_mask]
+
+    # @raw_cnts.setter
+    # def raw_cnts(self,value):
+    #     self.hdu[1].data['RAW_CNTS'][self.quality_mask] = value
+    
+    
+    # 
