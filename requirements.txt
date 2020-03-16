@@ -8,5 +8,6 @@ bottleneck
 statsmodels
 sklearn
 future==0.16.0
-k2sc==1.0.1.4
+pybind11
+k2sc
 scikit-image
