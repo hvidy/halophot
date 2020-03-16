@@ -430,7 +430,7 @@ def do_lc(tpf,ts,splits,sub,maxiter=101,split_times=None,w_init=None,random_init
         for j, low in enumerate(all_splits[:-1]):
             high = all_splits[j+1]
             pff, tsj, weights, pmap, pixels_sub = do_lc(tpf,
-                        ts,(low,high),sub,maxiter=101,split_times=None,w_init=w_init,random_init=random_init,
+                        ts,(low,high),sub,maxiter=maxiter,split_times=None,w_init=w_init,random_init=random_init,
                 thresh=thresh,minflux=minflux,analytic=analytic,sigclip=sigclip,verbose=verbose,objective=objective)
             tss.append(tsj)
             if low is None:
@@ -1241,7 +1241,6 @@ class halo_tpf_tess(lightkurve.TessTargetPixelFile):
         lc_out.primary_header = self.hdu[0].header
         lc_out.data_header = self.hdu[1].header
         return weightmap, lc_out
-
     # @property
     # def flux(self):
     #     """Returns the flux for all good-quality cadences."""
