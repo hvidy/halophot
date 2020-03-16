@@ -6,7 +6,6 @@ import os
 TESTDIR = os.path.abspath(os.path.dirname(__file__))
 ddir = os.path.join(TESTDIR,'../data/')
 
-
 def test_lk():
 
 	fname = ddir+"ktwo205897543-c03_lpd-targ.fits.gz"
@@ -22,6 +21,7 @@ def test_lk():
 def test_k2sc():
 	import k2sc
 	from k2sc import standalone
+	print('k2sc version',k2sc.__version__)
 
 	fname = ddir+"ktwo205897543-c03_lpd-targ.fits.gz"
 
