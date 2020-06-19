@@ -160,14 +160,26 @@ def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True,sub=1
 
     dummy[m,:,:][dummy[m,:,:]<0] = 0 # just as a check!
 
-    if thresh >= 0:
-        saturated = np.nanmax(dummy[m,:,:],axis=0) > (thresh*maxflux)
+    if thresh >= 1:
+        saturated = np.unravel_index((-np.nanmean(dummy[m,:,:],axis=0)).argsort(axis=None)[:thresh],np.nanmean(dummy[m,:,:],axis=0).shape)
+        dummy[:,saturated[0],saturated[1]] = np.nan
+        if verbose:
+            print('%d saturated pixels' % np.sum(saturated[0].shape))
+
+    elif thresh > 0:
+        saturated = np.nanmean(dummy[m,:,:],axis=0) > (thresh*maxflux)
+        dummy[:,saturated] = np.nan 
+        if verbose:
+            print('%d saturated pixels' % np.sum(saturated))
+
+    elif thresh == 0:
+        saturated = np.nanmean(dummy[m,:,:],axis=0) > maxflux
         dummy[:,saturated] = np.nan 
         if verbose:
             print('%d saturated pixels' % np.sum(saturated))
 
     # automatic saturation threshold
-    if thresh < 0:
+    else:
         nstart = max(0,np.sum(np.nanmax(dummy[m,:,:],axis=0) > 7e4) - 20)
         nfinish = np.sum(np.nanmax(dummy[m,:,:],axis=0) > 5e4)
         if verbose:
@@ -211,6 +223,7 @@ def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True,sub=1
 
     no_flux = np.nanmin(dummy[m,:,:],axis=0) < minflux
     dummy[:,no_flux] = np.nan
+
     
     xc, yc = np.nanmedian(ts['x'][m]), np.nanmedian(ts['y'][m])
 
@@ -222,6 +235,7 @@ def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True,sub=1
         if np.sum(~goodpos)>0:
             if verbose:
                 print('Throwing out %d bad cadences' % np.sum(~goodpos))
+
     
     # dummy = dummy[goodpos,:,:] # some campaigns have a few extremely bad cadences
     # tsd = tsd[goodpos]
@@ -238,14 +252,16 @@ def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True,sub=1
 
     # pixels = pixels[:,indic_cad>200]
     # ts = ts[indic_cad>200]
-    m[m][~np.all(np.isfinite(pixels),axis=0)] = 0
-    tsd = ts[m]
-    pixels = pixels[:,np.all(np.isfinite(pixels),axis=0)]
 
+    # these next lines are breaking halo for bet Hyi - commenting out
+    # m[m][~np.all(np.isfinite(pixels),axis=0)] = 0
+    # tsd = ts[m]
+    # pixels = pixels[:,np.all(np.isfinite(pixels),axis=0)]
+ 
     # this should get all the nans but if not just set them to 0
 
     pixels[~np.isfinite(pixels)] = 0
-
+  
     return pixels, tsd, m, np.where(indic>60), np.sum(saturated[0].shape)
 
 # =========================================================================
@@ -479,10 +495,10 @@ def do_lc(tpf,ts,splits,sub,maxiter=101,split_times=None,w_init=None,random_init
             print('Censored TPF')
 
         ### subsample
-
         pixels_sub = pixels[::sub,:]
         if verbose:
             print('Subsampling by a factor of %d' % sub)
+
 
         ### now calculate the halo 
 
@@ -1131,3 +1147,164 @@ class halo_tpf(lightkurve.TessTargetPixelFile):
         lc_out.primary_header = self.hdu[0].header
         lc_out.data_header = self.hdu[1].header
         return weightmap, lc_out
+
+    @property
+    def flux(self):
+        """Returns the flux for all good-quality cadences."""
+        return self.hdu[1].data['FLUX'][self.quality_mask]
+
+    @flux.setter
+    def flux(self, value):
+        self.hdu[1].data['FLUX'][self.quality_mask] = value
+
+    @property
+    def flux_bkg(self):
+        """Returns the background flux for all good-quality cadences."""
+        return self.hdu[1].data['FLUX_BKG'][self.quality_mask]
+
+    @flux_bkg.setter
+    def flux_bkg(self, value):
+        self.hdu[1].data['FLUX_BKG'][self.quality_mask] = value
+
+    @property
+    def raw_cnts(self):
+        """Returns the raw counts for all good-quality cadences."""
+        return self.hdu[1].data['RAW_CNTS'][self.quality_mask]
+
+    @raw_cnts.setter
+    def raw_cnts(self,value):
+        self.hdu[1].data['RAW_CNTS'][self.quality_mask] = value
+
+class kephalo_tpf(lightkurve.KeplerTargetPixelFile):
+    
+    def halo(self, aperture_mask='pipeline',split_times=None,sub=1,
+        maxiter=101,w_init=None,random_init=False,
+        thresh=-1,minflux=-100.,objective='tv',rr=None,
+        analytic=True,sigclip=False,mask=None,verbose=True,lag=1,bitmask='default'):
+
+        """Performs 'halo' TV-min weighted-aperture photometry.
+             Parameters
+            ----------
+            aperture_mask : array-like, 'pipeline', or 'all'
+                A boolean array describing the aperture such that `False` means
+                that the pixel will be masked out.
+                If the string 'all' is passed, all pixels will be used.
+                The default behaviour is to use the Kepler pipeline mask.
+             splits : tuple, (None, None) or (2152,2175) etc.
+                A tuple including two times at which to split the light curve and run halo 
+                separately outside these splits.
+             sub : int
+                Do you want to subsample every nth pixel in your light curve? Not advised, 
+                but can come in handy for very large TPFs.
+             maxiter: int
+                Number of iterations to optimize. 101 is default & usually sufficient.
+             w_init: None or array-like.
+                Initialize weights with a particular weight vector - useful if you have
+                already run TV-min and want to update, but otherwise set to None 
+                and it will have default initialization.
+             random_init: Boolean
+                If False, and w_init is None, it will initialize with uniform weights; if True, it
+                will initialize with random weights. False is usually better.
+             thresh: float
+                A float greater than 0. Pixels less than this fraction of the maximum
+                flux at any pixel will be masked out - this is to deal with saturation.
+                Because halo is usually intended for saturated stars, the default is 0.8, 
+                to deal with saturated pixels. If your star is not saturated, set this 
+                greater than 1.0. 
+             analytic: Boolean
+                If True, it will optimize the TV with autograd analytic derivatives, which is
+                several orders of magnitude faster than with numerical derivatives. This is 
+                by default True but you can run it numerically with False if you prefer.
+             sigclip: Boolean
+                If True, it will iteratively run the TV-min algorithm clipping outliers.
+                Use this for data with a lot of outliers, but by default it is set False.
+             Returns
+            -------
+            lc : KeplerLightCurve object
+                Array containing the TV-min flux within the aperture for each
+                cadence.
+            """
+    
+        if mask is None:
+            aperture_mask = self._parse_aperture_mask(aperture_mask)
+        else:
+            aperture_mask = mask
+
+        if self.mission == 'TESS':
+            mission = 'tess'
+        else:
+            mission = 'kepler'
+
+        centroid_col, centroid_row = self.estimate_centroids()
+
+        x, y = self.hdu[1].data['POS_CORR1'][self.quality_mask], self.hdu[1].data['POS_CORR2'][self.quality_mask]
+        quality = self.quality
+        ts = Table({'time':self.time,
+                    'cadence':self.cadenceno,
+                    'x':x,
+                    'y':y,
+                    'quality':quality})
+
+        
+
+        flux = np.copy(self.flux)
+
+        flux[:,~aperture_mask] = np.nan
+        if rr is not None:
+            rmin, rmax = rr
+            print('Getting annulus from',rmin,'to',rmax)
+            flux = get_annulus(flux,rmin,rmax)
+            print('Using',np.sum(np.isfinite(flux[0,:,:])),'pixels')
+
+        pf, ts, weights, weightmap, pixels_sub = do_lc(flux,
+                    ts,(None,None),sub,maxiter=101,split_times=split_times,w_init=w_init,random_init=random_init,
+            thresh=thresh,minflux=minflux,analytic=analytic,sigclip=sigclip,verbose=verbose,lag=lag,objective=objective,mission=mission,bitmask=bitmask)
+        
+        nanmask = np.isfinite(ts['corr_flux'])
+         ### to do! Implement light curve POS_CORR1, POS_CORR2 attributes.
+        lc_out = lightkurve.KeplerLightCurve(flux=ts['corr_flux'],
+                                time=ts['time'],
+                                flux_err=np.nan*ts['corr_flux'],
+                                centroid_col=ts['x'],
+                                centroid_row=ts['y'],
+                                quality=ts['quality'],
+                                channel=self.channel,
+                                campaign=self.campaign,
+                                quarter=self.quarter,
+                                targetid=self.targetid,
+                                # ccd = self.ccd,
+                                # sector=self.sector,
+                                # mission=self.mission,
+                                cadenceno=ts['cadence'])
+        lc_out.pos_corr1 = self.pos_corr1
+        lc_out.pos_corr2 = self.pos_corr2
+        lc_out.primary_header = self.hdu[0].header
+        lc_out.data_header = self.hdu[1].header
+        return weightmap, lc_out
+
+    @property
+    def flux(self):
+        """Returns the flux for all good-quality cadences."""
+        return self.hdu[1].data['FLUX'][self.quality_mask]
+
+    @flux.setter
+    def flux(self, value):
+        self.hdu[1].data['FLUX'][self.quality_mask] = value
+
+    @property
+    def flux_bkg(self):
+        """Returns the background flux for all good-quality cadences."""
+        return self.hdu[1].data['FLUX_BKG'][self.quality_mask]
+
+    @flux_bkg.setter
+    def flux_bkg(self, value):
+        self.hdu[1].data['FLUX_BKG'][self.quality_mask] = value
+
+    @property
+    def raw_cnts(self):
+        """Returns the raw counts for all good-quality cadences."""
+        return self.hdu[1].data['RAW_CNTS'][self.quality_mask]
+
+    @raw_cnts.setter
+    def raw_cnts(self,value):
+        self.hdu[1].data['RAW_CNTS'][self.quality_mask] = value
