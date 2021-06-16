@@ -3,6 +3,8 @@
 [![Licence](http://img.shields.io/badge/license-GPLv3-blue.svg?style=flat)](http://www.gnu.org/licenses/gpl-3.0.html)
 [![arXiv](http://img.shields.io/badge/arXiv-1708.07462-blue.svg?style=flat)](http://arxiv.org/abs/1708.07462)
 [![arXiv](http://img.shields.io/badge/arXiv-1908.06981-blue.svg?style=flat)](http://arxiv.org/abs/1908.06981)
+[![PyPI version](https://badge.fury.io/py/halophot.svg)](https://badge.fury.io/py/halophot)
+
 ## Contributors
 
 Tim White, Benjamin Pope
