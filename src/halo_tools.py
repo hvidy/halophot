@@ -3,27 +3,34 @@ from autograd import numpy as agnp
 from autograd import grad 
 import matplotlib.pyplot as plt
 import matplotlib as mpl
-from astropy.table import Table
+
 import scipy.optimize as optimize
 from scipy.signal import savgol_filter
+from scipy.ndimage import gaussian_filter1d as gaussfilt
 from scipy import stats, ndimage
-from astropy.io import fits
+
 from time import time as clock
-import astropy.table
+
+
 from statsmodels.nonparametric.bandwidths import select_bandwidth
 from statsmodels.nonparametric.kde import KDEUnivariate as KDE
-from bottleneck import replace, nanmedian, ss
 from sklearn.cluster import DBSCAN
 from skimage.feature import peak_local_max
 from skimage.morphology import watershed
+
+import astropy.table
+from astropy.table import Table
+from astropy.stats import LombScargle, sigma_clip
+from astropy.io import fits
+from astropy.time import Time
+
 import lightkurve
 from lightkurve.utils import KeplerQualityFlags, TessQualityFlags
-from scipy.signal import savgol_filter
-from astropy.stats import LombScargle, sigma_clip
+
 from tqdm import tqdm
 
-from scipy.ndimage import gaussian_filter1d as gaussfilt
 from . import halo_objectives as objectives 
+
 import matplotlib as mpl
 from matplotlib import rc
 from matplotlib.gridspec import GridSpec
@@ -361,7 +368,6 @@ def tv_tpf(pixelvector,w_init=None,maxiter=101,analytic=False,sigclip=False,verb
     objective_fun = objectives.mapping[objective]
 
     gradient = grad(objective_fun,argnum=0)
-
 
     res = optimize.minimize(objective_fun, w_init, args=(lag,pixelvector,), method='L-BFGS-B', jac=gradient, 
         options={'disp': False,'maxiter':maxiter})
@@ -704,7 +710,7 @@ def remove_stars(tpf):
     MODE = optimize.fmin_powell(kernel_opt, max_guess, disp=0)
 
     mad_to_sigma = 1.482602218505602
-    MAD1 = mad_to_sigma * nanmedian( np.abs( Flux[(Flux < MODE)] - MODE ) )
+    MAD1 = mad_to_sigma * np.nanmedian( np.abs( Flux[(Flux < MODE)] - MODE ) )
 
     thresh= 2.
     CUT = MODE + thresh * MAD1
@@ -1005,7 +1011,7 @@ def k2p2_saturated(SumImage, MASKS, idx):
 
             # Calculate ratio as defined in Lund & Handberg (2014):
             ratio = np.abs(nanmedian(np.diff(pixels)))/np.nanmax(pixels)
-            if ratio < 0.01 and nanmedian(pixels) >= mask_max/2:
+            if ratio < 0.01 and np.nanmedian(pixels) >= mask_max/2:
                 # logger.debug("Column %d - RATIO = %f - Saturated", c, ratio)
 
                 # Has significant flux and is in saturated column:
@@ -1099,7 +1105,7 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
 
         x, y = self.hdu[1].data['POS_CORR1'][self.quality_mask], self.hdu[1].data['POS_CORR2'][self.quality_mask]
         quality = self.quality
-        ts = Table({'time':self.time,
+        ts = Table({'time':self.time.value,
                     'cadence':self.cadenceno,
                     'x':x,
                     'y':y,
@@ -1114,14 +1120,14 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
             flux = get_annulus(flux,rmin,rmax)
             print('Using',np.sum(np.isfinite(flux[0,:,:])),'pixels')
 
-        pf, ts, weights, weightmap, pixels_sub = do_lc(flux,
+        pf, ts, weights, weightmap, pixels_sub = do_lc(flux.value,
                     ts,(None,None),sub,maxiter=101,split_times=split_times,w_init=w_init,random_init=random_init,
             thresh=thresh,minflux=minflux,analytic=analytic,sigclip=sigclip,verbose=verbose,lag=lag,objective=objective,mission=mission,bitmask=bitmask)
         
         nanmask = np.isfinite(ts['corr_flux'])
          ### to do! Implement light curve POS_CORR1, POS_CORR2 attributes.
-        lc_out = lightkurve.KeplerLightCurve(flux=ts['corr_flux'],
-                                time=ts['time'],
+        lc_out = lightkurve.KeplerLightCurve(flux=ts['corr_flux']*self.flux.unit,
+                                time=Time(ts['time'],format=self.time.format),
                                 flux_err=np.nan*ts['corr_flux'],
                                 centroid_col=ts['x'],
                                 centroid_row=ts['y'],
@@ -1201,7 +1207,7 @@ class halo_tpf_tess(lightkurve.TessTargetPixelFile):
 
         x, y = self.hdu[1].data['POS_CORR1'][self.quality_mask], self.hdu[1].data['POS_CORR2'][self.quality_mask]
         quality = self.quality
-        ts = Table({'time':self.time,
+        ts = Table({'time':self.time.value,
                     'cadence':self.cadenceno,
                     'x':x,
                     'y':y,
@@ -1216,14 +1222,14 @@ class halo_tpf_tess(lightkurve.TessTargetPixelFile):
             flux = get_annulus(flux,rmin,rmax)
             print('Using',np.sum(np.isfinite(flux[0,:,:])),'pixels')
 
-        pf, ts, weights, weightmap, pixels_sub = do_lc(flux,
+        pf, ts, weights, weightmap, pixels_sub = do_lc(flux.value,
                     ts,(None,None),sub,maxiter=101,split_times=split_times,w_init=w_init,random_init=random_init,
             thresh=thresh,minflux=minflux,analytic=analytic,sigclip=sigclip,verbose=verbose,lag=lag,objective=objective,mission=mission,bitmask=bitmask)
         
         nanmask = np.isfinite(ts['corr_flux'])
          ### to do! Implement light curve POS_CORR1, POS_CORR2 attributes.
-        lc_out = lightkurve.TessLightCurve(flux=ts['corr_flux'],
-                                time=ts['time'],
+        lc_out = lightkurve.TessLightCurve(flux=ts['corr_flux']*self.flux.unit,
+                                time=Time(ts['time'],format=self.time.format),
                                 flux_err=np.nan*ts['corr_flux'],
                                 centroid_col=ts['x'],
                                 centroid_row=ts['y'],
