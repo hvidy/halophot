@@ -1126,7 +1126,7 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
         
         nanmask = np.isfinite(ts['corr_flux'])
          ### to do! Implement light curve POS_CORR1, POS_CORR2 attributes.
-        lc_out = lightkurve.KeplerLightCurve(flux=ts['corr_flux']*self.flux.unit,
+        lc_out = lightkurve.KeplerLightCurve(flux=ts['corr_flux'],
                                 time=Time(ts['time'],format=self.time.format),
                                 flux_err=np.nan*ts['corr_flux'],
                                 centroid_col=ts['x'],
@@ -1228,7 +1228,7 @@ class halo_tpf_tess(lightkurve.TessTargetPixelFile):
         
         nanmask = np.isfinite(ts['corr_flux'])
          ### to do! Implement light curve POS_CORR1, POS_CORR2 attributes.
-        lc_out = lightkurve.TessLightCurve(flux=ts['corr_flux']*self.flux.unit,
+        lc_out = lightkurve.TessLightCurve(flux=ts['corr_flux'],
                                 time=Time(ts['time'],format=self.time.format),
                                 flux_err=np.nan*ts['corr_flux'],
                                 centroid_col=ts['x'],
