@@ -23,6 +23,7 @@ from astropy.table import Table
 from astropy.stats import LombScargle, sigma_clip
 from astropy.io import fits
 from astropy.time import Time
+from astropy.units import Quantity
 
 import lightkurve
 from lightkurve.utils import KeplerQualityFlags, TessQualityFlags
@@ -1249,19 +1250,23 @@ class halo_tpf_tess(lightkurve.TessTargetPixelFile):
         return weightmap, lc_out
 
 
+    
     @property
-    def flux(self):
+    def flux(self) -> Quantity:
         """Returns the flux for all good-quality cadences."""
-        return self.hdu[1].data['FLUX'][self.quality_mask]
+        unit = None
+        if self.get_header(1).get("TUNIT5") == "e-/s":
+            unit = "electron/s"
+        return Quantity(self.hdu[1].data["FLUX"][self.quality_mask], unit=unit)
 
     @flux.setter
     def flux(self,value):
         self.hdu[1].data['FLUX'][self.quality_mask] = value
 
     @property
-    def flux_bkg(self):
-        """Returns the background flux for all good-quality cadences"""
-        return self.hdu[1].data['FLUX_BKG'][self.quality_mask]
+    def flux_bkg(self) -> Quantity:
+        """Returns the background flux for all good-quality cadences."""
+        return Quantity(self.hdu[1].data["FLUX_BKG"][self.quality_mask], unit="electron/s")
 
     @flux_bkg.setter
     def flux_bkg(self,value):
