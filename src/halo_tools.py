@@ -158,7 +158,7 @@ def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True,sub=1
         if mission == 'kepler':
             qf = KeplerQualityFlags()
             m = qf.create_quality_mask(ts['quality'],bitmask=bitmask)
-        elif mission == 'TESS':
+        elif mission == 'tess':
             qf = TessQualityFlags()
             m = qf.create_quality_mask(ts['quality'],bitmask=bitmask)
         else:
@@ -171,26 +171,26 @@ def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True,sub=1
     dummy[m,:,:][dummy[m,:,:]<0] = 0 # just as a check!
 
     if thresh >= 0:
-        saturated = np.nanmax(dummy[m,:,:],axis=0) > (thresh*maxflux)
+        saturated = np.nanmedian(dummy[m,:,:],axis=0) > (thresh*maxflux)
         dummy[:,saturated] = np.nan 
         if verbose:
             print('%d saturated pixels' % np.sum(saturated))
 
     # automatic saturation threshold
     if thresh < 0:
-        nstart = max(0,np.sum(np.nanmax(dummy[m,:,:],axis=0) > 7e4) - 20)
-        nfinish = np.sum(np.nanmax(dummy[m,:,:],axis=0) > 5e4)
+        nstart = max(0,np.sum(np.nanmedian(dummy[m,:,:],axis=0) > 7e4) - 20)
+        nfinish = np.sum(np.nanmedian(dummy[m,:,:],axis=0) > 5e4)
         if verbose:
             print('Searching for number of saturated pixels to cut between %d and %d' % (nstart,nfinish))
         stds=[]
         threshs=np.arange(nstart,nfinish)
         for thr in tqdm(threshs,desc='thresholds'):
-            saturated = np.unravel_index((-np.nanmax(dummy[m,:,:],axis=0)).argsort(axis=None)[:thr],np.nanmax(dummy[m,:,:],axis=0).shape)
+            saturated = np.unravel_index((-np.nanmedian(dummy[m,:,:],axis=0)).argsort(axis=None)[:thr],np.nanmedian(dummy[m,:,:],axis=0).shape)
             # saturated=(flx_ord[0][-thresh:],flx_ord[1][-thresh:])
             dummy2 = dummy.copy()
             dummy2[:,saturated[0],saturated[1]] = np.nan 
             pf, ts, weights, weightmap, pixels_sub = do_lc(dummy2,tsd,(None,None),sub,maxiter=101,w_init=None,random_init=False,
-            thresh=1.0,minflux=-100,analytic=True,sigclip=False,verbose=False)
+            thresh=1.0,minflux=-100,analytic=True,sigclip=False,verbose=False,lag=lag,objective=objective,mission=mission,bitmask=bitmask)
             fl=ts['corr_flux']
             fs=fl[~np.isnan(fl)]/np.nanmedian(fl)
             sfs=savgol_filter(fs,(np.floor(len(fs)/8)*2-1).astype(int),3)
@@ -438,7 +438,8 @@ def do_lc(tpf,ts,splits,sub,maxiter=101,split_times=None,w_init=None,random_init
             high = all_splits[j+1]
             pff, tsj, weights, pmap, pixels_sub = do_lc(tpf,
                         ts,(low,high),sub,maxiter=maxiter,split_times=None,w_init=w_init,random_init=random_init,
-                thresh=thresh,minflux=minflux,analytic=analytic,sigclip=sigclip,verbose=verbose,objective=objective)
+                thresh=thresh,minflux=minflux,analytic=analytic,sigclip=sigclip,verbose=verbose,lag=lag,
+                objective=objective,mission=mission,bitmask=bitmask)
             tss.append(tsj)
             if low is None:
                 cad1.append(ts['cadence'][0])
