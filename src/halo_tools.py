@@ -1240,9 +1240,12 @@ class halo_tpf_tess(lightkurve.TessTargetPixelFile):
                                 # campaign=self.campaign,
                                 # quarter=self.quarter,
                                 targetid=self.targetid,
-                                ccd = self.ccd,
+                                ra=self.ra,
+                                dec=self.dec,
                                 sector=self.sector,
-                                # mission=self.mission,
+                                camera=self.camera,
+                                ccd = self.ccd,
+                                mission=self.mission,
                                 cadenceno=ts['cadence'])
         lc_out.pos_corr1 = self.pos_corr1
         lc_out.pos_corr2 = self.pos_corr2
