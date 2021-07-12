@@ -572,7 +572,7 @@ def plot_fluxmap(ax1,image,name,title=False):
         
         cax.yaxis.set_ticks_position('left')
         
-def plot_weightmap(ax1,weightmap,name,title=False):
+def plot_weightmap(ax1,weightmap,name,title=False,aspect=None):
         norm = np.size(weightmap)
 
         cmap = mpl.cm.seismic
@@ -580,22 +580,32 @@ def plot_weightmap(ax1,weightmap,name,title=False):
 
         im = np.log10(weightmap.T*norm)
         pic = ax1.imshow(im,cmap=cmap, vmin=-2*np.nanmax(im),vmax=2*np.nanmax(im),
-            interpolation='nearest',origin='lower')
+            interpolation=None,origin='lower',aspect=aspect)
         if title:
-            plt.title(r'TV-min Weightmap %s' % name)
+            plt.title(r'TV-min Weightmap: %s' % name)
 
         # cbaraxes, kw = mpl.colorbar.make_axes(ax1,location='right',pad=0.01)
         # plt.colorbar(pic,cax=cbaraxes)
 
         # cbaraxes.yaxis.set_ticks_position('right')
-        aspect = 20
-        pad_fraction = 0.5
+        if aspect is not None:
+            aspect = 20
+            pad_fraction = 0.5
 
-        divider = make_axes_locatable(ax1)
-        width = axes_size.AxesY(ax1, aspect=1./aspect)
-        pad = axes_size.Fraction(pad_fraction, width)
-        cax = divider.append_axes("right", size=width, pad=pad)
-        plt.colorbar(pic, cax=cax)
+            divider = make_axes_locatable(ax1)
+            width = axes_size.AxesY(ax1, aspect=1./aspect)
+            pad = axes_size.Fraction(pad_fraction, width)
+            cax = divider.append_axes("right", size=0.1*width, pad=0.1*pad)
+        else:
+            aspect = 20
+            pad_fraction = 0.5
+
+            divider = make_axes_locatable(ax1)
+            width = axes_size.AxesY(ax1, aspect=1./aspect)
+            pad = axes_size.Fraction(pad_fraction, width)
+            cax = divider.append_axes("right", size=width, pad=pad)
+
+        plt.colorbar(pic, cax=cax,label='log Weight')
 
         ax1.yaxis.set_ticks_position('left')
 
