@@ -1137,18 +1137,22 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
             thresh=thresh,minflux=minflux,analytic=analytic,sigclip=sigclip,verbose=verbose,lag=lag,objective=objective,mission=mission,bitmask=bitmask)
         
         nanmask = np.isfinite(ts['corr_flux'])
-         ### to do! Implement light curve POS_CORR1, POS_CORR2 attributes.
+        ### to do! Implement light curve POS_CORR1, POS_CORR2 attributes.
+        keys = {'centroid_col':ts['x'],
+                'centroid_row':ts['y'],
+                'quality':ts['quality'],
+                'channel':self.channel,
+                'campaign':self.campaign,
+                'targetid':self.targetid,
+                'mission':self.mission,
+                'quarter':self.quarter,
+                'ra':self.ra,
+                'dec':self.dec,
+                'cadenceno':ts['cadence']}
         lc_out = lightkurve.KeplerLightCurve(flux=ts['corr_flux'],
                                 time=Time(ts['time'],format=self.time.format),
                                 flux_err=np.nan*ts['corr_flux'],
-                                centroid_col=ts['x'],
-                                centroid_row=ts['y'],
-                                quality=ts['quality'],
-                                channel=self.channel,
-                                campaign=self.campaign,
-                                targetid=self.targetid,
-                                mission=self.mission,
-                                cadenceno=ts['cadence'])
+                                **keys)
         lc_out.pos_corr1 = self.pos_corr1
         lc_out.pos_corr2 = self.pos_corr2
         lc_out.primary_header = self.hdu[0].header
@@ -1240,23 +1244,23 @@ class halo_tpf_tess(lightkurve.TessTargetPixelFile):
         
         nanmask = np.isfinite(ts['corr_flux'])
          ### to do! Implement light curve POS_CORR1, POS_CORR2 attributes.
+        keys = {'centroid_col': ts['x'],
+                'centroid_row':ts['y'],
+                'quality':ts['quality'],
+                'targetid':self.targetid,
+                'ra':self.ra,
+                'dec':self.dec,
+                'sector':self.sector,
+                'camera':self.camera,
+                'ccd':self.ccd,
+                'mission':self.mission,
+                'cadenceno':ts['cadence']
+
+        }
         lc_out = lightkurve.TessLightCurve(flux=ts['corr_flux'],
                                 time=Time(ts['time'],format=self.time.format),
-                                flux_err=np.nan*ts['corr_flux'],
-                                centroid_col=ts['x'],
-                                centroid_row=ts['y'],
-                                quality=ts['quality'],
-                                # channel=self.channel,
-                                # campaign=self.campaign,
-                                # quarter=self.quarter,
-                                targetid=self.targetid,
-                                ra=self.ra,
-                                dec=self.dec,
-                                sector=self.sector,
-                                camera=self.camera,
-                                ccd = self.ccd,
-                                mission=self.mission,
-                                cadenceno=ts['cadence'])
+                                flux_err=np.nan*ts['corr_flux']
+                                **keys)
         lc_out.pos_corr1 = self.pos_corr1
         lc_out.pos_corr2 = self.pos_corr2
         lc_out.primary_header = self.hdu[0].header
@@ -1264,7 +1268,6 @@ class halo_tpf_tess(lightkurve.TessTargetPixelFile):
         return weightmap, lc_out
 
 
-    
     @property
     def flux(self) -> Quantity:
         """Returns the flux for all good-quality cadences."""
