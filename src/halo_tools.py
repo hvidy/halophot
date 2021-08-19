@@ -1259,7 +1259,7 @@ class halo_tpf_tess(lightkurve.TessTargetPixelFile):
         }
         lc_out = lightkurve.TessLightCurve(flux=ts['corr_flux'],
                                 time=Time(ts['time'],format=self.time.format),
-                                flux_err=np.nan*ts['corr_flux']
+                                flux_err=np.nan*ts['corr_flux'],
                                 **keys)
         lc_out.pos_corr1 = self.pos_corr1
         lc_out.pos_corr2 = self.pos_corr2
