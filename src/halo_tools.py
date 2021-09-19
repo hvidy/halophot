@@ -1149,14 +1149,16 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
                 'ra':self.ra,
                 'dec':self.dec,
                 'cadenceno':ts['cadence']}
+
         lc_out = lightkurve.KeplerLightCurve(flux=ts['corr_flux'],
                                 time=Time(ts['time'],format=self.time.format),
                                 flux_err=np.nan*ts['corr_flux'],
                                 **keys)
         lc_out.pos_corr1 = self.pos_corr1
         lc_out.pos_corr2 = self.pos_corr2
-        lc_out.primary_header = self.hdu[0].header
-        lc_out.data_header = self.hdu[1].header
+        hdu  = lc_out.to_fits() 
+        lc_out.primary_header = hdu[0].header
+        lc_out.data_header = hdu[1].header
         return weightmap, lc_out
 
 class halo_tpf_tess(lightkurve.TessTargetPixelFile):

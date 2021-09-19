@@ -20,7 +20,7 @@ def test_lk():
 
 def test_k2sc():
 	import k2sc
-	from k2sc import standalone
+	from k2sc.standalone import k2sc_lc
 	print('k2sc version',k2sc.__version__)
 
 	fname = ddir+"ktwo205897543-c03_lpd-targ.fits.gz"
@@ -28,10 +28,8 @@ def test_k2sc():
 	tpf = lk.KeplerTargetPixelFile(fname)
 
 	lc = tpf.to_lightcurve()
-	lc.primary_header = tpf.hdu[0].header
-	lc.data_header = tpf.hdu[1].header
 
-	lc.__class__ = standalone.k2sc_lc
+	lc.__class__ = k2sc_lc
 
 	lc.k2sc(de_max_time=10)
 
