@@ -49,7 +49,7 @@ If you use our code, please cite
 
 and 
 
-    Pope et al. (2019), arXiv: 1908.06981
+    Pope et al. (2019), ApJS, 248, 8, arXiv: 1908.06981
 
 Or use this these BibTeX entries:
 
@@ -76,22 +76,19 @@ Or use this these BibTeX entries:
       adsnote = {Provided by the SAO/NASA Astrophysics Data System}
     }
 
-    @ARTICLE{2019arXiv190806981P,
-       author = {{Pope}, Benjamin J.~S. and {White}, Timothy R. and {Farr}, Will M. and
-         {Yu}, Jie and {Greklek-McKeon}, Michael and {Huber}, Daniel and
-         {Aerts}, Conny and {Aigrain}, Suzanne and {Bedding}, Timothy R. and
-         {Boyajian}, Tabetha and {Creevey}, Orlagh L. and {Hogg}, David W.},
-        title = "{The K2 Bright Star Survey I: Methodology and Data Release}",
-      journal = {arXiv e-prints},
-     keywords = {Astrophysics - Solar and Stellar Astrophysics, Astrophysics - Instrumentation and Methods for Astrophysics},
-         year = "2019",
-        month = "Aug",
-          eid = {arXiv:1908.06981},
-        pages = {arXiv:1908.06981},
-    archivePrefix = {arXiv},
-       eprint = {1908.06981},
-     primaryClass = {astro-ph.SR},
-       adsurl = {https://ui.adsabs.harvard.edu/abs/2019arXiv190806981P},
+    @ARTICLE{Pope2019,
+       author = { {Pope}, Benjamin J.~S. and {White}, Timothy R. and {Farr}, Will M. and {Yu}, Jie and {Greklek-McKeon}, Michael and {Huber}, Daniel and {Aerts}, Conny and {Aigrain}, Suzanne and {Bedding}, Timothy R. and {Boyajian}, Tabetha and {Creevey}, Orlagh L. and {Hogg}, David W.},
+        title = "{The K2 Bright Star Survey. I. Methodology and Data Release}",
+      journal = {\apjs},
+     keywords = {Asteroseismology, Photometry, Astronomical techniques, Eclipsing binary stars, Red giant stars, Variable stars, Astrophysics - Solar and Stellar Astrophysics, Astrophysics - Instrumentation and Methods for Astrophysics},
+         year = 2019,
+        month = nov,
+       volume = {245},
+       number = {1},
+          eid = {8},
+        pages = {8},
+          doi = {10.3847/1538-4365/ab3d29},
+       adsurl = {https://ui.adsabs.harvard.edu/abs/2019ApJS..245....8P},
       adsnote = {Provided by the SAO/NASA Astrophysics Data System}
     }
 
