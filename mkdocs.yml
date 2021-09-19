@@ -1,0 +1,22 @@
+site_name: halophot
+nav:
+    - Home: index.md
+    - 'Examples':
+        - aldebaran: notebooks/aldebaran.ipynb
+
+theme:
+  name: material
+
+repo_url: https://github.com/hvidy/halophot
+plugins:
+  - search
+  - mkdocs-jupyter
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          selection:
+            docstring_style: "numpy"
+          rendering:
+            show_source: false
+      custom_templates: templates
