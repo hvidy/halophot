@@ -455,7 +455,7 @@ def do_lc(tpf,ts,splits,sub,maxiter=101,split_times=None,w_init=None,random_init
         "initial_cadence": cad1,
         "final_cadence": cad2,
         "sat_pixels": sat,
-        "weightmap": weightmap
+        "weightmap": weightmap[0]
         }
         ts = stitch(tss)
         
@@ -516,18 +516,20 @@ def do_lc(tpf,ts,splits,sub,maxiter=101,split_times=None,w_init=None,random_init
             print('Calculated weights!')
 
         ts['corr_flux'] = np.nan*np.ones_like(ts['x'])
-        ts['corr_flux'][goodcad] = opt_lc
+        ts['corr_flux'][goodcad] = opt_lc/np.nanmedian(opt_lc)
 
         if sub == 1:
             pixelmap.ravel()[mapping] = weights
         else:
             pixelmap.ravel()[mapping[0][::sub]] = weights
+
         wmap = {
         "initial_cadence": c1,
         "final_cadence": c2,
         "sat_pixels": sat,
         "weightmap": pixelmap
         }
+
     return tpf, ts, weights, wmap, pixels_sub
 
 # =========================================================================
