@@ -1024,7 +1024,7 @@ def k2p2_saturated(SumImage, MASKS, idx):
             pixels = SumImage[mask & column_mask]
 
             # Calculate ratio as defined in Lund & Handberg (2014):
-            ratio = np.abs(nanmedian(np.diff(pixels)))/np.nanmax(pixels)
+            ratio = np.abs(np.nanmedian(np.diff(pixels)))/np.nanmax(pixels)
             if ratio < 0.01 and np.nanmedian(pixels) >= mask_max/2:
                 # logger.debug("Column %d - RATIO = %f - Saturated", c, ratio)
 
