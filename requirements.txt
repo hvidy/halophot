@@ -9,4 +9,4 @@ sklearn
 future==0.16.0
 pybind11
 k2sc
-scikit-image
+scikit-image >= 0.14.0

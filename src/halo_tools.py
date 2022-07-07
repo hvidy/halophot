@@ -16,7 +16,7 @@ from statsmodels.nonparametric.bandwidths import select_bandwidth
 from statsmodels.nonparametric.kde import KDEUnivariate as KDE
 from sklearn.cluster import DBSCAN
 from skimage.feature import peak_local_max
-from skimage.morphology import watershed
+from skimage.segmentation import watershed
 
 import astropy.table
 from astropy.table import Table
@@ -145,7 +145,7 @@ def read_tpf(fname):
 # =========================================================================
 # =========================================================================
 
-def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True,sub=1,mission='kepler',bitmask='default'):
+def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True,sub=1,lag=1,objective='tv',mission='kepler',bitmask='default'):
     '''Throw away bad pixels and bad cadences'''
 
     dummy = tpf.copy()
@@ -166,7 +166,7 @@ def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True,sub=1
         # dummy = dummy[m,:,:]
         # tsd = tsd[m]
     else:
-    	m = np.ones_like(ts['quality'])
+        m = np.ones_like(ts['quality'])
 
     dummy[m,:,:][dummy[m,:,:]<0] = 0 # just as a check!
 
@@ -361,7 +361,7 @@ def tv_tpf(pixelvector,w_init=None,maxiter=101,analytic=False,sigclip=False,verb
     bounds = npix*((0,1),)
 
     if w_init is None:
-        w_init = np.ones(npix)/np.float(npix)
+        w_init = np.ones(npix)/float(npix)
 
     if verbose:
         print('Using Analytic Derivatives')
@@ -491,7 +491,8 @@ def do_lc(tpf,ts,splits,sub,maxiter=101,split_times=None,w_init=None,random_init
 
         ### now throw away saturated columns, nan pixels and nan cadences
 
-        pixels, tsd, goodcad, mapping, sat = censor_tpf(tpf,ts,thresh=thresh,minflux=minflux,verbose=verbose,sub=sub,mission=mission,bitmask=bitmask)
+        pixels, tsd, goodcad, mapping, sat = censor_tpf(tpf,ts,thresh=thresh,minflux=minflux,
+			verbose=verbose,sub=sub,lag=lag,objective=objective,mission=mission,bitmask=bitmask)
         pixelmap = np.zeros((tpf.shape[2],tpf.shape[1]))
         if verbose:
             print('Censored TPF')
