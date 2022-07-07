@@ -361,7 +361,7 @@ def tv_tpf(pixelvector,w_init=None,maxiter=101,analytic=False,sigclip=False,verb
     bounds = npix*((0,1),)
 
     if w_init is None:
-        w_init = np.ones(npix)/np.float(npix)
+        w_init = np.ones(npix)/float(npix)
 
     if verbose:
         print('Using Analytic Derivatives')
