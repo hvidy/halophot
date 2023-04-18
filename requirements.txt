@@ -5,8 +5,7 @@ scipy
 autograd
 lightkurve
 statsmodels
-sklearn
-future==0.16.0
+scikit-learn
 pybind11
 k2sc
 scikit-image >= 0.14.0
