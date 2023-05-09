@@ -1,8 +1,8 @@
-from numpy.distutils.core import setup, Extension
-from numpy.distutils.misc_util import Configuration
-import distutils.sysconfig as ds
+
 from setuptools import setup
-import os, codecs, re
+import os
+import codecs
+import re
 
 long_description = 'A Python package for doing photometry of very bright stars in the Kepler/K2 mission using halo photometry, constructing the light curve as a linear combination of pixels.\
       We minimize total variation (TV) of the final light curve with respect to the weights of the individual pixels using analytic gradient descent.\
