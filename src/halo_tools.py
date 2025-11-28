@@ -20,7 +20,11 @@ from skimage.segmentation import watershed
 
 import astropy.table
 from astropy.table import Table
-from astropy.stats import LombScargle, sigma_clip
+try:
+    from astropy.stats import LombScargle, sigma_clip
+except ImportError:
+    from astropy.stats import sigma_clip
+    from astropy.timeseries import LombScargle
 from astropy.io import fits
 from astropy.time import Time
 from astropy.units import Quantity
@@ -30,6 +34,11 @@ from lightkurve.utils import KeplerQualityFlags, TessQualityFlags
 
 from tqdm import tqdm
 
+import jax.numpy as jnp
+import jaxopt
+import jax
+jax.config.update("jax_enable_x64", True)
+
 from . import halo_objectives as objectives 
 
 import matplotlib as mpl
@@ -38,7 +47,7 @@ from matplotlib.gridspec import GridSpec
 from matplotlib.pyplot import figure, subplots, subplot
 from mpl_toolkits.axes_grid1 import make_axes_locatable, axes_size
 
-mpl.style.use('seaborn-colorblind')
+mpl.style.use('seaborn-v0_8-colorblind')
 
 #To make sure we have always the same matplotlib settings
 #(the ones in comments are the ipython notebook settings)
@@ -171,12 +180,13 @@ def censor_tpf(tpf,ts,thresh=-1,minflux=-100.,do_quality=True,verbose=True,sub=1
     dummy[m,:,:][dummy[m,:,:]<0] = 0 # just as a check!
 
     if thresh >= 0:
-        saturated = np.nanmedian(dummy[m,:,:],axis=0) > (thresh*maxflux)
+        saturated = ndimage.binary_dilation(np.nanmax(dummy[m,:,:], axis = 0) > (thresh*maxflux).astype(int), axes = 0)
         dummy[:,saturated] = np.nan 
         if verbose:
             print('%d saturated pixels' % np.sum(saturated))
 
-    # automatic saturation threshold
+    # automatic saturation threshold 
+    # TODO: does not have binary dilation mask implemented
     if thresh < 0:
         nstart = max(0,np.sum(np.nanmedian(dummy[m,:,:],axis=0) > 7e4) - 20)
         nfinish = np.sum(np.nanmedian(dummy[m,:,:],axis=0) > 5e4)
@@ -324,11 +334,34 @@ def diff_2(z):
 # =========================================================================
 # =========================================================================
 
+def jax_func(pixelvector_jax, w_init, objective, maxiter, lag):
+   
+    """
+    Wrapper for solving different objective functions using JAXopt
+    """
+   
+    if objective == "tv": 
+        # TV-Min - minimize L1 norm of gradient - same as in halo
+        obj_fun = lambda x: objectives.tv(x, lag, pixelvector_jax)
+    if objective == "tv_o2": 
+        obj_fun = lambda x: objectives.tv_o2(x, lag, pixelvector_jax)
+    if objective == "l2v": 
+        # L2V-Min - minimize L2 norm of gradient, ie maximize smoothness
+        obj_fun = lambda x: objectives.l2v(x, lag, pixelvector_jax)
+    if objective == "owl": 
+        # OWL - from https://github.com/davidwhogg/OWL using standard deviation as the objective.
+        obj_fun = lambda x: objectives.owl(x, pixelvector_jax)
+    
+    solver = jaxopt.LBFGS(fun = obj_fun, maxiter = maxiter, tol = 1e-6)
+    res = solver.run(w_init)
+    
+    return res
+
 def tv_tpf(pixelvector,w_init=None,maxiter=101,analytic=False,sigclip=False,verbose=True,lag=1,
     objective='tv'):
     '''
     This is the main function here - once you have loaded the data, pass it to this
-    to do a TV-min light curve.
+    to do a TV-min light curve. Implemented in JAX.
 
     Keywords
 
@@ -348,7 +381,7 @@ def tv_tpf(pixelvector,w_init=None,maxiter=101,analytic=False,sigclip=False,verb
         to deal with saturated pixels. If your star is not saturated, set this 
         greater than 1.0. 
     analytic: Boolean
-        If True, it will optimize the TV with autograd analytic derivatives, which is
+        If True, it will optimize the TV with JAX analytic derivatives, which is
         several orders of magnitude faster than with numerical derivatives. This is 
         by default True but you can run it numerically with False if you prefer.
     sigclip: Boolean
@@ -357,23 +390,19 @@ def tv_tpf(pixelvector,w_init=None,maxiter=101,analytic=False,sigclip=False,verb
     '''
 
     npix = np.shape(pixelvector)[0]
-    cons = ({'type': 'eq', 'fun': lambda z: z.sum() - 1.})
-    bounds = npix*((0,1),)
 
     if w_init is None:
-        w_init = np.ones(npix)/float(npix)
+        w_init = jnp.ones(npix)/float(npix)
 
     if verbose:
         print('Using Analytic Derivatives')
+    
+    pixelvector_jax = jnp.array(pixelvector)
+    
+    res = jax_func(pixelvector_jax, w_init, objective, maxiter, lag)
+    obj_params, _ = res
 
-    objective_fun = objectives.mapping[objective]
-
-    gradient = grad(objective_fun,argnum=0)
-
-    res = optimize.minimize(objective_fun, w_init, args=(lag,pixelvector,), method='L-BFGS-B', jac=gradient, 
-        options={'disp': False,'maxiter':maxiter})
-
-    w_best = softmax(res['x']) # softmax
+    w_best = np.array(objectives.softmax(obj_params))
 
     lc_first_try = np.dot(w_best.T,pixelvector)
 
@@ -387,12 +416,12 @@ def tv_tpf(pixelvector,w_init=None,maxiter=101,analytic=False,sigclip=False,verb
             if verbose:
                 print('Clipping %d bad points' % np.sum(~good))
 
-            pixels_masked = pixelvector[:,good]
+            pixels_masked = jnp.array(pixelvector[:,good])
 
-            res = optimize.minimize(objective_fun, w_init, args=(lag,pixels_masked,), method='L-BFGS-B', jac=gradient, 
-                options={'disp': False,'maxiter':maxiter})
+            res = jax_func(pixels_masked, w_init, objective, maxiter, lag)
+            tv_params, state = res
 
-            w_best = softmax(res['x']) # softmax
+            w_best = np.array(objectives.softmax(tv_params)) # softmax
 
         else:
             if verbose:
@@ -401,10 +430,9 @@ def tv_tpf(pixelvector,w_init=None,maxiter=101,analytic=False,sigclip=False,verb
         good = np.isfinite(lc_first_try)
         pass
 
-
-    lc_opt = np.dot(w_best.T,pixelvector)
+    lc_opt = np.dot(w_best.T, pixelvector)
     lc_opt[~good] = np.nan
-    return w_best, lc_opt
+    return w_best, lc_opt, res
 
 # =========================================================================
 # =========================================================================
@@ -1093,7 +1121,7 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
                 to deal with saturated pixels. If your star is not saturated, set this 
                 greater than 1.0. 
              analytic: Boolean
-                If True, it will optimize the TV with autograd analytic derivatives, which is
+                If True, it will optimize the TV with JAX analytic derivatives, which is
                 several orders of magnitude faster than with numerical derivatives. This is 
                 by default True but you can run it numerically with False if you prefer.
              sigclip: Boolean

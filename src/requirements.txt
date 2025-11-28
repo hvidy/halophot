@@ -1,0 +1,12 @@
+numpy
+matplotlib
+astropy
+scipy
+jax
+jaxopt
+lightkurve
+statsmodels
+scikit-learn
+pybind11
+k2sc
+scikit-image >= 0.14.0
