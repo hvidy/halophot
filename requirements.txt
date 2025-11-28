@@ -2,7 +2,8 @@ numpy
 matplotlib
 astropy
 scipy
-autograd
+jax
+jaxopt
 lightkurve
 statsmodels
 scikit-learn
