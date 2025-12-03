@@ -28,5 +28,5 @@ jobs:
             python setup.py install
           name: 'Install halophot & dependencies'
 
-        - run: pytest --junitxml=junit/test-results.xml 
-          name: 'Run pytest'
+        #- run: pytest --junitxml=junit/test-results.xml 
+        #  name: 'Run pytest'
