@@ -1,6 +1,4 @@
 import numpy as np
-from autograd import numpy as agnp
-from autograd import grad 
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 
@@ -88,14 +86,6 @@ def translate_greek(word):
                 return(word)
         return(word)
 
-# =========================================================================
-# =========================================================================
-
-def softmax(x):
-    '''From https://gist.github.com/stober/1946926'''
-    e_x = agnp.exp(x - agnp.max(x))
-    out = e_x / e_x.sum()
-    return out
 
 # =========================================================================
 # =========================================================================
