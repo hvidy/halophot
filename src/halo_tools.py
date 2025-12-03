@@ -1,6 +1,4 @@
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib as mpl
 
 import scipy.optimize as optimize
 from scipy.signal import savgol_filter
@@ -41,6 +39,7 @@ from . import halo_objectives as objectives
 
 import matplotlib as mpl
 from matplotlib import rc
+import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 from matplotlib.pyplot import figure, subplots, subplot
 from mpl_toolkits.axes_grid1 import make_axes_locatable, axes_size
