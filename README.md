@@ -25,7 +25,11 @@ This is code that implements a Total Variation (TV) based regularization for Kep
 
 We minimize nth order TV - i.e. the sum of the absolute values of the nth differences of a light curve - of a light curve created as the weighted sum of pixels, with weights in (0,1). This appears remarkably effective at removing pointing-based systematics from K2 lightcurves where it is impractical to do photometry otherwise and apply more standard detrending methods. 
 
-We believe this is of practical use for Kepler targets brighter than  Kp ~ 6. 
+We believe this is of practical use for Kepler targets brighter than Kp ~ 6. 
+
+## TESS Halo Photometry
+
+For TESS we updated halophot to work in Python framework Jax. We also implemented a binary mask for cutting away pixels at the edge of the bleed columns. For TESS we recommend to use it for stars in the magnitude range 0.45 ≤ V ≤ 2.54. The diagnostic outputs for the TESS Halo Photometry are located at this GitHub repository https://github.com/JonatanRudrasingam/TESS_halophot.
 
 ## Basic usage
 
@@ -92,5 +96,9 @@ Or use this these BibTeX entries:
       adsnote = {Provided by the SAO/NASA Astrophysics Data System}
     }
 
+If you use the newest version in Jax (version 1.0), please cite
 
+    Rudrasingam et al. (in prep.)
+
+Or use this BibTeX entry (TBD):
 
