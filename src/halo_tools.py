@@ -8,9 +8,8 @@ from scipy import stats, ndimage
 from time import time as clock
 
 
-import statsmodels
-from statsmodels.nonparametric.bandwidths import select_bandwidth
-from statsmodels.nonparametric.kde import KDEUnivariate as KDE
+#from statsmodels.nonparametric.bandwidths import select_bandwidth
+#from statsmodels.nonparametric.kde import KDEUnivariate as KDE
 from sklearn.cluster import DBSCAN
 from skimage.feature import peak_local_max
 from skimage.segmentation import watershed
