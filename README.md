@@ -98,7 +98,22 @@ Or use this these BibTeX entries:
 
 If you use the newest version in Jax (version 1.0), please cite
 
-    Rudrasingam et al. (in prep.)
+    Rudrasingam et al. (2026), MNRAS, 547, stag413, arXiv:2602.22472
 
-Or use this BibTeX entry (TBD):
+Or use this BibTeX entry:
+
+    @ARTICLE{Rudrasingam2026,
+       author = {{Rudrasingam}, Jonatan and {Bedding}, Timothy R. and {Pope}, Benjamin J.~S. and {Pedersen}, May Gade and {Lund}, Mikkel N. and {White}, Timothy R. and {Hey}, Daniel},
+        title = "{Halo Photometry and Asteroseismology for 98 of the Brightest Stars Observed by TESS}",
+      journal = {\mnras},
+     keywords = {Solar and Stellar Astrophysics},
+         year = 2026,
+        month = feb,
+          doi = {10.1093/mnras/stag413},
+    archivePrefix = {arXiv},
+       eprint = {2602.22472},
+    primaryClass = {astro-ph.SR},
+       adsurl = {https://ui.adsabs.harvard.edu/abs/2026MNRAS.tmp..385R},
+      adsnote = {Provided by the SAO/NASA Astrophysics Data System}
+    }
 
