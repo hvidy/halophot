@@ -109,6 +109,7 @@ Or use this BibTeX entry:
      keywords = {Solar and Stellar Astrophysics},
          year = 2026,
         month = feb,
+        volume = {547},
           doi = {10.1093/mnras/stag413},
     archivePrefix = {arXiv},
        eprint = {2602.22472},
