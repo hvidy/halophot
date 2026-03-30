@@ -23,10 +23,12 @@ jobs:
 
         - run: pip install https://github.com/OxES/k2sc/archive/master.zip
           name: 'install k2sc'
-              
-        - run:
-            python setup.py install
-          name: 'Install halophot & dependencies'
+
+        - run: pip install -r requirements.txt
+          name: 'install dependencies'
+
+        - run: pip install --no-deps .
+          name: 'Install halophot'
 
         - run: pytest --junitxml=junit/test-results.xml 
           name: 'Run pytest'
