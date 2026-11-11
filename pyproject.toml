@@ -1,0 +1,95 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "halophot"
+dynamic = ["version"]
+description = "Kepler/K2 and TESS halo photometry with total variation regularization in JAX."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "GPL-3.0-or-later" }
+authors = [
+  { name = "Tim White" },
+  { name = "Benjamin Pope", email = "benjamin.pope@mq.edu.au" },
+  { name = "Jonatan Rudrasingam" },
+]
+keywords = [
+  "astronomy",
+  "photometry",
+  "asteroseismology",
+  "kepler",
+  "k2",
+  "tess",
+  "jax",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Astronomy",
+]
+dependencies = [
+  "numpy>=1.26",
+  "scipy>=1.11",
+  "astropy>=6.0",
+  "lightkurve>=2.4",
+  "matplotlib>=3.8",
+  "jax>=0.4.30",
+  "equinox>=0.11.5",
+  "optimistix>=0.0.7",
+  "optax>=0.2.2",
+  "zodiax>=0.5.0",
+  "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.6",
+]
+
+[project.scripts]
+halo = "halophot.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/hvidy/halophot"
+Repository = "https://github.com/hvidy/halophot"
+Issues = "https://github.com/hvidy/halophot/issues"
+
+[tool.hatch.version]
+path = "src/halophot/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/halophot"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+  "data/*.fits.gz",
+  "notebooks/*",
+  "*.ipynb",
+  "*.fits",
+  "experiments/*",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "W"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/halophot/__init__.py" = ["F401"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra"
