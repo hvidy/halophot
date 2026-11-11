@@ -52,7 +52,8 @@ def cast_tree(tree: object, dtype: str = "float64") -> object:
             return jnp.asarray(leaf, dtype=real_dtype)
         return leaf
 
-    return jax.tree_util.tree_map(_cast_leaf, tree)
+    with run_in(dtype):
+        return jax.tree_util.tree_map(_cast_leaf, tree)
 
 
 def in_float64(fn: _F) -> _F:

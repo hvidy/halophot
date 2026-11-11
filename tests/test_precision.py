@@ -97,6 +97,27 @@ def test_in_float64_restores_state_on_exception_and_nesting() -> None:
     assert jax.config.jax_enable_x64 is False
 
 
+def test_cast_tree_float64_while_global_x64_disabled() -> None:
+    """Public ``halophot.cast_tree`` must allocate float64/complex128 without global x64."""
+    assert jax.config.jax_enable_x64 is False
+    tree_in = {
+        "jax_f32": jnp.array([1.25, -2.5], dtype=jnp.float32),
+        "np_f32": np.array([3.5, 4.75], dtype=np.float32),
+        "cplx64": jnp.array([1.0 - 3.0j], dtype=jnp.complex64),
+        "ints": np.array([5, 6], dtype=np.int32),
+    }
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        tree_out = halophot.cast_tree(tree_in, "float64")
+
+    assert jax.config.jax_enable_x64 is False
+    assert len(caught) == 0
+    assert tree_out["jax_f32"].dtype == jnp.float64  # type: ignore[index]
+    assert tree_out["np_f32"].dtype == jnp.float64  # type: ignore[index]
+    assert tree_out["cplx64"].dtype == jnp.complex128  # type: ignore[index]
+    assert tree_out["ints"].dtype == np.int32  # type: ignore[index]
+
+
 def test_iterators_pass_through_and_invalid_dtype_raises() -> None:
     @in_float64
     def consume_first(it):

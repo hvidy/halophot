@@ -48,7 +48,9 @@ def l3v(weights, lag, pixelvector):
 def owl(weights, pixelvector):
     # for halophot this is strictly worse than all other options
     flux = make_flux(weights, pixelvector)
-    diff = np.std(flux)
+    var = np.var(flux)
+    safe_var = np.where(var > 0.0, var, 1.0)
+    diff = np.where(var > 0.0, np.sqrt(safe_var), 0.0)
     return diff / np.mean(flux)
 
 

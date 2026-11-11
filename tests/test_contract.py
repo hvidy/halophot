@@ -5,6 +5,7 @@ from __future__ import annotations
 import warnings
 from pathlib import Path
 
+import jax.numpy as jnp
 import lightkurve as lk
 import numpy as np
 import pytest
@@ -271,6 +272,25 @@ def test_contract_missing_and_malformed_extensions() -> None:
     with pytest.raises(ValueError, match="PIXEL_QUALITY shape"):
         read_pixel_quality(hdul_bad_pq)
 
+    # pack_bkg_chol must reject upper-triangular arrays, negative diagonals, P=0, and NaNs
+    upper = np.zeros((4, 3, 3), dtype=np.float64)
+    upper[:, 0, 0] = 1.0
+    upper[:, 1, 1] = 1.0
+    upper[:, 2, 2] = 1.0
+    upper[:, 0, 1] = 0.5  # Strict upper-triangular entry (e.g. scipy cholesky lower=False)
+    with pytest.raises(ValueError, match="lower-triangular"):
+        pack_bkg_chol(upper)
+
+    neg_diag = np.zeros((4, 2, 2), dtype=np.float64)
+    neg_diag[:, 0, 0] = 1.0
+    neg_diag[:, 1, 1] = 1.0
+    neg_diag[2, 1, 1] = -0.25
+    with pytest.raises(ValueError, match="non-negative diagonal"):
+        pack_bkg_chol(neg_diag)
+
+    with pytest.raises(ValueError, match="P >= 1"):
+        pack_bkg_chol(np.zeros((4, 0, 0), dtype=np.float64))
+
 
 def test_write_lightcurve_fits_weightmap_round_trip(tmp_path: Path) -> None:
     time = Time(1500.0 + np.arange(30) * 0.02, format="btjd", scale="tdb")
@@ -298,6 +318,20 @@ def test_write_lightcurve_fits_weightmap_round_trip(tmp_path: Path) -> None:
         assert hdul[0].header["HALOCVER"] == HALOCVER
         assert "WEIGHTMAP" in hdul
         np.testing.assert_allclose(hdul["WEIGHTMAP"].data, wmap, equal_nan=True)
+
+    # Also verify jax.Array weightmap in lc.meta is stripped cleanly without FITS card warnings
+    lc_jax = lk.TessLightCurve(time=time, flux=flux, flux_err=flux_err)
+    jax_wmap = jnp.asarray(wmap, dtype=jnp.float32)
+    lc_jax.meta["WEIGHTMAP"] = jax_wmap
+    out_jax_fits = tmp_path / "halo_lc_jax.fits"
+    with warnings.catch_warnings(record=True) as caught_jax:
+        warnings.simplefilter("always")
+        write_lightcurve_fits(lc_jax, out_jax_fits)
+    assert not any("WEIGHTMAP" in str(w.message) for w in caught_jax)
+    assert isinstance(lc_jax.meta["WEIGHTMAP"], type(jax_wmap))
+    with fits.open(out_jax_fits) as hdul_jax:
+        assert "WEIGHTMAP" in hdul_jax
+        np.testing.assert_allclose(hdul_jax["WEIGHTMAP"].data, wmap, rtol=1e-6, equal_nan=True)
 
 
 def test_resolve_cache_dir_fred_guard(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

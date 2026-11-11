@@ -271,11 +271,24 @@ def read_smear_err(
 def pack_bkg_chol(chol: np.ndarray) -> np.ndarray:
     """Pack lower-triangular ``(N_cad, P, P)`` Cholesky factors in row-major ``tril`` order."""
     arr = np.asarray(chol, dtype=np.float64)
-    if arr.ndim != 3 or arr.shape[1] != arr.shape[2]:
+    if arr.ndim != 3 or arr.shape[1] != arr.shape[2] or arr.shape[1] < 1:
         raise ValueError(
-            f"Expected 3D square Cholesky array (N_cad, P, P), got shape {arr.shape}."
+            f"Expected 3D square Cholesky array (N_cad, P, P) with P >= 1, got shape {arr.shape}."
         )
-    tril_r, tril_c = np.tril_indices(arr.shape[1])
+    p_dim = arr.shape[1]
+    if p_dim > 1:
+        triu_r, triu_c = np.triu_indices(p_dim, k=1)
+        if np.any(arr[:, triu_r, triu_c] != 0.0):
+            raise ValueError(
+                "Cholesky array must be lower-triangular "
+                "(found non-zero strict upper-triangular entries)."
+            )
+    diag = np.diagonal(arr, axis1=1, axis2=2)
+    if np.any(diag < 0.0):
+        raise ValueError("Cholesky factors must have non-negative diagonal entries.")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError("Cholesky factors must contain only finite entries.")
+    tril_r, tril_c = np.tril_indices(p_dim)
     return np.asarray(arr[:, tril_r, tril_c], dtype=np.float32)
 
 
@@ -349,6 +362,8 @@ def read_bkg_covariance(
         chol = np.zeros((packed.shape[0], p_dim, p_dim), dtype=np.float64)
         tril_r, tril_c = np.tril_indices(p_dim)
         chol[:, tril_r, tril_c] = packed
+        if np.any(np.diagonal(chol, axis1=1, axis2=2) < 0.0):
+            raise ValueError("BKG_CHOL diagonal entries must be non-negative.")
 
         return BkgCovariance(chol=chol, basis=basis)
 
@@ -380,9 +395,12 @@ def write_lightcurve_fits(
     lc_export = lc.copy() if hasattr(lc, "copy") else lc
     export_meta = getattr(lc_export, "meta", None)
     if isinstance(export_meta, dict):
-        for key in ("WEIGHTMAP", "weightmap"):
-            if key in export_meta and isinstance(export_meta[key], np.ndarray):
-                export_meta.pop(key)
+        if export_meta is meta:
+            export_meta = dict(meta)
+            lc_export.meta = export_meta
+        if resolved_wmap is not None:
+            for key in ("WEIGHTMAP", "weightmap"):
+                export_meta.pop(key, None)
         if (
             "TARGETID" not in export_meta
             and "targetid" not in export_meta

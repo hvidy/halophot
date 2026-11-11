@@ -10,6 +10,7 @@ from time import time as clock
 import matplotlib.pyplot as plt
 import numpy as np
 from astropy.io import fits
+from astropy.table import Table
 
 from .halo_tools import (
     diff_1,
@@ -25,7 +26,74 @@ from .halo_tools import (
 
 
 def _parse_float_array(text: str) -> np.ndarray:
-    return np.fromstring(text.strip("[]"), sep=",")
+    stripped = text.strip().strip("[]").strip()
+    if not stripped:
+        raise ValueError("Expected one or more comma-separated float values.")
+    return np.asarray([float(tok.strip()) for tok in stripped.split(",")], dtype=np.float64)
+
+
+def _parse_int_array(text: str) -> list[int]:
+    stripped = text.strip().strip("[]").strip()
+    if not stripped:
+        raise ValueError("Expected one or more comma-separated integer cadence indices.")
+    return [int(tok.strip()) for tok in stripped.split(",")]
+
+
+def _resolve_split_indices(
+    ts: Table,
+    *,
+    split_times: np.ndarray | None,
+    split_cadences: list[int] | None,
+    campaign: int,
+) -> list[int]:
+    """Resolve time splits or cadence-index splits to strictly increasing 0-based slice indices."""
+    if split_times is not None and split_cadences is not None:
+        raise ValueError(
+            "Pass at most one of --splits (time values) or --split-cadences (cadence indices)."
+        )
+
+    n_cad = len(ts)
+    if n_cad < 4:
+        raise ValueError(f"Cannot split TPF with only {n_cad} cadences.")
+
+    if split_times is not None:
+        times_arr = np.asarray(split_times, dtype=np.float64).ravel()
+        if times_arr.size < 1 or not np.all(np.isfinite(times_arr)):
+            raise ValueError("--splits must provide at least one finite timestamp.")
+        t_col = np.asarray(ts["time"], dtype=np.float64)
+        finite_t = t_col[np.isfinite(t_col)]
+        if finite_t.size == 0:
+            raise ValueError("TPF time column contains no finite timestamps.")
+        t_min = float(np.min(finite_t))
+        t_max = float(np.max(finite_t))
+        sorted_times = np.sort(times_arr)
+        if sorted_times[0] <= t_min or sorted_times[-1] >= t_max:
+            raise ValueError(
+                f"--splits timestamps {sorted_times.tolist()} must lie strictly inside "
+                f"the observation time span ({t_min}, {t_max})."
+            )
+        indices = [int(np.min(np.where(t_col > t_val))) for t_val in sorted_times]
+    elif split_cadences is not None:
+        if len(split_cadences) < 1:
+            raise ValueError("--split-cadences must provide at least one cadence index.")
+        indices = sorted(int(idx) for idx in split_cadences)
+    else:
+        csplits: dict[int, list[int] | None] = {j: None for j in range(16)}
+        csplits[4] = [550, 2200]
+        default_splits = csplits.get(campaign)
+        if default_splits is None:
+            raise ValueError(
+                "--do-split requires split points via --splits, --split-cadences, or -c 4."
+            )
+        indices = list(default_splits)
+
+    if indices[0] <= 0 or indices[-1] >= n_cad:
+        raise ValueError(
+            f"Split cadence indices {indices} must lie strictly inside (0, {n_cad})."
+        )
+    if len(set(indices)) != len(indices):
+        raise ValueError(f"Split points map to duplicate cadence indices {indices}.")
+    return indices
 
 
 def build_parser() -> ArgumentParser:
@@ -54,7 +122,13 @@ def build_parser() -> ArgumentParser:
         "--splits",
         default=None,
         type=_parse_float_array,
-        help="List of time values for kernel splits",
+        help="Comma-separated time values (matching TPF TIME column) for kernel splits",
+    )
+    ap.add_argument(
+        "--split-cadences",
+        default=None,
+        type=_parse_int_array,
+        help="Comma-separated 0-based cadence indices for kernel splits",
     )
     ap.add_argument(
         "--rr",
@@ -98,14 +172,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     """Run the ``halo`` command-line workflow."""
     ap = build_parser()
     args = ap.parse_args(argv)
-
-    csplits: dict[int, list[int] | None] = {j: None for j in range(16)}
-    csplits[4] = [550, 2200]
-
-    if args.splits is None:
-        splits = csplits.get(args.campaign)
-    else:
-        splits = args.splits
 
     if not exists(args.save_dir):
         raise FileNotFoundError(f"Save directory {args.save_dir!r} does not exist.")
@@ -152,12 +218,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         tpf = remove_stars(tpf)
 
     if args.do_split:
-        if splits is None or len(splits) < 2:
-            raise ValueError("--do-split requires at least two split indices via --splits or -c 4.")
+        split_indices = _resolve_split_indices(
+            ts,
+            split_times=args.splits,
+            split_cadences=args.split_cadences,
+            campaign=args.campaign,
+        )
         if not args.quiet:
             print("First doing one run to establish weights")
 
-        tpf, newts, weights, _weightmap, pixelvector = do_lc(
+        _full_tpf, _full_ts, _full_weights, full_wmap, pixelvector = do_lc(
             tpf,
             ts,
             (None, None),
@@ -175,65 +245,45 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
 
         if not args.quiet:
-            print("Splitting at", splits)
-        _tpf1, ts1, _w1, _wm1, _pv1 = do_lc(
-            tpf,
-            ts,
-            (None, int(splits[0])),
-            args.sub,
-            maxiter=args.maxiter,
-            w_init=weights,
-            random_init=args.random_init,
-            thresh=args.thresh,
-            minflux=args.minflux,
-            analytic=args.analytic,
-            sigclip=args.sigclip,
-            verbose=not args.quiet,
-            objective=args.objective,
-            lag=args.lag,
-            bitmask=args.bitmask,
-        )
+            print("Splitting at cadence indices", split_indices)
 
-        _tpf2, ts2, _w2, _wm2, _pv2 = do_lc(
-            tpf,
-            ts,
-            (int(splits[0]), int(splits[1])),
-            args.sub,
-            maxiter=args.maxiter,
-            w_init=weights,
-            random_init=args.random_init,
-            thresh=args.thresh,
-            minflux=args.minflux,
-            sigclip=args.sigclip,
-            verbose=not args.quiet,
-            objective=args.objective,
-            lag=args.lag,
-            bitmask=args.bitmask,
-        )
+        boundaries: list[int | None] = [None, *split_indices, None]
+        seg_tables: list[Table] = []
+        seg_wmaps: list[dict[str, object]] = []
+        warm_weightmap = None if args.random_init else full_wmap["weightmap"]
 
-        tpf, ts3, _w3, wmap, pixelvector = do_lc(
-            tpf,
-            ts,
-            (int(splits[1]), None),
-            args.sub,
-            maxiter=args.maxiter,
-            w_init=weights,
-            random_init=args.random_init,
-            thresh=args.thresh,
-            minflux=args.minflux,
-            analytic=args.analytic,
-            lag=args.lag,
-            sigclip=args.sigclip,
-            verbose=not args.quiet,
-            objective=args.objective,
-            bitmask=args.bitmask,
-        )
+        for low, high in zip(boundaries[:-1], boundaries[1:], strict=True):
+            _seg_tpf, seg_ts, _seg_w, seg_wmap, _seg_pv = do_lc(
+                tpf,
+                ts,
+                (low, high),
+                args.sub,
+                maxiter=args.maxiter,
+                w_init=warm_weightmap,
+                random_init=args.random_init,
+                thresh=args.thresh,
+                minflux=args.minflux,
+                analytic=args.analytic,
+                sigclip=args.sigclip,
+                verbose=not args.quiet,
+                objective=args.objective,
+                lag=args.lag,
+                bitmask=args.bitmask,
+            )
+            seg_tables.append(seg_ts)
+            seg_wmaps.append(seg_wmap)
 
-        newts = stitch([ts1, ts2, ts3])
+        newts = stitch(seg_tables)
+        wmap = {
+            "initial_cadence": [wm["initial_cadence"] for wm in seg_wmaps],
+            "final_cadence": [wm["final_cadence"] for wm in seg_wmaps],
+            "sat_pixels": [wm["sat_pixels"] for wm in seg_wmaps],
+            "weightmap": np.mean([wm["weightmap"] for wm in seg_wmaps], axis=0),
+        }
     else:
         if not args.quiet:
             print("Not splitting")
-        tpf, newts, weights, wmap, pixelvector = do_lc(
+        tpf, newts, _weights, wmap, pixelvector = do_lc(
             tpf,
             ts,
             (None, None),
@@ -260,12 +310,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     if not args.quiet:
         print(f"Total variation per point (first order): {tv1:f} ")
 
-    finite = np.isfinite(newts["corr_flux"])
+    finite = np.isfinite(newts["time"]) & np.isfinite(newts["corr_flux"])
+    if not np.any(finite):
+        raise ValueError("No finite timestamps and fluxes survived in detrended light curve.")
     t_fin = np.asarray(newts["time"][finite], dtype=np.float64)
     f_fin = np.asarray(newts["corr_flux"][finite], dtype=np.float64)
     t_span = float(np.ptp(t_fin)) if t_fin.size > 0 else 1.0
     t_norm = (t_fin - float(np.mean(t_fin))) / (t_span if t_span > 0.0 else 1.0)
-    poly_deg = min(15, max(1, int(np.sum(finite)) - 1))
+    poly_deg = min(15, max(0, int(np.sum(finite)) - 1))
     poly = np.poly1d(np.polyfit(t_norm, f_fin, poly_deg))
     scf = poly(t_norm)
 

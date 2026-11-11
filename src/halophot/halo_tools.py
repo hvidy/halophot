@@ -195,6 +195,8 @@ def censor_tpf(
 ):
     """Throw away bad pixels and bad cadences"""
 
+    if not np.any(np.isfinite(tpf)):
+        raise ValueError("No valid pixels survived censoring in censor_tpf.")
     dummy = tpf.copy()
     tsd = ts.copy()
     maxflux = np.nanmax(tpf)
@@ -213,7 +215,9 @@ def censor_tpf(
     else:
         m = np.ones(len(ts["quality"]), dtype=bool)
 
-    dummy[m, :, :][dummy[m, :, :] < 0] = 0  # just as a check!
+    # Preserve negative background-subtracted noise excursions above minflux.
+    if not np.any(m):
+        raise ValueError("No valid cadences survived quality filtering in censor_tpf.")
 
     if thresh >= 0:
         valid_sat = np.any(np.isfinite(dummy[m, :, :]), axis=0)
@@ -225,8 +229,9 @@ def censor_tpf(
             structure=np.ones((3, 1), dtype=bool),
         )
         dummy[:, saturated] = np.nan
+        n_sat = int(np.sum(saturated))
         if verbose:
-            print(f"{int(np.sum(saturated)):d} saturated pixels")
+            print(f"{n_sat:d} saturated pixels")
 
     # automatic saturation threshold
     # TODO: does not have binary dilation mask implemented
@@ -239,66 +244,73 @@ def censor_tpf(
             )
         stds = []
         threshs = np.arange(nstart, nfinish)
-        for thr in tqdm(threshs, desc="thresholds"):
-            med_img = np.nanmedian(dummy[m, :, :], axis=0)
-            saturated = np.unravel_index((-med_img).argsort(axis=None)[:thr], med_img.shape)
-            dummy2 = dummy.copy()
-            dummy2[:, saturated[0], saturated[1]] = np.nan
-            pf, ts_iter, weights, weightmap, pixels_sub = do_lc(
-                dummy2,
-                tsd,
-                (None, None),
-                sub,
-                maxiter=101,
-                w_init=None,
-                random_init=False,
-                thresh=1.0,
-                minflux=-100,
-                analytic=True,
-                sigclip=False,
-                verbose=False,
-                lag=lag,
-                objective=objective,
-                mission=mission,
-                bitmask=bitmask,
-            )
-            fl = ts_iter["corr_flux"]
-            fs = fl[~np.isnan(fl)] / np.nanmedian(fl)
-            sfs = savgol_filter(fs, int(np.floor(len(fs) / 8) * 2 - 1), 3)
-            stds.append(np.std(fs / sfs))
-        stds = np.asarray(stds)
-        d1 = np.r_[0, stds[1:] - stds[:-1]]
-        d2 = np.r_[0, stds[2:] - 2 * stds[1:-1] + stds[:-2], 0]
-        i1 = []
-        for cut in [3, 2, 1, 0]:  # no while loop!!
-            ind = (
-                (stds > cut * stds[0])
-                & (d1 > 0)
-                & np.r_[True, d2[1:] < d2[:-1]]
-                & np.r_[d2[:-1] < d2[1:], True]
-                & (d2 < 0)
-            )
-            i1 = np.arange(len(ind))[ind]
-            if len(i1) != 0:
-                break
-
-        if len(i1) > 3:
-            i1 = i1[i1.argsort(axis=None)][0:3]
-
-        if threshs[i1[np.argmax(d1[i1])]] == threshs[i1[np.argmin(d2[i1])]]:
-            pix = threshs[i1[np.argmax(d1[i1])]]
+        if len(threshs) == 0:
+            pix = 0
         else:
-            p1 = i1[np.argmax(d1[i1])]
-            p2 = i1[np.argmin(d2[i1])]
-            if abs(d1[p1] - d1[p2]) > abs(d2[p1] - d2[p2]):
-                pix = threshs[p1]
+            for thr in tqdm(threshs, desc="thresholds"):
+                med_img = np.nanmedian(dummy[m, :, :], axis=0)
+                saturated = np.unravel_index((-med_img).argsort(axis=None)[:thr], med_img.shape)
+                dummy2 = dummy.copy()
+                dummy2[:, saturated[0], saturated[1]] = np.nan
+                pf, ts_iter, weights, weightmap, pixels_sub = do_lc(
+                    dummy2,
+                    tsd,
+                    (None, None),
+                    sub,
+                    maxiter=101,
+                    w_init=None,
+                    random_init=False,
+                    thresh=1.0,
+                    minflux=-100,
+                    analytic=True,
+                    sigclip=False,
+                    verbose=False,
+                    lag=lag,
+                    objective=objective,
+                    mission=mission,
+                    bitmask=bitmask,
+                )
+                fl = ts_iter["corr_flux"]
+                fs = fl[~np.isnan(fl)] / np.nanmedian(fl)
+                sfs = savgol_filter(fs, int(np.floor(len(fs) / 8) * 2 - 1), 3)
+                stds.append(np.std(fs / sfs))
+            stds = np.asarray(stds)
+            d1 = np.r_[0, stds[1:] - stds[:-1]]
+            d2 = np.r_[0, stds[2:] - 2 * stds[1:-1] + stds[:-2], 0]
+            i1 = []
+            for cut in [3, 2, 1, 0]:  # no while loop!!
+                ind = (
+                    (stds > cut * stds[0])
+                    & (d1 > 0)
+                    & np.r_[True, d2[1:] < d2[:-1]]
+                    & np.r_[d2[:-1] < d2[1:], True]
+                    & (d2 < 0)
+                )
+                i1 = np.arange(len(ind))[ind]
+                if len(i1) != 0:
+                    break
+
+            if len(i1) == 0:
+                pix = int(threshs[0])
             else:
-                pix = threshs[p2]
+                if len(i1) > 3:
+                    i1 = i1[i1.argsort(axis=None)][0:3]
+
+                if threshs[i1[np.argmax(d1[i1])]] == threshs[i1[np.argmin(d2[i1])]]:
+                    pix = threshs[i1[np.argmax(d1[i1])]]
+                else:
+                    p1 = i1[np.argmax(d1[i1])]
+                    p2 = i1[np.argmin(d2[i1])]
+                    if abs(d1[p1] - d1[p2]) > abs(d2[p1] - d2[p2]):
+                        pix = threshs[p1]
+                    else:
+                        pix = threshs[p2]
         if verbose:
             print(f"Finished optimization: {int(pix):d} saturated pixels")
         max_img = np.nanmax(dummy[m, :, :], axis=0)
         saturated = np.unravel_index((-max_img).argsort(axis=None)[:pix], max_img.shape)
         dummy[:, saturated[0], saturated[1]] = np.nan
+        n_sat = int(len(saturated[0]))
 
     valid_pix = np.any(np.isfinite(dummy[m, :, :]), axis=0)
     no_flux = np.zeros(dummy.shape[1:], dtype=bool)
@@ -319,20 +331,28 @@ def censor_tpf(
     # then pick only pixels which are mostly good
 
     n_good_cad = dummy[m, :, :].shape[0]
+    if n_good_cad == 0:
+        raise ValueError("No valid cadences survived quality and centroid filtering in censor_tpf.")
     pixels = np.reshape(dummy[m, :, :].T, (tpf.shape[1] * tpf.shape[2], n_good_cad))
     indic = np.sum(np.isfinite(pixels), axis=1)
-    min_valid = min(60, max(1, n_good_cad - 1)) if n_good_cad <= 60 else 60
-    pixels = pixels[indic > min_valid, :]
+    min_valid = min(60, (n_good_cad - 1) // 2)
+    keep_pix = indic > min_valid
+    if not np.any(keep_pix):
+        raise ValueError("No valid pixels survived censoring in censor_tpf.")
+    pixels = pixels[keep_pix, :]
 
-    m[np.flatnonzero(m)[~np.all(np.isfinite(pixels), axis=0)]] = False
+    good_cols = np.all(np.isfinite(pixels), axis=0)
+    if not np.any(good_cols):
+        raise ValueError("No cadences with all-finite surviving pixels remained in censor_tpf.")
+    m[np.flatnonzero(m)[~good_cols]] = False
     tsd = ts[m]
-    pixels = pixels[:, np.all(np.isfinite(pixels), axis=0)]
+    pixels = pixels[:, good_cols]
 
     # this should get all the nans but if not just set them to 0
 
     pixels[~np.isfinite(pixels)] = 0
 
-    return pixels, tsd, m, np.where(indic > min_valid), np.sum(saturated[0].shape)
+    return pixels, tsd, m, np.where(keep_pix), n_sat
 
 
 # =========================================================================
@@ -396,6 +416,15 @@ class OptimResult(NamedTuple):
     solution: optx.Solution
 
 
+def _min_cadences_for_objective(objective: str, lag: int) -> int:
+    """Return the minimum number of cadences required to evaluate ``objective`` cleanly."""
+    if objective == "owl":
+        return 2
+    if objective == "tv_o2":
+        return 2 * lag + 1
+    return lag + 1
+
+
 @functools.lru_cache(maxsize=32)
 def _get_cached_minimiser(objective: str, lag: int):
     """Build and cache a JIT-compiled Optimistix L-BFGS runner for ``(objective, lag)``."""
@@ -415,8 +444,8 @@ def _get_cached_minimiser(objective: str, lag: int):
             return obj_callable(weights, lag, pvec)
 
     @eqx.filter_jit
-    def _run(w0: jax.Array, pvec: jax.Array, max_steps: int) -> optx.Solution:
-        return optx.minimise(
+    def _run(w0: jax.Array, pvec: jax.Array, max_steps: int) -> tuple[optx.Solution, jax.Array]:
+        sol = optx.minimise(
             loss_fn,
             solver,
             w0,
@@ -424,6 +453,7 @@ def _get_cached_minimiser(objective: str, lag: int):
             max_steps=max_steps,
             throw=False,
         )
+        return sol, loss_fn(sol.value, (pvec,))
 
     return _run
 
@@ -435,12 +465,41 @@ def jax_func(pixelvector_jax, w_init, objective, maxiter, lag):
         valid = ", ".join(sorted(objectives.mapping))
         raise ValueError(f"Unknown objective {objective!r}; expected one of: {valid}")
 
-    runner = _get_cached_minimiser(objective, int(lag))
-    sol = runner(
-        jnp.asarray(w_init, dtype=jnp.float64),
-        jnp.asarray(pixelvector_jax, dtype=jnp.float64),
-        int(maxiter),
-    )
+    if isinstance(maxiter, bool) or int(maxiter) < 1:
+        raise ValueError(f"maxiter must be an integer >= 1, got {maxiter!r}.")
+    maxiter_int = int(maxiter)
+
+    if isinstance(lag, bool) or int(lag) < 1:
+        raise ValueError(f"lag must be an integer >= 1, got {lag!r}.")
+    lag_int = int(lag)
+
+    pvec = jnp.asarray(pixelvector_jax, dtype=jnp.float64)
+    if pvec.ndim != 2:
+        raise ValueError(f"pixelvector_jax must be 2D (npix, n_cad), got shape {pvec.shape}.")
+    npix, n_cad = pvec.shape
+    if npix < 1:
+        raise ValueError(f"pixelvector_jax must contain at least 1 pixel, got npix={npix}.")
+    min_cad = _min_cadences_for_objective(objective, lag_int)
+    if n_cad < min_cad:
+        raise ValueError(
+            f"Objective {objective!r} with lag={lag_int} requires at least {min_cad} cadences, "
+            f"got n_cad={n_cad}."
+        )
+    if not bool(jnp.all(jnp.isfinite(pvec))):
+        raise ValueError("pixelvector_jax contains non-finite values.")
+
+    w0 = jnp.asarray(w_init, dtype=jnp.float64)
+    if w0.shape != (npix,):
+        raise ValueError(f"w_init shape {w0.shape} does not match (npix,) = ({npix},).")
+    if not bool(jnp.all(jnp.isfinite(w0))):
+        raise ValueError("w_init contains non-finite values.")
+
+    runner = _get_cached_minimiser(objective, lag_int)
+    sol, final_loss = runner(w0, pvec, maxiter_int)
+    if not bool(jnp.all(jnp.isfinite(sol.value))) or not bool(jnp.isfinite(final_loss)):
+        raise ValueError(
+            f"Optimization for objective={objective!r} produced a non-finite solution or loss."
+        )
     return OptimResult(params=sol.value, solution=sol)
 
 
@@ -464,9 +523,9 @@ def tv_tpf(
     maxiter: int
         Number of iterations to optimize. 101 is default & usually sufficient.
     w_init: None or array-like.
-        Initialize weights with a particular weight vector - useful if you have
+        Initialize weights with a particular simplex weight vector - useful if you have
         already run TV-min and want to update, but otherwise set to None
-        and it will have default initialization.
+        and it will have default uniform initialization.
     random_init: Boolean
         If False, and w_init is None, it will initialize with uniform weights; if True, it
         will initialize with random weights. False is usually better.
@@ -487,19 +546,32 @@ def tv_tpf(
     del analytic  # JAX reverse-mode AD is always used.
 
     pixelvector_np = np.asarray(pixelvector, dtype=np.float64)
+    if pixelvector_np.ndim != 2 or pixelvector_np.shape[0] < 1:
+        raise ValueError(
+            f"pixelvector must be 2D (npix, n_cad) with npix >= 1, got shape {pixelvector_np.shape}."
+        )
     npix = pixelvector_np.shape[0]
 
     if w_init is None:
-        w_init_jax = jnp.ones(npix, dtype=jnp.float64) / float(npix)
+        logits_init = jnp.zeros(npix, dtype=jnp.float64)
     else:
-        w_init_jax = jnp.asarray(w_init, dtype=jnp.float64)
+        w_arr = jnp.asarray(w_init, dtype=jnp.float64)
+        if w_arr.shape != (npix,):
+            raise ValueError(f"w_init shape {w_arr.shape} does not match (npix,) = ({npix},).")
+        if not bool(jnp.all(jnp.isfinite(w_arr))) or bool(jnp.any(w_arr < 0.0)):
+            raise ValueError("w_init simplex weights must be finite and non-negative.")
+        w_sum = jnp.sum(w_arr)
+        if not bool(w_sum > 0.0):
+            raise ValueError("w_init simplex weights must have strictly positive sum.")
+        w_norm = w_arr / w_sum
+        logits_init = jnp.log(jnp.maximum(w_norm, jnp.finfo(jnp.float64).tiny))
 
     if verbose:
         print("Using Analytic Derivatives")
 
     pixelvector_jax = jnp.asarray(pixelvector_np, dtype=jnp.float64)
 
-    res = jax_func(pixelvector_jax, w_init_jax, objective, maxiter, lag)
+    res = jax_func(pixelvector_jax, logits_init, objective, maxiter, lag)
     obj_params, _ = res
 
     w_best = np.asarray(objectives.softmax(obj_params), dtype=np.float64)
@@ -510,25 +582,36 @@ def tv_tpf(
         if verbose:
             print("Sigma clipping")
 
-        win = min(51, len(lc_first_try) if len(lc_first_try) % 2 == 1 else len(lc_first_try) - 1)
-        win = max(3, win)
+        if len(lc_first_try) >= 3:
+            win = min(
+                51, len(lc_first_try) if len(lc_first_try) % 2 == 1 else len(lc_first_try) - 1
+            )
+            win = max(3, win)
+            baseline = savgol_filter(lc_first_try, win, 1)
+        else:
+            baseline = np.nanmedian(lc_first_try)
         good = ~sigma_clip(
-            lc_first_try - savgol_filter(lc_first_try, win, 1),
+            lc_first_try - baseline,
             sigma_lower=10.0,
             sigma_upper=3.0,
         ).mask
 
-        if np.sum(~good) > 0:
+        min_cad = _min_cadences_for_objective(objective, int(lag))
+        if np.sum(~good) > 0 and int(np.sum(good)) >= min_cad:
             if verbose:
                 print(f"Clipping {int(np.sum(~good)):d} bad points")
 
             pixels_masked = jnp.asarray(pixelvector_np[:, good], dtype=jnp.float64)
 
-            res = jax_func(pixels_masked, w_init_jax, objective, maxiter, lag)
+            res = jax_func(pixels_masked, logits_init, objective, maxiter, lag)
             tv_params, _ = res
 
             w_best = np.asarray(objectives.softmax(tv_params), dtype=np.float64)
 
+        elif np.sum(~good) > 0:
+            if verbose:
+                print("Too few cadences remain after clipping for refit; retaining initial fit")
+            good = np.isfinite(lc_first_try)
         else:
             if verbose:
                 print("No outliers found, continuing")
@@ -576,10 +659,23 @@ def do_lc(
     bitmask="default",
 ):
     ### get a slice corresponding to the splits you want
+    if isinstance(sub, bool) or int(sub) < 1:
+        raise ValueError(f"sub must be an integer >= 1, got {sub!r}.")
+    sub = int(sub)
 
     if split_times is not None:
-        assert np.min(split_times) > np.min(ts["time"]), "Minimum time split must be during campaign"
-        splits = [int(np.min(np.where(ts["time"] > split))) for split in split_times]
+        split_arr = np.sort(np.asarray(split_times, dtype=np.float64).ravel())
+        if split_arr.size < 1 or not np.all(np.isfinite(split_arr)):
+            raise ValueError("split_times must contain at least one finite timestamp.")
+        if split_arr[0] <= np.nanmin(ts["time"]) or split_arr[-1] >= np.nanmax(ts["time"]):
+            raise ValueError("All split_times must lie strictly inside the campaign time span.")
+        splits = [int(np.min(np.where(ts["time"] > split))) for split in split_arr]
+        if len(set(splits)) != len(splits):
+            raise ValueError(f"split_times map to duplicate cadence indices {splits}.")
+        if w_init is not None and np.asarray(w_init).ndim == 1:
+            raise ValueError(
+                "When split_times is provided, w_init must be None or a 2D (nx, ny) weightmap."
+            )
         all_splits = [None, *splits, None]
         tss = []
         cad1 = []
@@ -674,6 +770,8 @@ def do_lc(
         ### subsample
 
         pixels_sub = pixels[::sub, :]
+        if pixels_sub.shape[0] < 1:
+            raise ValueError("No pixels remained after subsampling.")
         if verbose:
             print(f"Subsampling by a factor of {sub:d}")
 
@@ -681,14 +779,37 @@ def do_lc(
 
         if verbose:
             print("Calculating weights")
+
+        w_seg_init = w_init
+        if w_init is not None:
+            w_init_arr = np.asarray(w_init, dtype=np.float64)
+            if w_init_arr.ndim == 2:
+                expected_2d = (tpf.shape[2], tpf.shape[1])
+                if w_init_arr.shape != expected_2d:
+                    raise ValueError(
+                        f"2D w_init shape {w_init_arr.shape} does not match weightmap shape "
+                        f"{expected_2d}."
+                    )
+                active_idx = mapping[0] if sub == 1 else mapping[0][::sub]
+                raw_w = w_init_arr.ravel()[active_idx]
+                extracted = np.where(np.isfinite(raw_w) & (raw_w > 0.0), raw_w, 0.0)
+                w_sum = float(np.sum(extracted))
+                w_seg_init = extracted / w_sum if w_sum > 0.0 else None
+
         if random_init:
-            w_init = np.random.rand(pixels_sub.shape[0])
-            w_init /= np.sum(w_init)
+            rng = np.random.default_rng()
+            u_draws = np.clip(
+                rng.uniform(size=pixels_sub.shape[0]),
+                np.finfo(np.float64).tiny,
+                1.0 - np.finfo(np.float64).eps,
+            )
+            exp_draws = -np.log(u_draws)
+            w_seg_init = exp_draws / np.sum(exp_draws)
 
         weights, opt_lc, _ = tv_tpf(
             pixels_sub,
             maxiter=maxiter,
-            w_init=w_init,
+            w_init=w_seg_init,
             analytic=analytic,
             verbose=verbose,
             sigclip=sigclip,
@@ -743,9 +864,10 @@ def plot_lc(ax1, time, lc, name, trends=None, title=False):
 
 
 def plot_fluxmap(ax1, image, name, title=False):
-    cmap = mpl.colormaps["hot"].copy()
-    cmap.set_bad("k", 1.0)
-    im = np.log10(image)
+    cmap = mpl.colormaps["hot"].with_extremes(bad="k")
+    img_arr = np.asarray(image, dtype=np.float64)
+    pos = np.isfinite(img_arr) & (img_arr > 0.0)
+    im = np.where(pos, np.log10(np.where(pos, img_arr, 1.0)), np.nan)
     pic = ax1.imshow(im, cmap=cmap, vmax=np.nanmax(im), interpolation="nearest", origin="lower")
     if title:
         plt.title(f"{name} Flux Map")
@@ -767,10 +889,11 @@ def plot_fluxmap(ax1, image, name, title=False):
 def plot_weightmap(ax1, weightmap, name, title=False, aspect=None):
     norm = np.size(weightmap)
 
-    cmap = mpl.colormaps["seismic"].copy()
-    cmap.set_bad("k", 1.0)
+    cmap = mpl.colormaps["seismic"].with_extremes(bad="k")
 
-    im = np.log10(weightmap.T * norm)
+    wm_scaled = np.ma.filled(weightmap.T * norm, np.nan).astype(np.float64)
+    pos = np.isfinite(wm_scaled) & (wm_scaled > 0.0)
+    im = np.where(pos, np.log10(np.where(pos, wm_scaled, 1.0)), np.nan)
     pic = ax1.imshow(
         im,
         cmap=cmap,
@@ -1029,9 +1152,11 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
         flux[:, ~aperture_mask] = np.nan
         if rr is not None:
             rmin, rmax = rr
-            print("Getting annulus from", rmin, "to", rmax)
+            if verbose:
+                print("Getting annulus from", rmin, "to", rmax)
             flux = get_annulus(flux, rmin, rmax)
-            print("Using", np.sum(np.isfinite(flux[0, :, :])), "pixels")
+            if verbose:
+                print("Using", np.sum(np.isfinite(flux[0, :, :])), "pixels")
 
         flux_arr = flux.value if hasattr(flux, "value") else np.asarray(flux)
         pf, ts, weights, weightmap, pixels_sub = do_lc(
@@ -1070,7 +1195,7 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
 
         lc_out = lightkurve.KeplerLightCurve(
             flux=ts["corr_flux"],
-            time=Time(ts["time"], format=self.time.format),
+            time=Time(ts["time"], format=self.time.format, scale=self.time.scale),
             flux_err=np.nan * ts["corr_flux"],
             **keys,
         )
@@ -1175,9 +1300,11 @@ class halo_tpf_tess(lightkurve.TessTargetPixelFile):
         flux[:, ~aperture_mask] = np.nan
         if rr is not None:
             rmin, rmax = rr
-            print("Getting annulus from", rmin, "to", rmax)
+            if verbose:
+                print("Getting annulus from", rmin, "to", rmax)
             flux = get_annulus(flux, rmin, rmax)
-            print("Using", np.sum(np.isfinite(flux[0, :, :])), "pixels")
+            if verbose:
+                print("Using", np.sum(np.isfinite(flux[0, :, :])), "pixels")
 
         flux_arr = flux.value if hasattr(flux, "value") else np.asarray(flux)
         pf, ts, weights, weightmap, pixels_sub = do_lc(
@@ -1215,7 +1342,7 @@ class halo_tpf_tess(lightkurve.TessTargetPixelFile):
         }
         lc_out = lightkurve.TessLightCurve(
             flux=ts["corr_flux"],
-            time=Time(ts["time"], format=self.time.format),
+            time=Time(ts["time"], format=self.time.format, scale=self.time.scale),
             flux_err=np.nan * ts["corr_flux"],
             **keys,
         )
