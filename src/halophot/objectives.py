@@ -83,13 +83,7 @@ def tv_charbonnier_o2(
         zero = jnp.zeros((), dtype=f_tilde.dtype)
         return zero, zero
 
-    mask_o2 = obs.valid_diff_mask[: -2 * lag] & obs.valid_diff_mask[lag:-lag]
-    fallback_o2 = (
-        obs.valid_cadence_mask[: -2 * lag]
-        & obs.valid_cadence_mask[lag:-lag]
-        & obs.valid_cadence_mask[2 * lag :]
-    )
-    mask = jnp.where(jnp.any(mask_o2), mask_o2, fallback_o2)
+    mask = obs.valid_diff_mask[: -2 * lag] & obs.valid_diff_mask[lag:-lag]
     diffs2 = jnp.where(
         mask,
         2.0 * f_tilde[lag:-lag] - f_tilde[2 * lag :] - f_tilde[: -2 * lag],
@@ -140,8 +134,12 @@ def tv_exp_scan(
 
         dt_pair = jnp.roll(obs.times_padded, -ell) - obs.times_padded
         expected_dt = ell.astype(obs.times_padded.dtype) * obs.dt_nom
-        gap_ok = both_active & (jnp.abs(dt_pair - expected_dt) <= gap_tol * expected_dt)
-        mask_ell = jnp.where(jnp.any(gap_ok), gap_ok, both_active)
+        tol_ok = (
+            jnp.ones_like(dt_pair, dtype=jnp.bool_)
+            if math.isinf(float(gap_tol))
+            else (jnp.abs(dt_pair - expected_dt) <= gap_tol * expected_dt)
+        )
+        mask_ell = both_active & tol_ok
 
         diffs = jnp.where(mask_ell, jnp.roll(f_tilde, -ell) - f_tilde, 0.0)
         phi = jnp.where(mask_ell, charbonnier_penalty(diffs, epsilon=epsilon), 0.0)

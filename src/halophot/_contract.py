@@ -473,6 +473,7 @@ def write_lightcurve_fits(
     meta = getattr(lc, "meta", None)
     resolved_wmap = weightmap
     resolved_werr = None
+    resolved_splits = None
     if isinstance(meta, dict):
         if resolved_wmap is None:
             if "WEIGHTMAP" in meta:
@@ -483,6 +484,10 @@ def write_lightcurve_fits(
             resolved_werr = meta["WEIGHTMAP_ERR"]
         elif "weightmap_err" in meta:
             resolved_werr = meta["weightmap_err"]
+        if "SPLIT_TIMES" in meta:
+            resolved_splits = meta["SPLIT_TIMES"]
+        elif "split_times" in meta:
+            resolved_splits = meta["split_times"]
 
     lc_export = lc.copy() if hasattr(lc, "copy") else lc
     export_meta = getattr(lc_export, "meta", None)
@@ -519,6 +524,18 @@ def write_lightcurve_fits(
 
     hdul[0].header["HALOCVER"] = (HALOCVER, "Halophot pipeline contract version")
 
+    splits_arr: np.ndarray | None = None
+    if resolved_splits is not None:
+        cand_splits = np.asarray(resolved_splits, dtype=np.float64).ravel()
+        if cand_splits.size > 0:
+            if not np.all(np.isfinite(cand_splits)):
+                raise ValueError("SPLIT_TIMES must contain only finite timestamps.")
+            splits_arr = cand_splits
+            hdul[0].header["NSPLITS"] = (
+                int(splits_arr.size),
+                "Number of segment split timestamps",
+            )
+
     if resolved_wmap is not None:
         if isinstance(resolved_wmap, np.ma.MaskedArray):
             resolved_wmap = resolved_wmap.filled(np.nan)
@@ -529,7 +546,19 @@ def write_lightcurve_fits(
             )
         if "WEIGHTMAP" in hdul:
             del hdul["WEIGHTMAP"]
-        hdul.append(fits.ImageHDU(data=w_arr, name="WEIGHTMAP"))
+        wmap_hdu = fits.ImageHDU(data=w_arr, name="WEIGHTMAP")
+        if splits_arr is not None:
+            wmap_hdu.header["NSPLITS"] = (
+                int(splits_arr.size),
+                "Number of segment split timestamps",
+            )
+            if splits_arr.size <= 999:
+                for idx_s, st_val in enumerate(splits_arr, start=1):
+                    wmap_hdu.header[f"SPLIT{idx_s:03d}"] = (
+                        float(st_val),
+                        f"Segment split timestamp {idx_s}",
+                    )
+        hdul.append(wmap_hdu)
 
     if resolved_werr is not None:
         werr_arr = np.asarray(resolved_werr, dtype=np.float64)
@@ -538,8 +567,45 @@ def write_lightcurve_fits(
                 del hdul["WEIGHTMAP_ERR"]
             hdul.append(fits.ImageHDU(data=werr_arr, name="WEIGHTMAP_ERR"))
 
+    if splits_arr is not None:
+        if "SPLIT_TIMES" in hdul:
+            del hdul["SPLIT_TIMES"]
+        split_col = fits.Column(name="SPLIT_TIME", format="D", array=splits_arr)
+        hdul.append(fits.BinTableHDU.from_columns([split_col], name="SPLIT_TIMES"))
+
     hdul.writeto(out_path, overwrite=overwrite)
     return out_path
+
+
+def read_split_times(lc_or_hdul_or_path: Any) -> np.ndarray | None:
+    """Read segment ``SPLIT_TIMES`` from a light curve, FITS ``HDUList``, or path.
+
+    Returns ``None`` when the observation was extracted without segment splits.
+    """
+    meta = getattr(lc_or_hdul_or_path, "meta", None)
+    if isinstance(meta, dict):
+        for key in ("SPLIT_TIMES", "split_times"):
+            if key in meta and meta[key] is not None:
+                arr = np.asarray(meta[key], dtype=np.float64).ravel()
+                return arr if arr.size > 0 else None
+
+    with _open_hdul_and_mask(lc_or_hdul_or_path, apply_quality_mask=False) as (hdul, _):
+        if "SPLIT_TIMES" in hdul and hdul["SPLIT_TIMES"].data is not None:
+            names = [n.upper() for n in (hdul["SPLIT_TIMES"].data.names or ())]
+            if "SPLIT_TIME" in names:
+                arr = np.asarray(hdul["SPLIT_TIMES"].data["SPLIT_TIME"], dtype=np.float64).ravel()
+                return arr if arr.size > 0 else None
+        if "WEIGHTMAP" in hdul and "NSPLITS" in hdul["WEIGHTMAP"].header:
+            n_splits = int(hdul["WEIGHTMAP"].header["NSPLITS"])
+            if n_splits > 0:
+                cards = [
+                    float(hdul["WEIGHTMAP"].header[f"SPLIT{idx_s:03d}"])
+                    for idx_s in range(1, n_splits + 1)
+                    if f"SPLIT{idx_s:03d}" in hdul["WEIGHTMAP"].header
+                ]
+                if len(cards) == n_splits:
+                    return np.asarray(cards, dtype=np.float64)
+        return None
 
 
 def _is_under_fred(path: Path) -> bool:

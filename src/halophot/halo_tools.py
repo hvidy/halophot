@@ -27,6 +27,7 @@ from tqdm import tqdm
 
 from . import halo_objectives as objectives
 from ._contract import (
+    BkgCovariance,
     infer_bkg_poly_order,
     read_bkg_covariance,
     read_bkgsub_state,
@@ -729,6 +730,7 @@ def do_lc(
             "sat_pixels": sat,
             "weightmap": weightmap[0],
             "weightmaps": np.stack(weightmap, axis=0),
+            "split_indices": splits,
         }
         ts = stitch(tss)
 
@@ -1055,16 +1057,19 @@ def _compute_legacy_tpf_flux_err(
     weightmap_dict: dict[str, object],
     corr_flux: np.ndarray,
     flux_arr: np.ndarray,
+    *,
+    split_times=None,
 ) -> np.ndarray:
     """Propagate coherent normalized ``flux_err`` on ``halo_tpf`` / ``halo_tpf_tess``."""
+    n_total = len(corr_flux)
     fe_obj = getattr(tpf_obj, "flux_err", None)
     fe_arr = (
         np.asarray(fe_obj.value if hasattr(fe_obj, "value") else fe_obj, dtype=np.float64)
         if fe_obj is not None
         else None
     )
-    if fe_arr is None or not np.any(np.isfinite(fe_arr) & (fe_arr > 0.0)):
-        return np.nan * np.asarray(corr_flux, dtype=np.float64)
+    if fe_arr is not None and not np.any(np.isfinite(fe_arr) & (fe_arr > 0.0)):
+        fe_arr = None
 
     fbe_obj = getattr(tpf_obj, "flux_bkg_err", None)
     fbe_arr = (
@@ -1075,28 +1080,86 @@ def _compute_legacy_tpf_flux_err(
     if fbe_arr is not None and not np.any(np.isfinite(fbe_arr) & (fbe_arr > 0.0)):
         fbe_arr = None
 
+    se_arr = read_smear_err(tpf_obj, apply_quality_mask=True)
+    bkg_cov = read_bkg_covariance(tpf_obj, apply_quality_mask=True)
+    if fe_arr is None and se_arr is None and bkg_cov is None and fbe_arr is None:
+        return np.full(n_total, np.nan, dtype=np.float64)
+
+    bkgsub = read_bkgsub_state(tpf_obj, warn_legacy_mundey=False)
+    bkg_order = infer_bkg_poly_order(tpf_obj)
+
+    if "weightmaps" in weightmap_dict:
+        wmaps_3d = np.asarray(weightmap_dict["weightmaps"], dtype=np.float64)
+        raw_splits = weightmap_dict.get("split_indices")
+        if raw_splits is not None:
+            split_idx = [int(i) for i in raw_splits]
+        elif split_times is not None:
+            t_col = np.asarray(tpf_obj.time.value, dtype=np.float64)
+            split_arr = np.sort(np.asarray(split_times, dtype=np.float64).ravel())
+            split_idx = [int(np.min(np.where(t_col > st))) for st in split_arr]
+        else:
+            split_idx = []
+
+        if len(split_idx) + 1 != wmaps_3d.shape[0]:
+            return np.full(n_total, np.nan, dtype=np.float64)
+
+        bounds = [0, *split_idx, n_total]
+        err_out = np.full(n_total, np.nan, dtype=np.float64)
+        for s_idx, (low, high) in enumerate(zip(bounds[:-1], bounds[1:], strict=True)):
+            sl = slice(low, high)
+            w_ny_nx = np.asarray(wmaps_3d[s_idx], dtype=np.float64).T
+            rows_h, cols_h = np.where(np.isfinite(w_ny_nx) & (w_ny_nx > 0.0))
+            if rows_h.size == 0:
+                continue
+            corr_seg = np.asarray(corr_flux[sl], dtype=np.float64)
+            valid_seg = np.isfinite(corr_seg)
+            if not np.any(valid_seg):
+                continue
+            raw_lc_seg = flux_arr[sl][valid_seg][:, rows_h, cols_h] @ w_ny_nx[rows_h, cols_h]
+            med_raw = float(np.nanmedian(raw_lc_seg))
+            if not np.isfinite(med_raw) or abs(med_raw) <= 1e-30:
+                continue
+            bkg_cov_seg = (
+                BkgCovariance(chol=bkg_cov.chol[sl], basis=bkg_cov.basis)
+                if bkg_cov is not None
+                else None
+            )
+            seg_err = compute_coherent_flux_err(
+                w_ny_nx,
+                flux_err=None if fe_arr is None else fe_arr[sl],
+                smear_err=None if se_arr is None else se_arr[sl],
+                bkg_cov=bkg_cov_seg,
+                flux_bkg_err=None if fbe_arr is None else fbe_arr[sl],
+                bkgsub=bkgsub,
+                bkg_order=bkg_order,
+                norm_factor=med_raw,
+            )
+            seg_err[~valid_seg] = np.nan
+            err_out[sl] = seg_err
+        return err_out
+
     w_ny_nx = np.asarray(weightmap_dict["weightmap"], dtype=np.float64).T
     rows_h, cols_h = np.where(np.isfinite(w_ny_nx) & (w_ny_nx > 0.0))
     if rows_h.size == 0:
-        return np.nan * np.asarray(corr_flux, dtype=np.float64)
+        return np.full(n_total, np.nan, dtype=np.float64)
 
     valid_cad = np.isfinite(corr_flux)
     if not np.any(valid_cad):
-        return np.nan * np.asarray(corr_flux, dtype=np.float64)
+        return np.full(n_total, np.nan, dtype=np.float64)
 
     raw_lc = flux_arr[valid_cad][:, rows_h, cols_h] @ w_ny_nx[rows_h, cols_h]
     med_raw = float(np.nanmedian(raw_lc))
     if not np.isfinite(med_raw) or abs(med_raw) <= 1e-30:
-        return np.nan * np.asarray(corr_flux, dtype=np.float64)
+        return np.full(n_total, np.nan, dtype=np.float64)
 
     err_out = compute_coherent_flux_err(
         w_ny_nx,
         flux_err=fe_arr,
-        smear_err=read_smear_err(tpf_obj, apply_quality_mask=True),
-        bkg_cov=read_bkg_covariance(tpf_obj, apply_quality_mask=True),
+        smear_err=se_arr,
+        bkg_cov=bkg_cov,
         flux_bkg_err=fbe_arr,
-        bkgsub=read_bkgsub_state(tpf_obj, warn_legacy_mundey=False),
-        bkg_order=infer_bkg_poly_order(tpf_obj),
+        bkgsub=bkgsub,
+        bkg_order=bkg_order,
         norm_factor=med_raw,
     )
     err_out[~valid_cad] = np.nan
@@ -1246,7 +1309,9 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
             "cadenceno": ts["cadence"],
         }
 
-        flux_err_lc = _compute_legacy_tpf_flux_err(self, weightmap, ts["corr_flux"], flux_arr)
+        flux_err_lc = _compute_legacy_tpf_flux_err(
+            self, weightmap, ts["corr_flux"], flux_arr, split_times=split_times
+        )
         lc_out = lightkurve.KeplerLightCurve(
             flux=ts["corr_flux"],
             time=Time(ts["time"], format=self.time.format, scale=self.time.scale),
@@ -1263,6 +1328,10 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
             lc_out.meta["WEIGHTMAP"] = np.swapaxes(
                 np.asarray(weightmap["weightmaps"], dtype=np.float64), -1, -2
             )
+            if split_times is not None:
+                lc_out.meta["SPLIT_TIMES"] = (
+                    np.sort(np.asarray(split_times, dtype=np.float64).ravel()).tolist()
+                )
         else:
             lc_out.meta["WEIGHTMAP"] = np.asarray(weightmap["weightmap"], dtype=np.float64).T
         return weightmap, lc_out
@@ -1401,7 +1470,9 @@ class halo_tpf_tess(lightkurve.TessTargetPixelFile):
             "mission": self.mission,
             "cadenceno": ts["cadence"],
         }
-        flux_err_lc = _compute_legacy_tpf_flux_err(self, weightmap, ts["corr_flux"], flux_arr)
+        flux_err_lc = _compute_legacy_tpf_flux_err(
+            self, weightmap, ts["corr_flux"], flux_arr, split_times=split_times
+        )
         lc_out = lightkurve.TessLightCurve(
             flux=ts["corr_flux"],
             time=Time(ts["time"], format=self.time.format, scale=self.time.scale),
@@ -1415,6 +1486,10 @@ class halo_tpf_tess(lightkurve.TessTargetPixelFile):
             lc_out.meta["WEIGHTMAP"] = np.swapaxes(
                 np.asarray(weightmap["weightmaps"], dtype=np.float64), -1, -2
             )
+            if split_times is not None:
+                lc_out.meta["SPLIT_TIMES"] = (
+                    np.sort(np.asarray(split_times, dtype=np.float64).ravel()).tolist()
+                )
         else:
             lc_out.meta["WEIGHTMAP"] = np.asarray(weightmap["weightmap"], dtype=np.float64).T
         object.__setattr__(lc_out, "primary_header", self.hdu[0].header)

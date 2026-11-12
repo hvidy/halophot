@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import math
+from pathlib import Path
 
 import equinox as eqx
 import jax
@@ -16,11 +18,14 @@ from halophot.objectives import (
     AVAILABLE_OBJECTIVES,
     charbonnier_penalty,
     halo_objective,
+    tv_charbonnier_o2,
     tv_exp_scan,
 )
 from halophot.optimise import (
+    _get_fisher_fn,
     build_value_and_grad,
     cadence_scaled_savgol_window,
+    cadence_scaled_sigclip_mask,
     optimise_halo,
     orbit_block_jackknife,
     safe_eigen_projection,
@@ -343,3 +348,141 @@ def test_solvers_safe_eigen_projection_jackknife_sigclip_and_legacy_tv() -> None
     assert sub_obs.N_pad == obs_base.N_pad
     w_std, w_jk = orbit_block_jackknife(obs_base, fit_lbfgs.physical_weights, n_blocks=4)
     assert w_std.shape == (4,) and w_jk.shape == (4, 4)
+
+
+def test_gap_invariance_when_lag_exceeds_segment_length() -> None:
+    """Verify tv_exp_scan, tv_charbonnier_o2, and from_arrays never bridge cross-gap jumps."""
+    n_half = 16
+    dt = 2.0 / 1440.0
+    t_seg1 = np.arange(n_half, dtype=np.float64) * dt
+    t_seg2 = t_seg1 + 2.5  # 2.5-day TESS downlink gap
+    t_gapped = np.concatenate([t_seg1, t_seg2])
+
+    rng = np.random.default_rng(707)
+    p_base = 1000.0 + rng.normal(0.0, 5.0, size=(3, 2 * n_half))
+    p_shifted = p_base.copy()
+    # Add a huge cross-gap step on segment 2 that leaves intra-segment differences unchanged
+    p_shifted[:, n_half:] += 500.0
+
+    # 1. lag = 18 > n_half = 16 must leave valid_diff_mask empty (never falling back across gap!)
+    obs_lag18 = HaloObservation.from_arrays(p_base, t_gapped, lag=18)
+    assert int(jnp.sum(obs_lag18.valid_diff_mask)) == 0
+
+    # 2. tv_exp_scan with tau = 6.0 -> scan_len = ceil(4 * tau) = 24 > n_half = 16
+    obs_a = HaloObservation.from_arrays(p_base, t_gapped, lag=1, legacy_tv=True)
+    obs_b = HaloObservation.from_arrays(p_shifted, t_gapped, lag=1, legacy_tv=True)
+
+    with jax.enable_x64(True):
+        w_fixed = HaloWeights(z_ilr=jnp.array([0.2, -0.3], dtype=jnp.float64), legacy_tv=True)
+        # Evaluate raw (unnormalized) linear combination w^T P(t) directly so intra-segment
+        # differences match identically while the +500 cross-gap jump is present in f_b!
+        w_phys = w_fixed.physical_weights(jnp.ones(3, dtype=jnp.float64))
+        f_a = jnp.asarray(p_base.T, dtype=jnp.float64) @ w_phys
+        f_b = jnp.asarray(p_shifted.T, dtype=jnp.float64) @ w_phys
+        f_a_pad = jnp.pad(f_a, (0, obs_a.N_pad - f_a.shape[0]))
+        f_b_pad = jnp.pad(f_b, (0, obs_b.N_pad - f_b.shape[0]))
+
+        val_exp_a, _ = tv_exp_scan(f_a_pad, obs_a, tau=6.0, epsilon=1e-5)
+        val_exp_b, _ = tv_exp_scan(f_b_pad, obs_b, tau=6.0, epsilon=1e-5)
+        assert float(val_exp_a) == pytest.approx(float(val_exp_b), rel=1e-12, abs=1e-13)
+
+        # 3. tv_charbonnier_o2 with obs.lag = 10 -> 2 * lag = 20 > n_half = 16 (zero valid triples)
+        obs_o2 = HaloObservation.from_arrays(p_shifted, t_gapped, lag=10, legacy_tv=True)
+        val_o2, count_o2 = tv_charbonnier_o2(f_b_pad, obs_o2, epsilon=1e-5)
+        assert float(count_o2) == 0.0
+        assert float(val_o2) == 0.0
+
+
+def test_lambda_phot_subset_zero_mean_legacy_and_sigclip_jackknife_fixes() -> None:
+    """Verify explicit lambda_phot persistence, zero-mean legacy_tv, NaN-safe sigclip, and JK guards."""
+    # Choose n_cad = 72 (N_pad = 128) and M = 4 so solver calls reuse already-compiled XLA kernels!
+    n_cad = 72
+    dt = 2.0 / 1440.0
+    t = np.arange(n_cad, dtype=np.float64) * dt
+    p_pos = np.vstack(
+        [
+            1000.0 + 15.0 * np.sin(0.3 * np.arange(n_cad)),
+            900.0 - 15.0 * np.sin(0.3 * np.arange(n_cad)),
+            950.0 + 8.0 * np.cos(0.3 * np.arange(n_cad)),
+            850.0 - 8.0 * np.cos(0.3 * np.arange(n_cad)),
+        ]
+    )
+    pvar = np.full_like(p_pos, 25.0)
+
+    # 1. Explicit lambda_phot > 0 must survive with_cadence_subset verbatim
+    obs_explicit = HaloObservation.from_arrays(p_pos, t, pixel_var=pvar, lambda_phot=17.5)
+    assert obs_explicit.lambda_phot == pytest.approx(17.5)
+    assert obs_explicit.user_lambda_phot == pytest.approx(17.5)
+    obs_sub = obs_explicit.with_cadence_subset(np.arange(n_cad) >= 16)
+    assert obs_sub.lambda_phot == pytest.approx(17.5)
+    assert obs_sub.user_lambda_phot == pytest.approx(17.5)
+
+    # 2. Zero-mean pixel under legacy_tv=True must NOT be annihilated in evaluate_lightcurve,
+    #    with_cadence_subset, or _get_fisher_fn
+    zero_mean_wave = 25.0 * np.sin(2.0 * np.pi * np.arange(n_cad) / 18.0)
+    assert abs(float(np.mean(zero_mean_wave))) < 1e-13
+    p_zero = np.vstack([zero_mean_wave, 500.0 + 0.5 * zero_mean_wave])
+    obs_zm = HaloObservation.from_arrays(p_zero, t, legacy_tv=True)
+    with jax.enable_x64(True):
+        w_zm = HaloWeights(z_ilr=jnp.zeros(1, dtype=jnp.float64), legacy_tv=True)
+        lc_zm = np.asarray(w_zm.evaluate_lightcurve(obs_zm))[:n_cad]
+        raw_zm = 0.5 * p_zero[0] + 0.5 * p_zero[1]
+        expected_zm = raw_zm / np.mean(raw_zm)
+        np.testing.assert_allclose(lc_zm, expected_zm, atol=1e-11)
+
+        obs_zm_sub = obs_zm.with_cadence_subset(np.arange(n_cad) < 54)
+        lc_zm_sub = np.asarray(w_zm.evaluate_lightcurve(obs_zm_sub))[:54]
+        expected_sub = raw_zm[:54] / np.mean(raw_zm[:54])
+        np.testing.assert_allclose(lc_zm_sub, expected_sub, atol=1e-11)
+
+        fmat_zm = np.asarray(_get_fisher_fn("tv", 1)(w_zm, obs_zm))
+        assert fmat_zm.shape == (1, 1) and float(fmat_zm[0, 0]) > 0.0
+
+    # 3. cadence_scaled_sigclip_mask must NOT spread an isolated NaN across Savitzky-Golay windows
+    #    and must clip cosmic-ray spikes via mad_std (including N = 5!)
+    y_nan = 1.0 + 0.005 * np.sin(0.2 * np.arange(n_cad))
+    y_nan[20] = np.nan
+    y_nan[45] = 2.5  # Cosmic-ray spike
+    inliers_nan = cadence_scaled_sigclip_mask(y_nan, t, window_days=1.0)
+    assert not bool(inliers_nan[20])
+    assert not bool(inliers_nan[45])
+    assert int(np.sum(inliers_nan)) == n_cad - 2
+
+    y_five = np.array([1.0, 1.001, 0.999, 1.0, 5.0], dtype=np.float64)
+    t_five = np.arange(5, dtype=np.float64) * (1.0 / 48.0)
+    inliers_five = cadence_scaled_sigclip_mask(y_five, t_five, window_days=0.1)
+    assert list(inliers_five) == [True, True, True, True, False]
+
+    # 4. sigclip=True objective consistency (loss_final <= loss_init on same active_obs)
+    p_spike = p_pos.copy()
+    p_spike[:, 30] += 800.0
+    fit_sc = optimise_halo(
+        p_spike, t, pixel_var=pvar, lambda_phot=17.5, maxiter=151, sigclip=True
+    )
+    assert not bool(fit_sc.inlier_mask[30])
+    assert fit_sc.loss_final <= fit_sc.loss_init + 1e-12
+
+    # 5. orbit_block_jackknife honours solver="zodiax" and returns NaN when < 2 folds succeed
+    fit_zdx_jk = optimise_halo(
+        p_pos,
+        t,
+        solver="zodiax",
+        maxiter=151,
+        learning_rate=0.2,
+        precondition=True,
+        compute_uncertainty=True,
+        jackknife_blocks=3,
+    )
+    assert fit_zdx_jk.weight_std is not None
+    assert np.all(np.isfinite(fit_zdx_jk.weight_std))
+
+    obs_tiny = HaloObservation.from_arrays(p_pos[:, :3], t[:3])
+    w_std_skip, w_jk_skip = orbit_block_jackknife(
+        obs_tiny, np.full(4, 0.25), n_blocks=4
+    )
+    assert np.all(np.isnan(w_std_skip))
+    assert np.all(np.isnan(w_jk_skip))
+
+    nb_path = Path(__file__).resolve().parents[1] / "docs" / "notebooks" / "aldebaran.ipynb"
+    nb_data = json.loads(nb_path.read_text(encoding="utf-8"))
+    assert "extract_halo_lightcurve" in "".join(nb_data["cells"][0]["source"])

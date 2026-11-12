@@ -42,7 +42,12 @@ from ._contract import (
     read_smear_err,
 )
 from ._precision import in_float64
-from .masking import DEFAULT_EXCLUDE_QUALITY, _resolve_tpf_wcs, build_halo_masks
+from .masking import (
+    DEFAULT_EXCLUDE_QUALITY,
+    _resolve_tpf_obs_time,
+    _resolve_tpf_wcs,
+    build_halo_masks,
+)
 from .optimise import optimise_halo
 
 __all__ = [
@@ -363,6 +368,7 @@ def extract_halo_lightcurve(
     sigma_lower: float = 10.0,
     sigma_upper: float = 3.0,
     thresh: float = -1.0,
+    auto_sat_level: float | None = None,
     bleed_dilation: tuple[int, int] = (3, 3),
     minflux: float = -100.0,
     sky_kappa: float = 2.0,
@@ -371,8 +377,8 @@ def extract_halo_lightcurve(
     remove_contaminants: bool = False,
     catalog_table: Table | str | os.PathLike[str] | None = None,
     offline: bool = False,
-    target_exclusion_arcsec: float = 5.0,
-    mag_limit: float = 17.5,
+    target_exclusion_arcsec: float | None = None,
+    mag_limit: float | None = None,
     star_radius_pix: float | None = None,
     w_init: np.ndarray | None = None,
     compute_uncertainty: bool = False,
@@ -472,6 +478,7 @@ def extract_halo_lightcurve(
                 sigma_lower=sigma_lower,
                 sigma_upper=sigma_upper,
                 thresh=thresh,
+                auto_sat_level=auto_sat_level,
                 bleed_dilation=bleed_dilation,
                 minflux=minflux,
                 sky_kappa=sky_kappa,
@@ -486,14 +493,16 @@ def extract_halo_lightcurve(
                 w_init=w_init,
                 compute_uncertainty=compute_uncertainty,
                 jackknife_blocks=jackknife_blocks,
-                normalize=True,
+                normalize=normalize,
             )
             seg_wmaps.append(np.asarray(lc_seg.meta["WEIGHTMAP"], dtype=np.float64))
             if compute_uncertainty and "WEIGHTMAP_ERR" in lc_seg.meta:
                 seg_werrs.append(np.asarray(lc_seg.meta["WEIGHTMAP_ERR"], dtype=np.float64))
             seg_lcs.append(lc_seg)
 
-        stitched = lk.LightCurveCollection([seg.copy() for seg in seg_lcs]).stitch()
+        stitched = lk.LightCurveCollection([seg.copy() for seg in seg_lcs]).stitch(
+            corrector_func=None
+        )
         stitched.meta = dict(stitched.meta)
         stitched.meta["WEIGHTMAP"] = np.stack(seg_wmaps, axis=0)
         stitched.meta["SPLIT_TIMES"] = split_arr.tolist()
@@ -560,6 +569,7 @@ def extract_halo_lightcurve(
         pos_corr2=pc2,
         wcs=_resolve_tpf_wcs(tpf_obj),
         target_coord=tgt_coord,
+        obs_time=_resolve_tpf_obs_time(tpf_obj),
         remove_contaminants=remove_contaminants,
         catalog_table=catalog_table,
         offline=offline,
@@ -567,6 +577,8 @@ def extract_halo_lightcurve(
         mag_limit=mag_limit,
         star_radius_pix=star_radius_pix,
         thresh=thresh,
+        auto_sat_level=auto_sat_level,
+        mission=getattr(tpf_obj, "mission", None),
         bleed_dilation=bleed_dilation,
         minflux=minflux,
         sky_kappa=sky_kappa,
@@ -716,7 +728,11 @@ def extract_halo_lightcurve(
     if bkg_order is not None:
         extra_meta["BKG_ORD"] = int(bkg_order)
     if compute_uncertainty and fit.weight_std is not None:
-        werr_2d = np.zeros((ny, nx), dtype=np.float64)
+        werr_2d = (
+            np.full((ny, nx), np.nan, dtype=np.float64)
+            if np.all(np.isnan(fit.weight_std))
+            else np.zeros((ny, nx), dtype=np.float64)
+        )
         werr_2d[rows_h, cols_h] = fit.weight_std
         extra_meta["WEIGHTMAP_ERR"] = werr_2d
 

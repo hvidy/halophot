@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import astropy.units as u
 import jax
 import lightkurve as lk
 import numpy as np
@@ -21,6 +22,7 @@ from halophot._contract import (
     PixelQuality,
     pack_bkg_chol,
     read_pixel_quality,
+    read_split_times,
     write_lightcurve_fits,
 )
 from halophot.lightcurve import (
@@ -28,7 +30,13 @@ from halophot.lightcurve import (
     compute_coherent_flux_err,
     extract_halo_lightcurve,
 )
-from halophot.masking import build_halo_masks, mask_background_stars, remove_stars
+from halophot.masking import (
+    KEPLER_SAT_RATE_E_PER_S,
+    TESS_SAT_RATE_E_PER_S,
+    build_halo_masks,
+    mask_background_stars,
+    remove_stars,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EPIC_FITS = REPO_ROOT / "EPIC_211309989_mast.fits"
@@ -278,6 +286,34 @@ def test_2d_bleed_dilation_and_pixel_quality_disjointness() -> None:
     assert not res.pixel_mask[6, 1]
     assert not res.pixel_mask[5, 5]
 
+    # Verify physical TESS full-well saturation rate (7.5e4 e-/s < 9.0e4 < 1.5e5) when thresh < 0
+    assert TESS_SAT_RATE_E_PER_S == pytest.approx(7.5e4)
+    assert KEPLER_SAT_RATE_E_PER_S == pytest.approx(1.0e6 / 6.02)
+    flux_tess_sat = np.full((n_cad, ny, nx), 800.0, dtype=np.float64)
+    flux_tess_sat[:, 3, 3] = 9.0e4
+    res_tess = build_halo_masks(
+        flux_tess_sat,
+        flux_err=np.sqrt(flux_tess_sat),
+        thresh=-1.0,
+        mission="TESS",
+        bleed_dilation=(3, 3),
+    )
+    assert int(np.sum(res_tess.saturated_mask)) == 9
+    assert np.all(res_tess.saturated_mask[2:5, 2:5])
+
+    # Small (3, 3) stamp where saturation + (3, 3) bleed dilation leaves 0 pixels MUST raise
+    # ValueError rather than silently clearing saturated_mask to False!
+    flux_small_bleed = np.full((n_cad, 3, 3), 800.0, dtype=np.float64)
+    flux_small_bleed[:, 1, 1] = 9.0e4
+    with pytest.raises(ValueError, match="No valid halo pixels survived"):
+        build_halo_masks(
+            flux_small_bleed,
+            flux_err=np.sqrt(flux_small_bleed),
+            thresh=-1.0,
+            mission="TESS",
+            bleed_dilation=(3, 3),
+        )
+
 
 @pytest.mark.parametrize("bkg_order", [1, 2])
 def test_monte_carlo_unified_coherent_flux_err_with_smear_projection(bkg_order: int) -> None:
@@ -453,6 +489,61 @@ def test_wcs_star_masking_offline_and_remove_stars(tmp_path: Path) -> None:
     pq_clean = read_pixel_quality(cleaned_tpf)
     assert (pq_clean[2, 6] & int(PixelQuality.SOURCE_MASK)) != 0
 
+    # Verify TESS plate-scale contrast cut, NaN-magnitude handling/coalescing, and high-PM target guard:
+    # Primary star at J2000 (ra0, dec0) has pmra=+600 mas/yr, pmdec=-500 mas/yr -> moves ~12.5" by J2016!
+    pm_ra_mas = 600.0
+    pm_dec_mas = -500.0
+    dt_yr = 16.0
+    cos_dec = np.cos(np.deg2rad(dec0))
+    ra_2016 = ra0 + (pm_ra_mas * 1e-3 * dt_yr) / (3600.0 * cos_dec)
+    dec_2016 = dec0 + (pm_dec_mas * 1e-3 * dt_yr) / 3600.0
+
+    faint_t = wcs_2d.pixel_to_world(1.0, 1.0)
+    faint_gaia_nan_t = wcs_2d.pixel_to_world(1.0, 6.0)
+    all_nan_mag = wcs_2d.pixel_to_world(7.0, 6.0)
+    bright_nb = wcs_2d.pixel_to_world(6.0, 2.0)
+
+    cat_pm = Table(
+        {
+            "ra": [
+                ra_2016,
+                faint_t.ra.deg,
+                faint_gaia_nan_t.ra.deg,
+                all_nan_mag.ra.deg,
+                bright_nb.ra.deg,
+            ],
+            "dec": [
+                dec_2016,
+                faint_t.dec.deg,
+                faint_gaia_nan_t.dec.deg,
+                all_nan_mag.dec.deg,
+                bright_nb.dec.deg,
+            ],
+            "Tmag": [4.0, 16.8, np.nan, np.nan, 9.5],
+            "phot_g_mean_mag": [4.2, 17.1, 17.2, np.nan, 9.8],
+            "pmRA": [pm_ra_mas, 0.0, 0.0, 0.0, 0.0],
+            "pmDEC": [pm_dec_mas, 0.0, 0.0, 0.0, 0.0],
+            "ref_epoch": [2016.0, 2016.0, 2016.0, 2016.0, 2016.0],
+        }
+    )
+    pm_mask = mask_background_stars(
+        wcs_2d,
+        (ny, nx),
+        catalog_table=cat_pm,
+        offline=True,
+        target_coord=(ra0, dec0),
+        obs_time=Time(2019.0, format="jyear", scale="tdb"),
+        catalog="Gaia",
+    )
+    # High-PM primary star must NOT self-mask, and faint/NaN stars must NOT wipe out TESS pixels!
+    assert bool(pm_mask[ny // 2, nx // 2]) is False
+    assert bool(pm_mask[1, 1]) is False
+    assert bool(pm_mask[6, 1]) is False
+    assert bool(pm_mask[6, 7]) is False
+    # Bright T=9.5 neighbour at (row=2, col=6) IS masked with a compact TESS PRF disc
+    assert bool(pm_mask[2, 6]) is True
+    assert int(np.sum(pm_mask)) <= 16
+
 
 def test_rectangular_weightmap_splits_centroids_and_bounds(tmp_path: Path) -> None:
     """Verify non-transposed (ny, nx) and (n_splits, ny, nx) WEIGHTMAP, centroids, and split bounds."""
@@ -514,14 +605,39 @@ def test_rectangular_weightmap_splits_centroids_and_bounds(tmp_path: Path) -> No
     assert lc_split.meta["WEIGHTMAP"].shape == (3, ny, nx)
     assert lc_split.meta["WEIGHTMAP_ERR"].shape == (3, ny, nx)
     np.testing.assert_allclose(np.sum(lc_split.meta["WEIGHTMAP"], axis=(1, 2)), 1.0, atol=1e-6)
+    # Each stitched segment must preserve exact unit mean (NOT median re-normalization!)
+    assert float(np.nanmean(lc_split.flux.value[:66])) == pytest.approx(1.0, abs=1e-11)
+    assert float(np.nanmean(lc_split.flux.value[66:132])) == pytest.approx(1.0, abs=1e-11)
+    assert float(np.nanmean(lc_split.flux.value[132:])) == pytest.approx(1.0, abs=1e-11)
 
-    # Round-trip 3D split WEIGHTMAP and WEIGHTMAP_ERR through write_lightcurve_fits
+    # Verify normalize=False with split_times preserves physical tpf.flux.unit (electron / s)
+    # Use maxiter=151 so all 3 segments reuse the already-compiled (N_pad=128, M=8, maxiter=151) kernel!
+    lc_split_unnorm = extract_halo_lightcurve(
+        tpf,
+        split_times=splits,
+        maxiter=151,
+        normalize=False,
+    )
+    assert lc_split_unnorm.flux.unit == u.electron / u.s
+    assert lc_split_unnorm.flux_err.unit == u.electron / u.s
+    assert float(np.nanmean(lc_split_unnorm.flux.value)) == pytest.approx(900.0, rel=0.05)
+
+    # Verify skipped jackknife (< 2 folds when n_cad = 3 < 4) sets WEIGHTMAP_ERR to NaN (never 0.0!)
+    # bucket_pad_length(3) == 128, so this ALSO reuses the already-compiled (N_pad=128, M=8, maxiter=151) kernel!
+    lc_short = extract_halo_lightcurve(tpf[:3], maxiter=151, compute_uncertainty=True)
+    assert np.all(np.isnan(lc_short.meta["WEIGHTMAP_ERR"]))
+
+    # Round-trip 3D split WEIGHTMAP, WEIGHTMAP_ERR, and SPLIT_TIMES through write_lightcurve_fits
     split_fits = tmp_path / "split_halo_lc.fits"
     write_lightcurve_fits(lc_split, split_fits)
     with fits.open(split_fits) as hdul:
         assert hdul["WEIGHTMAP"].data.shape == (3, ny, nx)
         assert hdul["WEIGHTMAP_ERR"].data.shape == (3, ny, nx)
+        assert "SPLIT_TIMES" in hdul
+        assert hdul[0].header["NSPLITS"] == 2
+        assert hdul["WEIGHTMAP"].header["NSPLITS"] == 2
         np.testing.assert_allclose(hdul["WEIGHTMAP"].data, lc_split.meta["WEIGHTMAP"])
+    np.testing.assert_allclose(read_split_times(split_fits), splits, rtol=0.0, atol=1e-12)
 
 
 def test_end_to_end_real_k2_tpf_and_epic_mast_fits(tmp_path: Path) -> None:
@@ -580,7 +696,7 @@ def test_end_to_end_real_k2_tpf_and_epic_mast_fits(tmp_path: Path) -> None:
         assert hdul_k2[0].header["HALOCVER"] == HALOCVER
         assert hdul_k2["WEIGHTMAP"].data.shape == (ny_k2, nx_k2)
 
-    # Verify CLI --hlsp-fits --offline --strict-hpc path (matching hpc/halophot_survey_cpu.sbatch)
+    # Verify CLI --hlsp-fits honours --bitmask, --do-split / --split-cadences, and --do-plot
     cache_dir = tmp_path / "scratch_cache"
     out_cli = tmp_path / "hpc_cli_out"
     out_cli.mkdir()
@@ -589,6 +705,10 @@ def test_end_to_end_real_k2_tpf_and_epic_mast_fits(tmp_path: Path) -> None:
             str(mini_k2),
             "--name",
             "k2_hlsp",
+            "-c",
+            "3",
+            "--bitmask",
+            "hard",
             "-maxiter",
             "151",
             "--rr",
@@ -597,6 +717,10 @@ def test_end_to_end_real_k2_tpf_and_epic_mast_fits(tmp_path: Path) -> None:
             "0.8",
             "--minflux",
             "50.0",
+            "--do-split",
+            "--split-cadences",
+            "[40]",
+            "--do-plot",
             "--hlsp-fits",
             "--offline",
             "--strict-hpc",
@@ -608,7 +732,11 @@ def test_end_to_end_real_k2_tpf_and_epic_mast_fits(tmp_path: Path) -> None:
         ]
     )
     cli_fits = out_cli / "k2_hlsp_halo_lc_tv.fits"
+    cli_png = out_cli / "k2_hlsp_all_tv.png"
     assert cli_fits.exists()
+    assert cli_png.exists()
     with fits.open(cli_fits) as hdul_cli:
         assert hdul_cli[0].header["HALOCVER"] == HALOCVER
-        assert "WEIGHTMAP" in hdul_cli
+        assert hdul_cli["WEIGHTMAP"].data.shape == (2, ny_k2, nx_k2)
+        assert "SPLIT_TIMES" in hdul_cli
+        assert len(hdul_cli["SPLIT_TIMES"].data) == 1

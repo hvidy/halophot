@@ -10,6 +10,8 @@ block-jackknife folds, and multi-sector surveys.
 
 from __future__ import annotations
 
+import math
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -87,11 +89,12 @@ def compute_gap_diff_mask(
 
     dt_pair = times_padded[lag:] - times_padded[:-lag]
     expected_dt = float(lag) * jnp.asarray(dt_nom, dtype=times_padded.dtype)
-    pair_ok = (
-        valid_cadence_mask[:-lag]
-        & valid_cadence_mask[lag:]
-        & (jnp.abs(dt_pair - expected_dt) <= gap_tol * expected_dt)
+    tol_ok = (
+        jnp.ones_like(dt_pair, dtype=jnp.bool_)
+        if math.isinf(float(gap_tol))
+        else (jnp.abs(dt_pair - expected_dt) <= gap_tol * expected_dt)
     )
+    pair_ok = valid_cadence_mask[:-lag] & valid_cadence_mask[lag:] & tol_ok
     tail_false = jnp.zeros(lag, dtype=jnp.bool_)
     return jnp.concatenate([pair_ok, tail_false], axis=0)
 
@@ -149,10 +152,11 @@ class HaloWeights(zdx.Base):
             return jnp.dot(theta, obs.norm_pixels)
 
         w = ilr_to_simplex(self.z_ilr)
-        weighted_p = jnp.dot(w * obs.mean_pixel_flux, obs.norm_pixels)
+        safe_scale = jnp.where(jnp.abs(obs.mean_pixel_flux) > 1e-30, obs.mean_pixel_flux, 1.0)
+        weighted_p = jnp.dot(w * safe_scale, obs.norm_pixels)
         mean_f = jnp.dot(w, obs.mean_pixel_flux)
         safe_denom = jnp.where(
-            jnp.abs(mean_f) > jnp.finfo(weighted_p.dtype).tiny,
+            jnp.abs(mean_f) > 1e-30,
             mean_f,
             jnp.ones_like(mean_f),
         )
@@ -177,6 +181,7 @@ class HaloObservation(zdx.Base):
     N_pad: int = eqx.field(static=True)
     lag: int = eqx.field(static=True, default=1)
     gap_tol: float = eqx.field(static=True, default=0.25)
+    user_lambda_phot: float | None = eqx.field(static=True, default=None)
 
     @classmethod
     @in_float64
@@ -306,12 +311,6 @@ class HaloObservation(zdx.Base):
             dt_nom_j,
             gap_tol=gap_tol,
         )
-        # Fallback if timestamps are irregular everywhere (e.g. non-uniform synthetic grid):
-        # retain consecutive active pairs within [0, n_cad - lag) if gap filter left 0 pairs.
-        if n_cad > lag_int and int(jnp.sum(diff_mask_j)) == 0:
-            fallback_mask = np.zeros(resolved_pad, dtype=bool)
-            fallback_mask[: n_cad - lag_int] = True
-            diff_mask_j = jnp.asarray(fallback_mask, dtype=jnp.bool_)
 
         mean_p_j = jnp.asarray(mean_p, dtype=jnp.float64)
         z_init_j = uniform_weights_ilr(mean_p_j, legacy_tv=legacy_tv)
@@ -320,6 +319,7 @@ class HaloObservation(zdx.Base):
             b_hat_val = 1.0
             lam_phot_val = 0.0
             lam_z_val = 0.0
+            user_lam_phot_val: float | None = 0.0
         else:
             theta_init = ilr_to_simplex(z_init_j)
             f_init = np.asarray(jnp.dot(theta_init, jnp.asarray(norm_p, dtype=jnp.float64)))
@@ -337,10 +337,12 @@ class HaloObservation(zdx.Base):
                 med_fv = float(np.median(frac_var)) if frac_var.size > 0 else 0.0
                 ref_var = max(b_hat_val**2, med_fv, 1e-12)
                 lam_phot_val = 0.1 * float(n_v) / ref_var
+                user_lam_phot_val = None
             else:
                 lam_phot_val = float(lambda_phot)
                 if lam_phot_val < 0.0:
                     raise ValueError(f"lambda_phot must be >= 0, got {lambda_phot!r}.")
+                user_lam_phot_val = lam_phot_val
 
             if lambda_z is None:
                 lam_z_val = 1e-3
@@ -365,6 +367,7 @@ class HaloObservation(zdx.Base):
             N_pad=resolved_pad,
             lag=lag_int,
             gap_tol=float(gap_tol),
+            user_lambda_phot=user_lam_phot_val,
         )
 
     @in_float64
@@ -397,17 +400,14 @@ class HaloObservation(zdx.Base):
         if idx_keep.size < 2:
             raise ValueError("At least 2 active cadences are required in with_cadence_subset.")
 
-        raw_sub = (
-            np.asarray(self.mean_pixel_flux)[:, np.newaxis]
-            * np.asarray(self.norm_pixels)[:, idx_keep]
-        )
+        mean_orig = np.asarray(self.mean_pixel_flux, dtype=np.float64)
+        old_scale = np.where(np.abs(mean_orig) > 1e-30, mean_orig, 1.0)
+        raw_sub = old_scale[:, np.newaxis] * np.asarray(self.norm_pixels)[:, idx_keep]
         times_sub = np.asarray(self.times_padded)[idx_keep]
-
-        old_scale = np.where(np.abs(np.asarray(self.mean_pixel_flux)) > 1e-30, np.asarray(self.mean_pixel_flux), 1.0)
         pixel_var_est = np.asarray(self.mean_frac_var) * (old_scale**2)
 
-        lam_phot_arg: float | None = 0.0 if float(self.lambda_phot) == 0.0 else None
-        lam_z_arg: float | None = float(self.lambda_z)
+        lam_phot_arg: float | None = 0.0 if legacy_tv else self.user_lambda_phot
+        lam_z_arg: float | None = 0.0 if legacy_tv else float(self.lambda_z)
 
         return HaloObservation.from_arrays(
             raw_sub,

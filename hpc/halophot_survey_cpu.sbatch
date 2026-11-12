@@ -59,13 +59,17 @@ export APPTAINER_BINDPATH="/fred,/aphid${JOBFS:+,$JOBFS}"
 
 LINE_NUM=$((SLURM_ARRAY_TASK_ID + 1))
 TPF_PATH="$(sed -n "${LINE_NUM}p" "$MANIFEST")"
-if [ -z "$TPF_PATH" ]; then
-    echo "No manifest entry at line ${LINE_NUM}; exiting cleanly."
+TPF_PATH="${TPF_PATH%$'\r'}"
+TPF_PATH="${TPF_PATH#"${TPF_PATH%%[![:space:]]*}"}"
+TPF_PATH="${TPF_PATH%"${TPF_PATH##*[![:space:]]}"}"
+if [[ -z "$TPF_PATH" || "$TPF_PATH" == \#* ]]; then
+    echo "Skipping empty or comment manifest entry at line ${LINE_NUM}; exiting cleanly."
     exit 0
 fi
 
-TARGET_STEM="$(basename "$TPF_PATH" .fits)"
-TARGET_STEM="${TARGET_STEM%.fits.gz}"
+TARGET_STEM="$(basename "$TPF_PATH")"
+TARGET_STEM="${TARGET_STEM%.gz}"
+TARGET_STEM="${TARGET_STEM%.fits}"
 CAT_FILE="${CATALOG_DIR}/${TARGET_STEM}_cat.parquet"
 
 EXTRA_ARGS=()

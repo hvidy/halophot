@@ -24,7 +24,7 @@ import numpy as np
 import optax
 import optimistix as optx
 import zodiax as zdx
-from astropy.stats import sigma_clip
+from astropy.stats import mad_std, sigma_clip
 from scipy.signal import savgol_filter
 
 from ._precision import in_float64
@@ -166,10 +166,15 @@ def _get_fisher_fn(
             if not w0.legacy_tv:
                 f_tilde = jnp.dot(theta, obs.norm_pixels)
             else:
-                weighted_p = jnp.dot(theta * obs.mean_pixel_flux, obs.norm_pixels)
+                safe_scale = jnp.where(
+                    jnp.abs(obs.mean_pixel_flux) > 1e-30,
+                    obs.mean_pixel_flux,
+                    1.0,
+                )
+                weighted_p = jnp.dot(theta * safe_scale, obs.norm_pixels)
                 mean_f = jnp.dot(theta, obs.mean_pixel_flux)
                 safe_denom = jnp.where(
-                    jnp.abs(mean_f) > jnp.finfo(weighted_p.dtype).tiny,
+                    jnp.abs(mean_f) > 1e-30,
                     mean_f,
                     jnp.ones_like(mean_f),
                 )
@@ -363,27 +368,30 @@ def cadence_scaled_sigclip_mask(
     else:
         segments = [np.arange(n_cad)]
 
-    baseline = np.empty_like(y)
+    baseline = np.full_like(y, np.nan)
     for seg in segments:
         if seg.size == 0:
             continue
-        y_seg = y[seg]
-        if seg.size >= 5:
-            max_odd = seg.size if seg.size % 2 == 1 else seg.size - 1
+        fin_seg = seg[np.isfinite(y[seg])]
+        if fin_seg.size >= 9:
+            max_odd = fin_seg.size if fin_seg.size % 2 == 1 else fin_seg.size - 1
             win_seg = max(5, min(target_win, max_odd))
-            poly_ord = min(3, win_seg - 2)
-            baseline[seg] = savgol_filter(y_seg, win_seg, poly_ord)
-        elif seg.size >= 3:
-            baseline[seg] = savgol_filter(y_seg, 3, 1)
-        else:
-            baseline[seg] = np.nanmedian(y_seg)
+            poly_ord = 1 if win_seg < 15 else 3
+            baseline[fin_seg] = savgol_filter(y[fin_seg], win_seg, poly_ord)
+        elif fin_seg.size >= 1:
+            baseline[fin_seg] = float(np.median(y[fin_seg]))
 
-    clipped = sigma_clip(
-        y - baseline,
-        sigma_lower=sigma_lower,
-        sigma_upper=sigma_upper,
-    )
-    return np.asarray(~np.ma.getmaskarray(clipped), dtype=bool) & np.isfinite(y)
+    inliers = np.zeros(n_cad, dtype=bool)
+    fin_all = np.isfinite(y) & np.isfinite(baseline)
+    if np.any(fin_all):
+        clipped = sigma_clip(
+            y[fin_all] - baseline[fin_all],
+            sigma_lower=sigma_lower,
+            sigma_upper=sigma_upper,
+            stdfunc=mad_std,
+        )
+        inliers[fin_all] = ~np.ma.getmaskarray(clipped)
+    return inliers
 
 
 @in_float64
@@ -437,14 +445,17 @@ def orbit_block_jackknife(
     objective: str = "tv",
     epsilon: float = 1e-5,
     tau: float | None = None,
+    solver: str = "lbfgs",
     maxiter: int = 151,
     rtol: float = 1e-6,
     atol: float = 1e-6,
+    learning_rate: float = 0.2,
+    precondition: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Estimate physical weight uncertainties ``sigma_w`` via ``K``-block orbit jackknife.
 
     Leaves out each contiguous cadence block ``B_k`` in turn while retaining
-    ``obs.N_pad`` unchanged so all ``K`` warm-started L-BFGS solves share the
+    ``obs.N_pad`` unchanged so all ``K`` warm-started solves share the
     already-compiled XLA executable with zero recompilation.
     """
     if isinstance(n_blocks, bool) or int(n_blocks) < 2:
@@ -456,8 +467,13 @@ def orbit_block_jackknife(
     n_valid = int(obs.n_valid)
     min_req = 2 * obs.lag + 1 if objective == "tv_o2" else obs.lag + 1
 
-    if m_pix <= 1 or n_valid < max(4, min_req + 2):
+    if m_pix <= 1:
         return np.zeros(m_pix, dtype=np.float64), np.tile(w_full, (k_req, 1))
+    if n_valid < max(4, min_req + 2):
+        return (
+            np.full(m_pix, np.nan, dtype=np.float64),
+            np.full((k_req, m_pix), np.nan, dtype=np.float64),
+        )
 
     k_eff = min(k_req, n_valid // 2)
     blocks = np.array_split(np.arange(n_valid), k_eff)
@@ -480,19 +496,22 @@ def orbit_block_jackknife(
             objective=objective,
             epsilon=epsilon,
             tau=tau,
-            solver="lbfgs",
+            solver=solver,
             maxiter=maxiter,
             rtol=rtol,
             atol=atol,
-            learning_rate=5e-2,
-            precondition=False,
+            learning_rate=learning_rate,
+            precondition=precondition,
         )
         jk_weights.append(
             np.asarray(w_tree_k.physical_weights(obs_k.mean_pixel_flux), dtype=np.float64)
         )
 
     if len(jk_weights) < 2:
-        return np.zeros(m_pix, dtype=np.float64), np.tile(w_full, (k_req, 1))
+        return (
+            np.full(m_pix, np.nan, dtype=np.float64),
+            np.full((k_req, m_pix), np.nan, dtype=np.float64),
+        )
 
     w_jk = np.vstack(jk_weights)
     k_used = w_jk.shape[0]
@@ -601,6 +620,24 @@ def optimise_halo(
             mean_sub = np.mean(pix_np[:, inliers], axis=1)
             if legacy_tv or np.all(mean_sub > 0.0):
                 obs_sub = obs.with_cadence_subset(inliers, legacy_tv=legacy_tv)
+                w0_init_sub = (
+                    HaloWeights.from_uniform(obs_sub.mean_pixel_flux, legacy_tv=legacy_tv)
+                    if w_init is None
+                    else HaloWeights.from_physical_weights(
+                        np.asarray(w_init, dtype=np.float64),
+                        obs_sub.mean_pixel_flux,
+                        legacy_tv=legacy_tv,
+                    )
+                )
+                loss0_sub = float(
+                    halo_objective(
+                        w0_init_sub,
+                        obs_sub,
+                        objective=objective,
+                        epsilon=epsilon,
+                        tau=tau,
+                    )
+                )
                 w0_refit = HaloWeights.from_physical_weights(
                     w_phys,
                     obs_sub.mean_pixel_flux,
@@ -619,6 +656,21 @@ def optimise_halo(
                     learning_rate=learning_rate,
                     precondition=precondition,
                 )
+                if loss_final > loss0_sub:
+                    w_tree, _, loss_final = _solve_single_pass(
+                        w0_init_sub,
+                        obs_sub,
+                        objective=objective,
+                        epsilon=epsilon,
+                        tau=tau,
+                        solver=solver,
+                        maxiter=maxiter_int,
+                        rtol=rtol,
+                        atol=atol,
+                        learning_rate=learning_rate,
+                        precondition=precondition,
+                    )
+                loss0 = loss0_sub
                 w_phys = np.asarray(
                     w_tree.physical_weights(obs_sub.mean_pixel_flux),
                     dtype=np.float64,
@@ -646,9 +698,12 @@ def optimise_halo(
             objective=objective,
             epsilon=epsilon,
             tau=tau,
+            solver=solver,
             maxiter=maxiter_int,
             rtol=rtol,
             atol=atol,
+            learning_rate=learning_rate,
+            precondition=precondition,
         )
 
     return HaloFitResult(

@@ -20,6 +20,7 @@ from ._contract import (
     read_bkgsub_state,
     read_pixel_quality,
     read_smear_err,
+    read_split_times,
     resolve_cache_dir,
     write_lightcurve_fits,
 )
@@ -32,6 +33,8 @@ from .lightcurve import (
 )
 from .masking import (
     DEFAULT_EXCLUDE_QUALITY,
+    KEPLER_SAT_RATE_E_PER_S,
+    TESS_SAT_RATE_E_PER_S,
     HaloMaskResult,
     build_halo_masks,
     mask_background_stars,
@@ -78,7 +81,9 @@ __all__ = [
     "HaloMaskResult",
     "HaloObservation",
     "HaloWeights",
+    "KEPLER_SAT_RATE_E_PER_S",
     "PixelQuality",
+    "TESS_SAT_RATE_E_PER_S",
     "__version__",
     "bucket_pad_length",
     "build_halo_masks",
@@ -114,6 +119,7 @@ __all__ = [
     "read_bkgsub_state",
     "read_pixel_quality",
     "read_smear_err",
+    "read_split_times",
     "remove_stars",
     "resolve_cache_dir",
     "run_in",

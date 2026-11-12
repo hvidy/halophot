@@ -23,6 +23,11 @@ From: nvcr.io/nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04
     export PATH="/opt/venv/bin:$PATH"
     export UV_LINK_MODE=copy
 
+    # Pin immutable commit SHAs or release tags (never mutable branch heads) for reproducible .sif builds.
+    MUNDEY_REF="a69f346db2a791355833516b1d74ff195edfafdb"
+    TESSBKGD_REF="0224102c21bd23da9342f993f7d1e2bbb2d5eec9"
+    HALOPHOT_REF="v2.0.0"
+
     uv pip install --no-cache \
         "jax[cuda12]>=0.4.35" \
         "equinox>=0.11.5" \
@@ -39,9 +44,9 @@ From: nvcr.io/nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04
         "s3fs>=2024.2" \
         "pyarrow>=15.0" \
         "tqdm>=4.66" \
-        "git+https://github.com/hvidy/mundey.git@dev" \
-        "git+https://github.com/hvidy/tessbkgd.git@dev" \
-        "git+https://github.com/hvidy/halophot.git@dev"
+        "git+https://github.com/hvidy/mundey.git@${MUNDEY_REF}" \
+        "git+https://github.com/hvidy/tessbkgd.git@${TESSBKGD_REF}" \
+        "git+https://github.com/hvidy/halophot.git@${HALOPHOT_REF}"
 
 %environment
     export VIRTUAL_ENV=/opt/venv

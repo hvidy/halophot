@@ -49,11 +49,17 @@ Legacy `halo_tpf` / `halo_tpf_tess` shims, `do_lc`, and `legacy_tv=True` remain 
 
 ### Command-line usage
 
-Call `halophot` from the command line as, e.g.
+Call `halo` from the command line as, e.g.
 
 `halo ktwo200007768-c04_lpd-targ.fits --data-dir /path/to/data/directory/ --name Atlas -c 4 --do-plot`
 
-where `--name` is the star name you would like to save the outputs under, and `-c` is the campaign.
+where `--name` is the star name you would like to save the outputs under, and `-c` is the campaign. Key v2.0 CLI flags include:
+
+- `--hlsp-fits`: emit a `HALOCVER = 1` `lightkurve` FITS file with lossless `WEIGHTMAP` (and `SPLIT_TIMES` / `WEIGHTMAP_ERR` when requested), while honouring `--bitmask`, `--do-split` / `--splits` / `--split-cadences` / `-c`, and `--do-plot`;
+- `--uncertainty`: compute orbit block-jackknife pixel weight uncertainties (`WEIGHTMAP_ERR`) in `--hlsp-fits` mode;
+- `--legacy-tv`: reproduce unregularized $w$-simplex total variation for *K2* and `halo-tess` DR1 compatibility;
+- `--deathstar --catalog-table <path>`: mask contaminant stars via WCS using a pre-cached FITS/Parquet/ECSV catalogue table (pair with `--offline` on compute nodes without internet access);
+- `--strict-hpc --cache-dir <path>`: enforce zero-`/fred` cache paths on HPC clusters.
 
 ## Licence
 

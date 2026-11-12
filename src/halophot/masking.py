@@ -5,18 +5,23 @@ Implements Section 5.2 and Section 6.1 aperture selection rules:
 * Automatic exclusion of ``PIXEL_QUALITY`` bits ``STRAP_COL | SAT_BLEED |
   SMEAR_UNRESOLVED | SOURCE_MASK | BKG_USED`` so ``Omega_halo`` and ``Omega_bg``
   are strictly disjoint (``Omega_halo cap Omega_bg = empty``).
-* 2D saturation + bleed + LDE-undershoot dilation via ``scipy.ndimage.binary_dilation``.
+* 2D saturation + bleed + LDE-undershoot dilation via ``scipy.ndimage.binary_dilation``,
+  calibrated to physical single-read CCD full-well rates per frame integration time
+  (Vanderspek et al. 2018 for *TESS*; Van Cleve & Caldwell 2016 for *Kepler*/*K2*).
 * Sky-dominance guard ``P_bar_i >= kappa * median_t(B_{i,t})`` (``kappa = 2.0``
   default when ``FLUX_BKG`` is non-zero and ``not legacy_tv``) and pixel
   ``SNR_i >= 5`` preventing TV minimization from diluting astrophysical
   amplitudes on sky-dominated pixels.
-* WCS-projected circular contaminant masking from a pre-cached Astropy ``Table``
-  (for ``--offline`` HPC execution) or live ``astroquery.mast`` queries.
+* WCS-projected contaminant-star masking with proper-motion propagation, plate-scale
+  and flux-contrast scaling from Gaussian PRF encircled energy (Ricker et al. 2015;
+  Bryson et al. 2010), supporting pre-cached Astropy ``Table`` inputs for ``--offline``
+  HPC execution or live ``astroquery.mast`` queries.
 """
 
 from __future__ import annotations
 
 import copy
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,14 +32,20 @@ import numpy as np
 from astropy.coordinates import SkyCoord
 from astropy.io import fits
 from astropy.table import Table
+from astropy.time import Time
 from astropy.wcs import WCS
+from astropy.wcs.utils import proj_plane_pixel_scales
 from scipy import ndimage
+from scipy.special import erfinv
 
 from ._contract import PixelQuality
 
 __all__ = [
     "DEFAULT_EXCLUDE_QUALITY",
     "HaloMaskResult",
+    "KEPLER_SAT_RATE_E_PER_S",
+    "TESS_SAT_RATE_E_PER_S",
+    "_resolve_tpf_obs_time",
     "_resolve_tpf_wcs",
     "build_halo_masks",
     "mask_background_stars",
@@ -47,6 +58,37 @@ DEFAULT_EXCLUDE_QUALITY: PixelQuality = (
     | PixelQuality.SMEAR_UNRESOLVED
     | PixelQuality.SOURCE_MASK
     | PixelQuality.BKG_USED
+)
+
+# Physical single-frame CCD full-well depth divided by single-frame integration time:
+# - TESS CCID-80: 1.5e5 e- full well / 2.0 s frame = 7.5e4 e-/s
+#   (Vanderspek et al. 2018, TESS Instrument Handbook, Section 4.2 / Table 4.1).
+# - Kepler/K2 e2v CCD90: 1.0e6 e- full well / 6.02 s integration = 1.661e5 e-/s
+#   (Van Cleve & Caldwell 2016, Kepler Instrument Handbook, Section 4.2 / Table 13).
+TESS_FULL_WELL_ELECTRONS: float = 1.5e5
+TESS_FRAME_TIME_SEC: float = 2.0
+TESS_SAT_RATE_E_PER_S: float = TESS_FULL_WELL_ELECTRONS / TESS_FRAME_TIME_SEC
+
+KEPLER_FULL_WELL_ELECTRONS: float = 1.0e6
+KEPLER_FRAME_TIME_SEC: float = 6.02
+KEPLER_SAT_RATE_E_PER_S: float = KEPLER_FULL_WELL_ELECTRONS / KEPLER_FRAME_TIME_SEC
+
+# Pixel-integrated 50% encircled energy in 1x1 pixel (Ricker et al. 2015, JATIS, 1, 014003):
+# erf(0.5 / (sqrt(2) * sigma_det))^2 = 0.50 => sigma_det = 0.5 / (sqrt(2) * erfinv(sqrt(0.5))).
+_DETECTOR_PRF_SIGMA_PIX: float = float(0.5 / (math.sqrt(2.0) * erfinv(math.sqrt(0.5))))
+_OPTICAL_CORE_SIGMA_ARCSEC: float = 2.0
+# Zodiacal sky background reference surface brightness (mag / arcsec^2; Ricker et al. 2015)
+# and 10^-4 total-flux halo-wing contrast threshold (10.0 mag = -2.5 * log10(1e-4)).
+_ZODIACAL_SKY_MU_MAG_ARCSEC2: float = 22.0
+_HALO_WING_CONTRAST_MAG: float = 10.0
+
+_MAG_CANDIDATES: tuple[str, ...] = (
+    "tmag",
+    "phot_g_mean_mag",
+    "kepmag",
+    "mag",
+    "vmag",
+    "gmag",
 )
 
 
@@ -70,7 +112,13 @@ def _load_catalog_table(catalog_table: Table | str | os.PathLike[str]) -> Table:
     path = Path(catalog_table)
     suffix = path.suffix.lower()
     if suffix in (".parquet", ".pq"):
-        return Table.read(path, format="parquet")
+        try:
+            return Table.read(path, format="parquet")
+        except ImportError as exc:
+            raise ImportError(
+                "Reading Parquet star catalogues requires 'pyarrow'. "
+                "Install it with `pip install pyarrow` or supply a FITS/ECSV catalogue."
+            ) from exc
     if suffix in (".fits", ".fit", ".fts"):
         return Table.read(path, format="fits")
     if suffix == ".ecsv":
@@ -87,6 +135,26 @@ def _find_column_case_insensitive(table: Table, candidates: tuple[str, ...]) -> 
     return None
 
 
+def _coalesce_magnitudes(table: Table) -> tuple[np.ndarray | None, bool]:
+    """Coalesce per-row magnitudes across standard optical/NIR bandpass columns.
+
+    Returns ``(mag_array, has_mag_col)``. When one or more magnitude columns exist,
+    missing ``NaN`` entries in the primary column fall back per-row to secondary
+    columns (e.g. ``phot_g_mean_mag`` when ``Tmag`` is ``NaN``).
+    """
+    lower_map = {col.lower(): col for col in table.colnames}
+    found_cols = [lower_map[c] for c in _MAG_CANDIDATES if c in lower_map]
+    if not found_cols:
+        return None, False
+
+    coalesced = np.full(len(table), np.nan, dtype=np.float64)
+    for col in found_cols:
+        col_arr = np.asarray(table[col], dtype=np.float64)
+        missing = ~np.isfinite(coalesced) & np.isfinite(col_arr)
+        coalesced[missing] = col_arr[missing]
+    return coalesced, True
+
+
 def _query_mast_region(
     center: SkyCoord,
     radius_deg: float,
@@ -94,9 +162,111 @@ def _query_mast_region(
     catalog: str = "TIC",
 ) -> Table:
     """Query MAST ``Catalogs.query_region`` when ``offline=False``."""
-    from astroquery.mast import Catalogs
+    try:
+        from astroquery.mast import Catalogs
+    except ImportError as exc:
+        raise ImportError(
+            "Live MAST star-catalogue queries require 'astroquery'. "
+            "Install it with `pip install astroquery` or pass a pre-cached `catalog_table`."
+        ) from exc
 
     return Catalogs.query_region(center, radius=radius_deg * u.deg, catalog=catalog)
+
+
+def _wcs_pixel_scale_arcsec(wcs: WCS) -> float:
+    """Compute geometric mean celestial pixel scale in arcsec/pixel from ``wcs``."""
+    scales_deg = np.asarray(proj_plane_pixel_scales(wcs.celestial), dtype=np.float64)
+    pos_scales = scales_deg[np.isfinite(scales_deg) & (scales_deg > 0.0)]
+    if pos_scales.size == 0:
+        return 21.0
+    return float(np.sqrt(np.prod(pos_scales[:2])) * 3600.0)
+
+
+def _coerce_obs_time(obs_time: Time | str | float | None, wcs: WCS) -> Time | None:
+    """Resolve observation epoch from ``obs_time`` or ``wcs`` header keywords."""
+    if obs_time is not None:
+        if isinstance(obs_time, Time):
+            return Time(float(obs_time.jd), format="jd", scale="tdb")
+        if isinstance(obs_time, (int, float, np.floating)):
+            val = float(obs_time)
+            if np.isfinite(val):
+                # Values < 3000 are Julian years (e.g. 2020.5); > 2.4e6 are JD; else MJD.
+                if 1900.0 <= val <= 2200.0:
+                    return Time(val, format="jyear", scale="tdb")
+                if val > 2.4e6:
+                    return Time(val, format="jd", scale="tdb")
+                return Time(val, format="mjd", scale="tdb")
+            return None
+        if isinstance(obs_time, str) and obs_time.strip():
+            return Time(obs_time, scale="utc")
+
+    mjd_obs = getattr(wcs.wcs, "mjdobs", np.nan)
+    if np.isfinite(mjd_obs) and float(mjd_obs) > 0.0:
+        return Time(float(mjd_obs), format="mjd", scale="tdb")
+    date_obs = getattr(wcs.wcs, "dateobs", "")
+    if isinstance(date_obs, str) and date_obs.strip():
+        try:
+            return Time(date_obs.strip(), scale="utc")
+        except ValueError:
+            return None
+    return None
+
+
+def _propagate_catalogue_coords(
+    ra_deg: np.ndarray,
+    dec_deg: np.ndarray,
+    table_valid: Table,
+    *,
+    catalog: str,
+    obs_time: Time | None,
+) -> tuple[SkyCoord, SkyCoord, SkyCoord]:
+    """Return ``(coords_raw, coords_j2000, coords_obs)`` propagating proper motions when present."""
+    coords_raw = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="icrs")
+    pmra_col = _find_column_case_insensitive(table_valid, ("pmra", "pm_ra"))
+    pmdec_col = _find_column_case_insensitive(table_valid, ("pmdec", "pm_dec"))
+    if pmra_col is None or pmdec_col is None:
+        return coords_raw, coords_raw, coords_raw
+
+    pmra = np.asarray(table_valid[pmra_col], dtype=np.float64)
+    pmdec = np.asarray(table_valid[pmdec_col], dtype=np.float64)
+    has_pm = np.isfinite(pmra) & np.isfinite(pmdec)
+    if not np.any(has_pm):
+        return coords_raw, coords_raw, coords_raw
+
+    ep_col = _find_column_case_insensitive(table_valid, ("ref_epoch", "epoch"))
+    lower_names = {c.lower() for c in table_valid.colnames}
+    default_ep = (
+        2016.0
+        if ("gaia" in catalog.lower() or ("phot_g_mean_mag" in lower_names and "tmag" not in lower_names))
+        else 2000.0
+    )
+    if ep_col is not None:
+        ep_raw = np.asarray(table_valid[ep_col], dtype=np.float64)
+        ref_ep = np.where(np.isfinite(ep_raw) & (ep_raw > 1900.0), ep_raw, default_ep)
+    else:
+        ref_ep = np.full(len(table_valid), default_ep, dtype=np.float64)
+
+    pmra_clean = np.where(has_pm, pmra, 0.0)
+    pmdec_clean = np.where(has_pm, pmdec, 0.0)
+    sc_motion = SkyCoord(
+        ra=ra_deg * u.deg,
+        dec=dec_deg * u.deg,
+        pm_ra_cosdec=pmra_clean * (u.mas / u.yr),
+        pm_dec=pmdec_clean * (u.mas / u.yr),
+        obstime=Time(ref_ep, format="jyear", scale="tdb"),
+        frame="icrs",
+    )
+
+    sc_j2000_pm = sc_motion.apply_space_motion(new_obstime=Time(2000.0, format="jyear", scale="tdb"))
+    coords_j2000 = SkyCoord(ra=sc_j2000_pm.ra, dec=sc_j2000_pm.dec, frame="icrs")
+
+    if obs_time is not None:
+        sc_obs_pm = sc_motion.apply_space_motion(new_obstime=obs_time)
+        coords_obs = SkyCoord(ra=sc_obs_pm.ra, dec=sc_obs_pm.dec, frame="icrs")
+    else:
+        coords_obs = coords_raw
+
+    return coords_raw, coords_j2000, coords_obs
 
 
 def mask_background_stars(
@@ -106,23 +276,39 @@ def mask_background_stars(
     catalog_table: Table | str | os.PathLike[str] | None = None,
     offline: bool = False,
     target_coord: SkyCoord | tuple[float, float] | None = None,
-    target_exclusion_arcsec: float = 5.0,
-    mag_limit: float = 17.5,
+    target_mag: float | None = None,
+    target_exclusion_arcsec: float | None = None,
+    mag_limit: float | None = None,
     radius_pix: float | None = None,
+    obs_time: Time | str | float | None = None,
     catalog: str = "TIC",
 ) -> np.ndarray:
     """Construct a ``(ny, nx)`` boolean mask of background stars projected via ``wcs``.
 
-    Returns ``True`` on pixels contaminated by field stars (excluding the primary
-    target within ``target_exclusion_arcsec`` of ``target_coord`` when provided).
-    When ``offline=True``, ``catalog_table`` must be supplied and zero network
-    calls are made.
+    Contaminant exclusion thresholds and pixel radii are derived from WCS plate scale
+    and Gaussian PRF encircled energy:
+
+    * **Sky & halo-wing contrast cut**: When ``mag_limit`` is ``None``, stars fainter
+      than ``min(m_target + 10.0, mu_sky - 2.5 * log10(s_pix^2 / 0.5))`` (``14.6`` mag
+      at *TESS* ``21"/px``, ``17.9`` mag at *Kepler*/*K2* ``3.98"/px``) are below sky
+      or ``10^-4`` of the primary target flux and are not masked.
+    * **Gaussian PRF radius**: When ``radius_pix`` is ``None``, a contaminant of
+      magnitude ``m_s`` is masked out to ``sqrt(2 * sigma_prf^2 * (ln 10 / 2.5) *
+      (m_lim - m_s) + 0.5)`` pixels, where ``sigma_prf`` combines the ``2"`` optical
+      core with the ``0.678``-pixel 50%-encircled-energy detector core.
+    * **Proper-motion & target exclusion**: Propagates ``pmra``/``pmdec`` when present
+      and matches ``target_coord`` across both J2000 and observation epochs so nearby
+      high-proper-motion halo stars are never self-masked.
     """
     ny, nx = int(shape[0]), int(shape[1])
     if ny < 1 or nx < 1:
         raise ValueError(f"Invalid stamp shape {shape}; expected positive (ny, nx).")
     if wcs is None or not wcs.has_celestial:
         raise ValueError("A valid celestial astropy.wcs.WCS is required to project star masks.")
+
+    pix_scale_arcsec = _wcs_pixel_scale_arcsec(wcs)
+    sigma_prf_pix = math.hypot(_OPTICAL_CORE_SIGMA_ARCSEC / pix_scale_arcsec, _DETECTOR_PRF_SIGMA_PIX)
+    resolved_obs_time = _coerce_obs_time(obs_time, wcs)
 
     if catalog_table is None:
         if offline:
@@ -134,7 +320,9 @@ def mask_background_stars(
         corners_y = np.array([-0.5, -0.5, ny - 0.5, ny - 0.5], dtype=np.float64)
         center_sky = wcs.celestial.pixel_to_world((nx - 1) / 2.0, (ny - 1) / 2.0)
         corner_sky = wcs.celestial.pixel_to_world(corners_x, corners_y)
-        sep_deg = float(np.max(center_sky.separation(corner_sky).deg)) * 1.15 + (10.0 / 3600.0)
+        sep_deg = float(np.max(center_sky.separation(corner_sky).deg)) * 1.15 + (
+            2.0 * pix_scale_arcsec / 3600.0
+        )
         tbl = _query_mast_region(center_sky, sep_deg, catalog=catalog)
     else:
         tbl = _load_catalog_table(catalog_table)
@@ -154,46 +342,97 @@ def mask_background_stars(
     dec_vals = np.asarray(tbl[dec_col], dtype=np.float64)
     valid = np.isfinite(ra_vals) & np.isfinite(dec_vals)
 
-    mag_col = _find_column_case_insensitive(
-        tbl,
-        ("tmag", "phot_g_mean_mag", "kepmag", "mag", "vmag", "gmag"),
-    )
-    mag_vals: np.ndarray | None = None
-    if mag_col is not None:
-        mag_vals = np.asarray(tbl[mag_col], dtype=np.float64)
-        # Retain rows with finite mag <= mag_limit or missing NaN mag.
-        valid &= np.isnan(mag_vals) | (mag_vals <= float(mag_limit))
+    mag_vals, has_mag_col = _coalesce_magnitudes(tbl)
+    if has_mag_col and mag_vals is not None:
+        # Never retain unmeasured NaN-magnitude rows when magnitude columns are present.
+        valid &= np.isfinite(mag_vals)
 
     if not np.any(valid):
         return out_mask
 
+    tbl_valid = tbl[valid]
     ra_vals = ra_vals[valid]
     dec_vals = dec_vals[valid]
     if mag_vals is not None:
         mag_vals = mag_vals[valid]
 
-    src_coords = SkyCoord(ra=ra_vals * u.deg, dec=dec_vals * u.deg, frame="icrs")
+    coords_raw, coords_j2000, coords_obs = _propagate_catalogue_coords(
+        ra_vals,
+        dec_vals,
+        tbl_valid,
+        catalog=catalog,
+        obs_time=resolved_obs_time,
+    )
 
-    if target_coord is not None and target_exclusion_arcsec > 0.0:
-        if isinstance(target_coord, SkyCoord):
-            tgt_sky = target_coord.icrs
-        else:
-            t_ra, t_dec = float(target_coord[0]), float(target_coord[1])
-            tgt_sky = (
-                SkyCoord(ra=t_ra * u.deg, dec=t_dec * u.deg, frame="icrs")
-                if np.isfinite(t_ra) and np.isfinite(t_dec)
-                else None
-            )
-        if tgt_sky is not None:
-            not_target = src_coords.separation(tgt_sky).arcsec > float(target_exclusion_arcsec)
-            src_coords = src_coords[not_target]
-            if mag_vals is not None:
-                mag_vals = mag_vals[not_target]
+    inferred_tgt_mag: float | None = float(target_mag) if target_mag is not None else None
+    if target_coord is not None:
+        eff_excl_arcsec = (
+            max(1.5 * pix_scale_arcsec, 6.0)
+            if target_exclusion_arcsec is None
+            else float(target_exclusion_arcsec)
+        )
+        if eff_excl_arcsec > 0.0:
+            if isinstance(target_coord, SkyCoord):
+                tgt_sky: SkyCoord | None = target_coord.icrs
+            else:
+                t_ra, t_dec = float(target_coord[0]), float(target_coord[1])
+                tgt_sky = (
+                    SkyCoord(ra=t_ra * u.deg, dec=t_dec * u.deg, frame="icrs")
+                    if np.isfinite(t_ra) and np.isfinite(t_dec)
+                    else None
+                )
+            if tgt_sky is not None:
+                min_sep_arcsec = np.minimum(
+                    coords_raw.separation(tgt_sky).arcsec,
+                    np.minimum(
+                        coords_j2000.separation(tgt_sky).arcsec,
+                        coords_obs.separation(tgt_sky).arcsec,
+                    ),
+                )
+                in_excl = min_sep_arcsec <= eff_excl_arcsec
+                if np.any(in_excl):
+                    if mag_vals is not None:
+                        cand_idx = np.flatnonzero(in_excl)
+                        best_idx = cand_idx[int(np.argmin(mag_vals[cand_idx]))]
+                        if inferred_tgt_mag is None:
+                            inferred_tgt_mag = float(mag_vals[best_idx])
+                        if target_exclusion_arcsec is None:
+                            # Exclude only the primary star (and duplicate entries within 2")
+                            # so resolved fainter neighbours inside 1.5 TESS pixels remain masked.
+                            is_primary = (
+                                coords_obs.separation(coords_obs[best_idx]).arcsec <= 2.0
+                            ) & (mag_vals <= mag_vals[best_idx] + 0.5)
+                            keep = ~is_primary
+                        else:
+                            keep = ~in_excl
+                    else:
+                        keep = ~in_excl
+                    coords_obs = coords_obs[keep]
+                    if mag_vals is not None:
+                        mag_vals = mag_vals[keep]
 
-    if len(src_coords) == 0:
+    if len(coords_obs) == 0:
         return out_mask
 
-    col_pix, row_pix = wcs.celestial.world_to_pixel(src_coords)
+    # Resolve sky- and contrast-calibrated magnitude limit when mag_limit is None.
+    sky_mag_limit = _ZODIACAL_SKY_MU_MAG_ARCSEC2 - 2.5 * math.log10(
+        max(pix_scale_arcsec**2, 1e-6) / 0.50
+    )
+    if mag_limit is not None:
+        eff_mag_limit = float(mag_limit)
+    elif inferred_tgt_mag is not None and np.isfinite(inferred_tgt_mag):
+        eff_mag_limit = min(inferred_tgt_mag + _HALO_WING_CONTRAST_MAG, sky_mag_limit)
+    else:
+        eff_mag_limit = sky_mag_limit
+
+    if mag_vals is not None:
+        bright_enough = mag_vals <= eff_mag_limit
+        if not np.any(bright_enough):
+            return out_mask
+        coords_obs = coords_obs[bright_enough]
+        mag_vals = mag_vals[bright_enough]
+
+    col_pix, row_pix = wcs.celestial.world_to_pixel(coords_obs)
     col_pix = np.atleast_1d(np.asarray(col_pix, dtype=np.float64))
     row_pix = np.atleast_1d(np.asarray(row_pix, dtype=np.float64))
 
@@ -202,10 +441,12 @@ def mask_background_stars(
             raise ValueError(f"radius_pix must be > 0, got {radius_pix!r}.")
         radii = np.full(col_pix.shape, float(radius_pix), dtype=np.float64)
     elif mag_vals is not None:
-        eff_mag = np.where(np.isfinite(mag_vals), mag_vals, 15.0)
-        radii = np.clip(1.5 + 0.35 * np.maximum(15.0 - eff_mag, 0.0), 1.25, 4.5)
+        delta_m = np.maximum(eff_mag_limit - mag_vals, 0.0)
+        radii = np.sqrt(
+            2.0 * (sigma_prf_pix**2) * (math.log(10.0) / 2.5) * delta_m + 0.5
+        )
     else:
-        radii = np.full(col_pix.shape, 1.5, dtype=np.float64)
+        radii = np.full(col_pix.shape, max(2.0 * sigma_prf_pix, 1.0), dtype=np.float64)
 
     max_r = float(np.max(radii))
     in_box = (
@@ -248,6 +489,18 @@ def _resolve_tpf_wcs(tpf: Any) -> WCS | None:
     return None
 
 
+def _resolve_tpf_obs_time(tpf: Any) -> Time | None:
+    """Extract mid-observation ``astropy.time.Time`` in standard JD (TDB) from a TPF."""
+    t_attr = getattr(tpf, "time", None)
+    if t_attr is None or len(t_attr) == 0:
+        return None
+    jd_vals = np.asarray(t_attr.jd, dtype=np.float64)
+    fin_jd = jd_vals[np.isfinite(jd_vals)]
+    if fin_jd.size == 0:
+        return None
+    return Time(float(np.median(fin_jd)), format="jd", scale="tdb")
+
+
 def remove_stars(
     tpf: Any,
     *,
@@ -255,9 +508,11 @@ def remove_stars(
     catalog_table: Table | str | os.PathLike[str] | None = None,
     offline: bool = False,
     target_coord: SkyCoord | tuple[float, float] | None = None,
-    target_exclusion_arcsec: float = 5.0,
-    mag_limit: float = 17.5,
+    target_mag: float | None = None,
+    target_exclusion_arcsec: float | None = None,
+    mag_limit: float | None = None,
     radius_pix: float | None = None,
+    obs_time: Time | str | float | None = None,
     catalog: str = "TIC",
 ) -> Any:
     """Mask background contaminant stars on a ``TargetPixelFile`` or 3D flux array via WCS.
@@ -278,6 +533,7 @@ def remove_stars(
             dec_t = getattr(tpf, "dec", None)
             if ra_t is not None and dec_t is not None:
                 resolved_target = (float(ra_t), float(dec_t))
+        resolved_obs_time = obs_time if obs_time is not None else _resolve_tpf_obs_time(tpf)
 
         ny, nx = int(tpf.flux.shape[1]), int(tpf.flux.shape[2])
         star_mask = mask_background_stars(
@@ -286,9 +542,11 @@ def remove_stars(
             catalog_table=catalog_table,
             offline=offline,
             target_coord=resolved_target,
+            target_mag=target_mag,
             target_exclusion_arcsec=target_exclusion_arcsec,
             mag_limit=mag_limit,
             radius_pix=radius_pix,
+            obs_time=resolved_obs_time,
             catalog=catalog,
         )
 
@@ -340,9 +598,11 @@ def remove_stars(
         catalog_table=catalog_table,
         offline=offline,
         target_coord=target_coord,
+        target_mag=target_mag,
         target_exclusion_arcsec=target_exclusion_arcsec,
         mag_limit=mag_limit,
         radius_pix=radius_pix,
+        obs_time=obs_time,
         catalog=catalog,
     )
     out = np.array(arr, dtype=np.result_type(arr.dtype, np.float32), copy=True)
@@ -362,14 +622,17 @@ def build_halo_masks(
     pos_corr2: np.ndarray | None = None,
     wcs: WCS | None = None,
     target_coord: SkyCoord | tuple[float, float] | None = None,
+    target_mag: float | None = None,
+    obs_time: Time | str | float | None = None,
     remove_contaminants: bool = False,
     catalog_table: Table | str | os.PathLike[str] | None = None,
     offline: bool = False,
-    target_exclusion_arcsec: float = 5.0,
-    mag_limit: float = 17.5,
+    target_exclusion_arcsec: float | None = None,
+    mag_limit: float | None = None,
     star_radius_pix: float | None = None,
     thresh: float = -1.0,
-    auto_sat_level: float = 1.5e5,
+    auto_sat_level: float | None = None,
+    mission: str | None = None,
     bleed_dilation: tuple[int, int] = (3, 3),
     minflux: float = -100.0,
     sky_kappa: float = 2.0,
@@ -443,9 +706,11 @@ def build_halo_masks(
             catalog_table=catalog_table,
             offline=offline,
             target_coord=target_coord,
+            target_mag=target_mag,
             target_exclusion_arcsec=target_exclusion_arcsec,
             mag_limit=mag_limit,
             radius_pix=star_radius_pix,
+            obs_time=obs_time,
         )
     else:
         source_excl = np.zeros((ny, nx), dtype=bool)
@@ -468,18 +733,25 @@ def build_halo_masks(
         else:
             sat_mask = sat_raw
     else:
-        # Automatic saturation guard when PIXEL_QUALITY did not already flag SAT_BLEED.
-        already_flagged = (
-            pixel_quality is not None
-            and np.any((np.asarray(pixel_quality, dtype=np.uint16) & np.uint16(PixelQuality.SAT_BLEED)) != 0)
+        # Automatic physical full-well saturation guard when PIXEL_QUALITY lacks SAT_BLEED.
+        already_flagged = pixel_quality is not None and np.any(
+            (np.asarray(pixel_quality, dtype=np.uint16) & np.uint16(PixelQuality.SAT_BLEED)) != 0
         )
-        if not already_flagged and auto_sat_level > 0.0:
+        if auto_sat_level is None:
+            mission_upper = str(mission or "").upper()
+            resolved_sat = (
+                KEPLER_SAT_RATE_E_PER_S
+                if mission_upper in ("KEPLER", "K2")
+                else TESS_SAT_RATE_E_PER_S
+            )
+        else:
+            resolved_sat = float(auto_sat_level)
+
+        if not already_flagged and resolved_sat > 0.0:
             med_img = np.full((ny, nx), np.nan, dtype=np.float64)
             med_img[any_finite_pix] = np.nanmedian(flux_cad[:, any_finite_pix], axis=0)
-            sat_raw = np.isfinite(med_img) & (med_img > float(auto_sat_level))
-            cand_sat = ndimage.binary_dilation(sat_raw, structure=structure_2d)
-            surviving = base_mask & any_finite_pix & ~qual_excl & ~source_excl & ~cand_sat
-            sat_mask = cand_sat if int(np.sum(surviving)) >= 4 else np.zeros((ny, nx), dtype=bool)
+            sat_raw = np.isfinite(med_img) & (med_img > resolved_sat)
+            sat_mask = ndimage.binary_dilation(sat_raw, structure=structure_2d)
         else:
             sat_mask = np.zeros((ny, nx), dtype=bool)
 

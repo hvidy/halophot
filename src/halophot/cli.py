@@ -7,11 +7,13 @@ from collections.abc import Sequence
 from os.path import exists, join
 from time import time as clock
 
+import lightkurve as lk
 import matplotlib.pyplot as plt
 import numpy as np
 from astropy.io import fits
 from astropy.table import Table
 from astropy.wcs import WCS
+from lightkurve.targetpixelfile import TargetPixelFile
 
 from ._contract import resolve_cache_dir, write_lightcurve_fits
 from .halo_tools import (
@@ -231,6 +233,29 @@ def _read_tpf_wcs_and_target(fname: str) -> tuple[WCS | None, tuple[float, float
         return wcs_obj, tgt
 
 
+def _attach_trend_and_whitened(ts: Table) -> None:
+    """Populate polynomial ``trend`` and ``whitened`` columns on ``ts`` in-place."""
+    finite = np.isfinite(ts["time"]) & np.isfinite(ts["corr_flux"])
+    if not np.any(finite):
+        raise ValueError("No finite timestamps and fluxes survived in detrended light curve.")
+    t_fin = np.asarray(ts["time"][finite], dtype=np.float64)
+    f_fin = np.asarray(ts["corr_flux"][finite], dtype=np.float64)
+    t_span = float(np.ptp(t_fin)) if t_fin.size > 0 else 1.0
+    t_norm = (t_fin - float(np.mean(t_fin))) / (t_span if t_span > 0.0 else 1.0)
+    poly_deg = min(15, max(0, int(np.sum(finite)) - 1))
+    poly = np.poly1d(np.polyfit(t_norm, f_fin, poly_deg))
+    scf = poly(t_norm)
+
+    smooth = ts["corr_flux"][finite] - scf + np.nanmedian(scf)
+    smooth /= np.nanmedian(smooth)
+
+    ts["trend"] = np.nan * np.zeros_like(ts["corr_flux"])
+    ts["trend"][finite] = scf
+
+    ts["whitened"] = np.nan * np.zeros_like(ts["corr_flux"])
+    ts["whitened"][finite] = smooth
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     """Run the ``halo`` command-line workflow."""
     ap = build_parser()
@@ -244,11 +269,57 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     fname = join(args.data_dir, args.fname) if args.data_dir else args.fname
     if args.hlsp_fits:
+        tpf_lk = lk.read(fname, quality_bitmask=args.bitmask)
+        if not isinstance(tpf_lk, TargetPixelFile):
+            raise TypeError(
+                f"Expected a 3D lightkurve.TargetPixelFile from {fname!r}, got {type(tpf_lk).__name__}."
+            )
+
+        t_lk = np.asarray(tpf_lk.time.value, dtype=np.float64)
+        if args.campaign == 13:
+            m1 = np.logical_or(t_lk < 2988.2553329814764, t_lk > 2988.494)
+            m2 = np.logical_and(m1, t_lk < 3064.016165412577)
+            m3 = np.logical_or(m2, t_lk > 3064.75)
+            m4 = np.logical_and(m3, t_lk < 3065.9776255118923)
+            m_camp = np.logical_or(m4, t_lk > 3066.2225)
+            tpf_lk = tpf_lk[m_camp]
+        elif args.campaign == 10:
+            tpf_lk = tpf_lk[t_lk > 2760]
+        elif args.campaign == 7:
+            tpf_lk = tpf_lk[t_lk > 2470]
+        elif args.campaign == 12:
+            m_camp = (t_lk > 2937.75) & (t_lk < 2938.8)
+            tpf_lk = tpf_lk[~m_camp]
+
+        hlsp_splits: np.ndarray | None = None
+        if args.do_split or args.splits is not None or args.split_cadences is not None:
+            t_col = np.asarray(tpf_lk.time.value, dtype=np.float64)
+            ts_hlsp = Table({"time": t_col})
+            split_indices = _resolve_split_indices(
+                ts_hlsp,
+                split_times=args.splits,
+                split_cadences=args.split_cadences,
+                campaign=args.campaign,
+            )
+            if args.splits is not None and args.split_cadences is None:
+                hlsp_splits = np.sort(np.asarray(args.splits, dtype=np.float64).ravel())
+            else:
+                split_ts: list[float] = []
+                for idx_s in split_indices:
+                    left_fin = t_col[:idx_s][np.isfinite(t_col[:idx_s])]
+                    right_fin = t_col[idx_s:][np.isfinite(t_col[idx_s:])]
+                    if left_fin.size == 0 or right_fin.size == 0:
+                        raise ValueError(
+                            f"Split cadence index {idx_s} lacks finite flanking timestamps."
+                        )
+                    split_ts.append(0.5 * (float(left_fin[-1]) + float(right_fin[0])))
+                hlsp_splits = np.asarray(split_ts, dtype=np.float64)
+
         rr_tuple = (float(args.rr[0]), float(args.rr[1])) if args.rr is not None else None
         lc = extract_halo_lightcurve(
-            fname,
+            tpf_lk,
             rr=rr_tuple,
-            split_times=args.splits,
+            split_times=hlsp_splits,
             sub=args.sub,
             objective=args.objective,
             lag=args.lag,
@@ -266,6 +337,43 @@ def main(argv: Sequence[str] | None = None) -> None:
         write_lightcurve_fits(lc, out_fits, overwrite=True)
         if not args.quiet:
             print(f"Saved HALOCVER=1 halo light curve to {out_fits}")
+
+        if args.do_plot:
+            flux_vals = np.asarray(
+                lc.flux.value if hasattr(lc.flux, "value") else lc.flux,
+                dtype=np.float64,
+            )
+            plot_ts = Table(
+                {
+                    "time": np.asarray(lc.time.value, dtype=np.float64),
+                    "corr_flux": flux_vals,
+                }
+            )
+            _attach_trend_and_whitened(plot_ts)
+            tpf_flux = np.asarray(
+                tpf_lk.flux.value if hasattr(tpf_lk.flux, "value") else tpf_lk.flux,
+                dtype=np.float64,
+            )
+            image = np.nansum(tpf_flux, axis=0)
+            wmap_meta = np.asarray(lc.meta["WEIGHTMAP"], dtype=np.float64)
+            wmap_2d = np.mean(wmap_meta, axis=0) if wmap_meta.ndim == 3 else wmap_meta
+            wmap_legacy = wmap_2d.T
+            masked_wmap = np.ma.array(
+                wmap_legacy,
+                mask=~np.isfinite(wmap_legacy) | (wmap_legacy <= 0.0),
+            )
+            formal_name = translate_greek(args.name).replace("_", " ")
+            out_png = join(args.save_dir, f"{args.name}_all_{args.objective}.png")
+            fig = plot_all(
+                plot_ts,
+                image,
+                masked_wmap,
+                formal_name=f"{formal_name} - C{args.campaign:02d}",
+                save_file=out_png,
+            )
+            plt.close(fig)
+            if not args.quiet:
+                print(f"Everything saved to {out_png}")
         return
 
     tpf, ts = read_tpf(fname)
@@ -408,25 +516,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     if not args.quiet:
         print(f"Total variation per point (first order): {tv1:f} ")
 
-    finite = np.isfinite(newts["time"]) & np.isfinite(newts["corr_flux"])
-    if not np.any(finite):
-        raise ValueError("No finite timestamps and fluxes survived in detrended light curve.")
-    t_fin = np.asarray(newts["time"][finite], dtype=np.float64)
-    f_fin = np.asarray(newts["corr_flux"][finite], dtype=np.float64)
-    t_span = float(np.ptp(t_fin)) if t_fin.size > 0 else 1.0
-    t_norm = (t_fin - float(np.mean(t_fin))) / (t_span if t_span > 0.0 else 1.0)
-    poly_deg = min(15, max(0, int(np.sum(finite)) - 1))
-    poly = np.poly1d(np.polyfit(t_norm, f_fin, poly_deg))
-    scf = poly(t_norm)
-
-    smooth = newts["corr_flux"][finite] - scf + np.nanmedian(scf)
-    smooth /= np.nanmedian(smooth)
-
-    newts["trend"] = np.nan * np.zeros_like(newts["corr_flux"])
-    newts["trend"][finite] = scf
-
-    newts["whitened"] = np.nan * np.zeros_like(newts["corr_flux"])
-    newts["whitened"][finite] = smooth
+    _attach_trend_and_whitened(newts)
 
     hdu = fits.PrimaryHDU(weightmap.T)
     cols = [fits.Column(name=key, format="D", array=newts[key]) for key in newts.keys()]
