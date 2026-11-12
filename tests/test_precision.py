@@ -18,11 +18,17 @@ import halophot._precision
 import halophot.cli
 import halophot.halo_objectives
 import halophot.halo_tools
+import halophot.lightcurve
+import halophot.masking
+import halophot.models
+import halophot.objectives
+import halophot.optimise
+import halophot.simplex
 from halophot._precision import cast_tree, in_float64, run_in
 
 
 def test_import_has_zero_global_side_effects() -> None:
-    """Importing ``halophot`` and ``halophot.cli`` must not mutate JAX, Matplotlib, or warnings."""
+    """Importing ``halophot`` and all v2.0 submodules must not mutate JAX, Matplotlib, or warnings."""
     assert jax.config.jax_enable_x64 is False
     rc_before = dict(mpl.rcParams)
     filters_before = list(warnings.filters)
@@ -30,6 +36,12 @@ def test_import_has_zero_global_side_effects() -> None:
     for mod in (
         halophot._precision,
         halophot._contract,
+        halophot.simplex,
+        halophot.models,
+        halophot.objectives,
+        halophot.optimise,
+        halophot.masking,
+        halophot.lightcurve,
         halophot.halo_objectives,
         halophot.halo_tools,
         halophot.cli,

@@ -11,7 +11,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 from astropy.io import fits
 from astropy.table import Table
+from astropy.wcs import WCS
 
+from ._contract import resolve_cache_dir, write_lightcurve_fits
 from .halo_tools import (
     diff_1,
     do_lc,
@@ -23,6 +25,7 @@ from .halo_tools import (
     stitch,
     translate_greek,
 )
+from .lightcurve import extract_halo_lightcurve
 
 
 def _parse_float_array(text: str) -> np.ndarray:
@@ -165,7 +168,67 @@ def build_parser() -> ArgumentParser:
     ap.add_argument(
         "--deathstar", action="store_true", default=False, help="remove background star pixels"
     )
+    ap.add_argument(
+        "--catalog-table",
+        default=None,
+        type=str,
+        help="Path to pre-cached Gaia/TIC catalogue table for --deathstar / --offline",
+    )
+    ap.add_argument(
+        "--offline",
+        action="store_true",
+        default=False,
+        help="Disable live network catalogue queries (for HPC compute nodes)",
+    )
+    ap.add_argument(
+        "--strict-hpc",
+        action="store_true",
+        default=False,
+        help="Reject cache paths under /fred/ to protect HPC inode quotas",
+    )
+    ap.add_argument(
+        "--cache-dir",
+        default=None,
+        type=str,
+        help="Explicit cache directory (defaults to $SCRATCH/.cache/tess_bright)",
+    )
+    ap.add_argument(
+        "--legacy-tv",
+        action="store_true",
+        default=False,
+        help="Use unregularized w-simplex TV in --hlsp-fits v2.0 mode",
+    )
+    ap.add_argument(
+        "--hlsp-fits",
+        action="store_true",
+        default=False,
+        help="Run v2.0 extract_halo_lightcurve and write HALOCVER=1 HLSP FITS with WEIGHTMAP",
+    )
+    ap.add_argument(
+        "--uncertainty",
+        action="store_true",
+        default=False,
+        help="Compute orbit block-jackknife pixel weight uncertainties in --hlsp-fits mode",
+    )
     return ap
+
+
+def _read_tpf_wcs_and_target(fname: str) -> tuple[WCS | None, tuple[float, float] | None]:
+    """Extract celestial WCS and (RA_OBJ, DEC_OBJ) from a TPF FITS file."""
+    with fits.open(fname) as hdul:
+        wcs_obj: WCS | None = None
+        if "APERTURE" in hdul:
+            cand = WCS(hdul["APERTURE"].header)
+            if cand.has_celestial:
+                wcs_obj = cand
+        if wcs_obj is None and len(hdul) > 2:
+            cand = WCS(hdul[2].header)
+            if cand.has_celestial:
+                wcs_obj = cand
+        ra = hdul[0].header.get("RA_OBJ")
+        dec = hdul[0].header.get("DEC_OBJ")
+        tgt = (float(ra), float(dec)) if ra is not None and dec is not None else None
+        return wcs_obj, tgt
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -176,7 +239,35 @@ def main(argv: Sequence[str] | None = None) -> None:
     if not exists(args.save_dir):
         raise FileNotFoundError(f"Save directory {args.save_dir!r} does not exist.")
 
+    if args.strict_hpc or args.cache_dir is not None:
+        resolve_cache_dir(args.cache_dir, strict_hpc=args.strict_hpc)
+
     fname = join(args.data_dir, args.fname) if args.data_dir else args.fname
+    if args.hlsp_fits:
+        rr_tuple = (float(args.rr[0]), float(args.rr[1])) if args.rr is not None else None
+        lc = extract_halo_lightcurve(
+            fname,
+            rr=rr_tuple,
+            split_times=args.splits,
+            sub=args.sub,
+            objective=args.objective,
+            lag=args.lag,
+            legacy_tv=args.legacy_tv,
+            maxiter=args.maxiter,
+            sigclip=args.sigclip,
+            thresh=args.thresh,
+            minflux=args.minflux,
+            remove_contaminants=args.deathstar,
+            catalog_table=args.catalog_table,
+            offline=args.offline,
+            compute_uncertainty=args.uncertainty,
+        )
+        out_fits = join(args.save_dir, f"{args.name}_halo_lc_{args.objective}.fits")
+        write_lightcurve_fits(lc, out_fits, overwrite=True)
+        if not args.quiet:
+            print(f"Saved HALOCVER=1 halo light curve to {out_fits}")
+        return
+
     tpf, ts = read_tpf(fname)
 
     if args.campaign == 13:
@@ -215,7 +306,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.deathstar:
         if not args.quiet:
             print("Removing background stars")
-        tpf = remove_stars(tpf)
+        wcs_obj, tgt_coord = _read_tpf_wcs_and_target(fname)
+        tpf = remove_stars(
+            tpf,
+            wcs=wcs_obj,
+            target_coord=tgt_coord,
+            catalog_table=args.catalog_table,
+            offline=args.offline,
+        )
 
     if args.do_split:
         split_indices = _resolve_split_indices(

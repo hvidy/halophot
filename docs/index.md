@@ -24,7 +24,32 @@ We believe this is of practical use for *Kepler* targets brighter than Kp ~ 6 an
 
 ## Basic usage
 
-Call `halophot` either from its `lightkurve` interface (`halo_tpf` / `halo_tpf_tess`), as a library of functions (`src/halophot/halo_tools.py`), or from the command line as, e.g.
+### Functional `lightkurve` API (`halophot` v2.0)
+
+```python
+import lightkurve as lk
+import halophot
+
+tpf = lk.read("tess...-s_tp.fits")
+lc = halophot.extract_halo_lightcurve(
+    tpf,
+    sigclip=True,
+    compute_uncertainty=True,
+)
+halophot.write_fits(lc, "target_halo_lc.fits")
+```
+
+`extract_halo_lightcurve` returns a standard `lightkurve.LightCurve` (`KeplerLightCurve` or `TessLightCurve`) with:
+
+- `flux` and unified coherent `flux_err` propagated in `float64` across uncorrelated pixel noise, degree-$\le d$ column-projected `SMEAR_ERR`, and `BKG_CHOL` / `BKG_BASIS` background covariance;
+- flux-weighted aperture centroids in `centroid_col` / `centroid_row` (keeping `pos_corr1` / `pos_corr2` separate);
+- non-transposed `(ny, nx)` `lc.meta['WEIGHTMAP']` (or `(n_splits, ny, nx)` when `split_times` is supplied), preserved losslessly on disk via `halophot.write_fits(lc, path)`.
+
+Legacy `halo_tpf` / `halo_tpf_tess` shims, `do_lc`, and `legacy_tv=True` remain available for *K2* and `halo-tess` DR1 compatibility. Slurm and Apptainer templates for HPC survey execution are provided in `hpc/`.
+
+### Command-line usage
+
+Call `halophot` from the command line as, e.g.
 
 `halo ktwo200007768-c04_lpd-targ.fits --data-dir /path/to/data/directory/ --name Atlas -c 4 --do-plot`
 

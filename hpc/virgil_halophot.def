@@ -1,0 +1,54 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04
+
+# Apptainer recipe snippet for the single-inode virgil + bright-star photometry stack
+# on Swinburne Ngarrgu Tindebeek (tooarrana).
+#
+# Build on trevor (keeps uv cache off /fred and produces 1 .sif inode on $MYFRED):
+#   mkdir -p "$SCRATCH/.cache/uv" "$MYFRED/containers"
+#   UV_CACHE_DIR="$SCRATCH/.cache/uv" apptainer build --fakeroot \
+#       "$MYFRED/containers/virgil.sif" hpc/virgil_halophot.def
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-dev python3-venv git ca-certificates curl build-essential \
+        && rm -rf /var/lib/apt/lists/*
+
+    curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+
+    uv venv --python /usr/bin/python3 /opt/venv
+    export VIRTUAL_ENV=/opt/venv
+    export PATH="/opt/venv/bin:$PATH"
+    export UV_LINK_MODE=copy
+
+    uv pip install --no-cache \
+        "jax[cuda12]>=0.4.35" \
+        "equinox>=0.11.5" \
+        "optimistix>=0.0.7" \
+        "optax>=0.2.2" \
+        "zodiax>=0.5.0" \
+        "numpy>=1.26" \
+        "scipy>=1.11" \
+        "astropy>=6.0" \
+        "lightkurve>=2.4" \
+        "astroquery>=0.4.7" \
+        "matplotlib>=3.8" \
+        "fsspec>=2024.2" \
+        "s3fs>=2024.2" \
+        "pyarrow>=15.0" \
+        "tqdm>=4.66" \
+        "git+https://github.com/hvidy/mundey.git@dev" \
+        "git+https://github.com/hvidy/tessbkgd.git@dev" \
+        "git+https://github.com/hvidy/halophot.git@dev"
+
+%environment
+    export VIRTUAL_ENV=/opt/venv
+    export PATH="/opt/venv/bin:$PATH"
+    export PYTHONNOUSERSITE=1
+    export MPLBACKEND=Agg
+    export JAX_DEFAULT_MATMUL_PRECISION=highest
+
+%runscript
+    exec "$@"

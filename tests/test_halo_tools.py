@@ -237,7 +237,7 @@ def test_legacy_removals_and_print_time(capsys: pytest.CaptureFixture[str]) -> N
     assert "2 m" in captured
     assert "2 h 2 m" in captured
 
-    with pytest.raises(NotImplementedError, match="Phase 4"):
+    with pytest.raises(ValueError, match="wcs"):
         remove_stars(np.ones((10, 4, 4)))
 
 

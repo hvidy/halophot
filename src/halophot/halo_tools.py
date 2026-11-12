@@ -26,7 +26,15 @@ from scipy.signal import savgol_filter
 from tqdm import tqdm
 
 from . import halo_objectives as objectives
+from ._contract import (
+    infer_bkg_poly_order,
+    read_bkg_covariance,
+    read_bkgsub_state,
+    read_smear_err,
+)
 from ._precision import in_float64
+from .lightcurve import compute_coherent_flux_err
+from .masking import remove_stars as remove_stars
 
 """-----------------------------------------------------------------
 halo_tools.py
@@ -720,6 +728,7 @@ def do_lc(
             "final_cadence": cad2,
             "sat_pixels": sat,
             "weightmap": weightmap[0],
+            "weightmaps": np.stack(weightmap, axis=0),
         }
         ts = stitch(tss)
 
@@ -1037,17 +1046,61 @@ def plot_all(ts, image, weightmap, save_file=None, formal_name="test", title=Tru
 
 
 # =========================================================================
-# Remove background stars
+# Coherent flux_err helper for halo_tpf / halo_tpf_tess shims
 # =========================================================================
 
 
-def remove_stars(tpf):
-    """Mask background stars (replaced by WCS Gaia DR3 / TIC masking in Phase 4)."""
-    del tpf
-    raise NotImplementedError(
-        "Vendored K2P2 background-star masking has been removed; "
-        "WCS-projected Gaia DR3 / TIC source masking lands in Phase 4."
+def _compute_legacy_tpf_flux_err(
+    tpf_obj,
+    weightmap_dict: dict[str, object],
+    corr_flux: np.ndarray,
+    flux_arr: np.ndarray,
+) -> np.ndarray:
+    """Propagate coherent normalized ``flux_err`` on ``halo_tpf`` / ``halo_tpf_tess``."""
+    fe_obj = getattr(tpf_obj, "flux_err", None)
+    fe_arr = (
+        np.asarray(fe_obj.value if hasattr(fe_obj, "value") else fe_obj, dtype=np.float64)
+        if fe_obj is not None
+        else None
     )
+    if fe_arr is None or not np.any(np.isfinite(fe_arr) & (fe_arr > 0.0)):
+        return np.nan * np.asarray(corr_flux, dtype=np.float64)
+
+    fbe_obj = getattr(tpf_obj, "flux_bkg_err", None)
+    fbe_arr = (
+        np.asarray(fbe_obj.value if hasattr(fbe_obj, "value") else fbe_obj, dtype=np.float64)
+        if fbe_obj is not None
+        else None
+    )
+    if fbe_arr is not None and not np.any(np.isfinite(fbe_arr) & (fbe_arr > 0.0)):
+        fbe_arr = None
+
+    w_ny_nx = np.asarray(weightmap_dict["weightmap"], dtype=np.float64).T
+    rows_h, cols_h = np.where(np.isfinite(w_ny_nx) & (w_ny_nx > 0.0))
+    if rows_h.size == 0:
+        return np.nan * np.asarray(corr_flux, dtype=np.float64)
+
+    valid_cad = np.isfinite(corr_flux)
+    if not np.any(valid_cad):
+        return np.nan * np.asarray(corr_flux, dtype=np.float64)
+
+    raw_lc = flux_arr[valid_cad][:, rows_h, cols_h] @ w_ny_nx[rows_h, cols_h]
+    med_raw = float(np.nanmedian(raw_lc))
+    if not np.isfinite(med_raw) or abs(med_raw) <= 1e-30:
+        return np.nan * np.asarray(corr_flux, dtype=np.float64)
+
+    err_out = compute_coherent_flux_err(
+        w_ny_nx,
+        flux_err=fe_arr,
+        smear_err=read_smear_err(tpf_obj, apply_quality_mask=True),
+        bkg_cov=read_bkg_covariance(tpf_obj, apply_quality_mask=True),
+        flux_bkg_err=fbe_arr,
+        bkgsub=read_bkgsub_state(tpf_obj, warn_legacy_mundey=False),
+        bkg_order=infer_bkg_poly_order(tpf_obj),
+        norm_factor=med_raw,
+    )
+    err_out[~valid_cad] = np.nan
+    return err_out
 
 
 """-----------------------------------------------------------------
@@ -1132,7 +1185,7 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
         else:
             mission = "kepler"
 
-        self.estimate_centroids()
+        cent_col, cent_row = self.estimate_centroids(aperture_mask=aperture_mask)
 
         x = self.hdu[1].data["POS_CORR1"][self.quality_mask]
         y = self.hdu[1].data["POS_CORR2"][self.quality_mask]
@@ -1180,8 +1233,8 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
         )
 
         keys = {
-            "centroid_col": ts["x"],
-            "centroid_row": ts["y"],
+            "centroid_col": cent_col,
+            "centroid_row": cent_row,
             "quality": ts["quality"],
             "channel": self.channel,
             "campaign": self.campaign,
@@ -1193,17 +1246,25 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
             "cadenceno": ts["cadence"],
         }
 
+        flux_err_lc = _compute_legacy_tpf_flux_err(self, weightmap, ts["corr_flux"], flux_arr)
         lc_out = lightkurve.KeplerLightCurve(
             flux=ts["corr_flux"],
             time=Time(ts["time"], format=self.time.format, scale=self.time.scale),
-            flux_err=np.nan * ts["corr_flux"],
+            flux_err=flux_err_lc,
             **keys,
         )
         lc_out["pos_corr1"] = self.pos_corr1
         lc_out["pos_corr2"] = self.pos_corr2
+        lc_out.meta = dict(lc_out.meta)
         hdu = lc_out.to_fits()
         object.__setattr__(lc_out, "primary_header", hdu[0].header)
         object.__setattr__(lc_out, "data_header", hdu[1].header)
+        if "weightmaps" in weightmap:
+            lc_out.meta["WEIGHTMAP"] = np.swapaxes(
+                np.asarray(weightmap["weightmaps"], dtype=np.float64), -1, -2
+            )
+        else:
+            lc_out.meta["WEIGHTMAP"] = np.asarray(weightmap["weightmap"], dtype=np.float64).T
         return weightmap, lc_out
 
 
@@ -1280,7 +1341,7 @@ class halo_tpf_tess(lightkurve.TessTargetPixelFile):
         else:
             mission = "kepler"
 
-        self.estimate_centroids()
+        cent_col, cent_row = self.estimate_centroids(aperture_mask=aperture_mask)
 
         x = self.hdu[1].data["POS_CORR1"][self.quality_mask]
         y = self.hdu[1].data["POS_CORR2"][self.quality_mask]
@@ -1328,8 +1389,8 @@ class halo_tpf_tess(lightkurve.TessTargetPixelFile):
         )
 
         keys = {
-            "centroid_col": ts["x"],
-            "centroid_row": ts["y"],
+            "centroid_col": cent_col,
+            "centroid_row": cent_row,
             "quality": ts["quality"],
             "targetid": self.targetid,
             "ra": self.ra,
@@ -1340,14 +1401,22 @@ class halo_tpf_tess(lightkurve.TessTargetPixelFile):
             "mission": self.mission,
             "cadenceno": ts["cadence"],
         }
+        flux_err_lc = _compute_legacy_tpf_flux_err(self, weightmap, ts["corr_flux"], flux_arr)
         lc_out = lightkurve.TessLightCurve(
             flux=ts["corr_flux"],
             time=Time(ts["time"], format=self.time.format, scale=self.time.scale),
-            flux_err=np.nan * ts["corr_flux"],
+            flux_err=flux_err_lc,
             **keys,
         )
         lc_out["pos_corr1"] = self.pos_corr1
         lc_out["pos_corr2"] = self.pos_corr2
+        lc_out.meta = dict(lc_out.meta)
+        if "weightmaps" in weightmap:
+            lc_out.meta["WEIGHTMAP"] = np.swapaxes(
+                np.asarray(weightmap["weightmaps"], dtype=np.float64), -1, -2
+            )
+        else:
+            lc_out.meta["WEIGHTMAP"] = np.asarray(weightmap["weightmap"], dtype=np.float64).T
         object.__setattr__(lc_out, "primary_header", self.hdu[0].header)
         object.__setattr__(lc_out, "data_header", self.hdu[1].header)
         return weightmap, lc_out
