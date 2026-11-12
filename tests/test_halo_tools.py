@@ -237,7 +237,7 @@ def test_legacy_removals_and_print_time(capsys: pytest.CaptureFixture[str]) -> N
     assert "2 m" in captured
     assert "2 h 2 m" in captured
 
-    with pytest.raises(NotImplementedError, match="Phase 4"):
+    with pytest.raises(ValueError, match="wcs"):
         remove_stars(np.ones((10, 4, 4)))
 
 
@@ -387,6 +387,34 @@ def test_halo_tpf_tess_and_time_scale_preservation(
     assert meta_tess["weightmap"].shape == (5, 4)
     flux_vals = np.asarray(lc_tess.flux.value, dtype=np.float64)
     np.testing.assert_allclose(flux_vals, stellar / np.median(stellar), atol=1e-2)
+
+    # Verify split_times propagates per-segment weightmaps and segment-local medians into flux_err:
+    # rescale the second half of FLUX by 4x while keeping FLUX_ERR constant so segment 1 has 4x smaller
+    # relative flux_err than segment 0!
+    tess_split_path = tmp_path / "synth_tess_split_tpf.fits"
+    _write_synthetic_tess_tpf(tess_split_path, n_cad=60, ny=4, nx=5)
+    with fits.open(tess_split_path, mode="update") as hdul_sp:
+        hdul_sp[1].data["FLUX"][30:] *= 4.0
+        hdul_sp.flush()
+
+    ttpf_sp = halo_tpf_tess(str(tess_split_path))
+    t_mid = 0.5 * float(ttpf_sp.time.value[29] + ttpf_sp.time.value[30])
+    meta_sp, lc_sp = ttpf_sp.halo(
+        aperture_mask="all",
+        rr=(0.5, 5.0),
+        split_times=[t_mid],
+        thresh=0.8,
+        minflux=10.0,
+        maxiter=35,
+        sigclip=False,
+        verbose=False,
+    )
+    assert meta_sp["weightmaps"].shape == (2, 5, 4)
+    err_sp = np.asarray(lc_sp.flux_err.value, dtype=np.float64)
+    assert np.all(np.isfinite(err_sp))
+    # Segment 1 has 4x higher median flux at the same absolute FLUX_ERR -> ~4x smaller relative flux_err!
+    ratio_seg0_to_seg1 = float(np.median(err_sp[:30]) / np.median(err_sp[30:]))
+    assert ratio_seg0_to_seg1 == pytest.approx(4.0, rel=0.05)
 
 
 def test_read_epic_mast_fits_and_cli_smoke(

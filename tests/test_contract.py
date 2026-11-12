@@ -15,6 +15,7 @@ from astropy.time import Time
 from halophot._contract import (
     HALOCVER,
     PixelQuality,
+    infer_bkg_poly_order,
     pack_bkg_chol,
     read_bkg_covariance,
     read_bkgsub_state,
@@ -290,6 +291,47 @@ def test_contract_missing_and_malformed_extensions() -> None:
 
     with pytest.raises(ValueError, match="P >= 1"):
         pack_bkg_chol(np.zeros((4, 0, 0), dtype=np.float64))
+
+    # Partial NaNs in a cadence must raise ValueError, while all-NaN cadences round-trip seamlessly
+    partial_nan = np.zeros((4, 2, 2), dtype=np.float64)
+    partial_nan[:, 0, 0] = 1.0
+    partial_nan[:, 1, 1] = 1.0
+    partial_nan[1, 0, 0] = np.nan
+    with pytest.raises(ValueError, match="all-NaN"):
+        pack_bkg_chol(partial_nan)
+
+    hdul_nan, _, chol_true, _, _ = _make_contract_tpf_hdulist(n_raw=14, ny=4, nx=5, p_dim=3)
+    chol_with_nan = chol_true.copy()
+    chol_with_nan[4, :, :] = np.nan
+    packed_nan = pack_bkg_chol(chol_with_nan)
+    assert np.all(np.isnan(packed_nan[4]))
+    hdul_nan[1].data["BKG_CHOL"][:] = packed_nan
+    unpacked_nan = read_bkg_covariance(hdul_nan)
+    assert unpacked_nan is not None
+    assert np.all(np.isnan(unpacked_nan.chol[4]))
+    np.testing.assert_allclose(unpacked_nan.chol[:4], chol_with_nan[:4], rtol=1e-6)
+
+
+def test_infer_bkg_poly_order_headers_and_basis_count() -> None:
+    for d_expected, p_dim in ((0, 1), (1, 3), (2, 6), (3, 10)):
+        hdul, *_ = _make_contract_tpf_hdulist(p_dim=p_dim, bkgsub=True)
+        assert infer_bkg_poly_order(hdul) == d_expected
+
+    # Explicit BKG_ORD header card overrides basis count
+    hdul_ord, *_ = _make_contract_tpf_hdulist(p_dim=3, bkgsub=True)
+    hdul_ord["BKG_BASIS"].header["BKG_ORD"] = 2
+    assert infer_bkg_poly_order(hdul_ord) == 2
+
+    # BKGSUB=False returns None
+    hdul_unsub, *_ = _make_contract_tpf_hdulist(p_dim=3, bkgsub=False)
+    assert infer_bkg_poly_order(hdul_unsub) is None
+
+    # Conflicting BKG_ORD cards raise ValueError
+    hdul_conf, *_ = _make_contract_tpf_hdulist(p_dim=3, bkgsub=True)
+    hdul_conf[0].header["BKG_ORD"] = 1
+    hdul_conf["BKG_BASIS"].header["BKG_ORD"] = 2
+    with pytest.raises(ValueError, match="Conflicting BKG_ORD"):
+        infer_bkg_poly_order(hdul_conf)
 
 
 def test_write_lightcurve_fits_weightmap_round_trip(tmp_path: Path) -> None:

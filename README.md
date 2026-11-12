@@ -30,11 +30,38 @@ We believe this is of practical use for *Kepler* targets brighter than Kp ~ 6 an
 
 ## Basic usage
 
-Call `halophot` either as a library of functions (`src/halophot/halo_tools.py`) or from the command line as, e.g.
+### Functional `lightkurve` API (`halophot` v2.0)
+
+`halophot` v2.0 operates directly on standard `lightkurve.TargetPixelFile` objects (including `HALOCVER = 1` products from `mundey` and `tessbkgd`) via convex Charnes–Cooper flux-share coordinates parameterized on the simplex with singularity-free isometric log-ratio (ILR) transforms in JAX and Zodiax:
+
+```python
+import lightkurve as lk
+import halophot
+
+tpf = lk.read("tess...-s_tp.fits")
+lc = halophot.extract_halo_lightcurve(
+    tpf,
+    sigclip=True,
+    compute_uncertainty=True,
+)
+# Save HLSP FITS with lossless WEIGHTMAP ImageHDU and coherent flux_err
+halophot.write_fits(lc, "target_halo_lc.fits")
+```
+
+Key v2.0 features:
+
+- **Convex Charnes–Cooper + ILR Simplex Core**: `HaloWeights(zdx.Base)` isolates `z_ilr` as its sole differentiable leaf, optimized in locally scoped `float64` precision via `optimistix.LBFGS` (or `zodiax.optimisation` with rank-guarded eigen-projection) without mutating global `jax_enable_x64`.
+- **Gap-Aware Charbonnier TV & $\mathcal{O}(N)$ `tv_exp`**: Smooth Charbonnier total variation strictly masks spacecraft downlink and safe-mode gaps, while `jax.lax.scan` evaluates multi-lag `tv_exp` in `< 10 MB` RAM even on 20-second *TESS* sectors.
+- **Sky-Dilution Guard & Unified Coherent `flux_err`**: Automatically excludes `PIXEL_QUALITY` strap, bleed, unresolved-smear, background-star, and `BKG_USED` pixels ($\Omega_{\text{halo}} \cap \Omega_{\text{bg}} = \emptyset$), enforces $\bar{P}_i \ge 2\,\operatorname{median}_t(B_{i,t})$ and $\operatorname{SNR}_i \ge 5$, and propagates pixel, column-orthogonalized `SMEAR_ERR`, and `BKG_CHOL` / `BKG_BASIS` uncertainties without double-counting. Pass `legacy_tv=True` to reproduce unregularized *K2* / `halo-tess` DR1 weights.
+- **HPC Templates**: Slurm array and Apptainer recipes for Swinburne Ngarrgu Tindebeek (`tooarrana`) are provided in `hpc/`.
+
+### Command-line usage
+
+Call `halo` from the command line as, e.g.
 
 `halo ktwo200007768-c04_lpd-targ.fits --data-dir /path/to/data/directory/ --name Atlas -c 4 --do-plot`
 
-where `--name` is the star name you would like to save the outputs under, and `-c` is the campaign.
+where `--name` is the star name you would like to save the outputs under, and `-c` is the campaign. Add `--hlsp-fits` (and `--offline --strict-hpc` on HPC clusters) to emit `HALOCVER = 1` `lightkurve` FITS files with `WEIGHTMAP` extensions.
 
 ## Licence
 

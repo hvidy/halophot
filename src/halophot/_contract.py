@@ -15,6 +15,7 @@ This module defines the zero-import-coupling schema shared between ``mundey``,
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import warnings
 from collections.abc import Iterator
@@ -269,27 +270,104 @@ def read_smear_err(
 
 
 def pack_bkg_chol(chol: np.ndarray) -> np.ndarray:
-    """Pack lower-triangular ``(N_cad, P, P)`` Cholesky factors in row-major ``tril`` order."""
+    """Pack lower-triangular ``(N_cad, P, P)`` Cholesky factors in row-major ``tril`` order.
+
+    All-``NaN`` cadences (emitted by ``tessbkgd`` when fewer than ``P`` valid
+    background pixels survive on a cadence) are permitted and pack to all-``NaN``
+    rows; partial ``NaN``s, infinities, negative diagonal entries, and non-zero
+    strict upper-triangular entries raise ``ValueError``.
+    """
     arr = np.asarray(chol, dtype=np.float64)
     if arr.ndim != 3 or arr.shape[1] != arr.shape[2] or arr.shape[1] < 1:
         raise ValueError(
             f"Expected 3D square Cholesky array (N_cad, P, P) with P >= 1, got shape {arr.shape}."
         )
     p_dim = arr.shape[1]
-    if p_dim > 1:
-        triu_r, triu_c = np.triu_indices(p_dim, k=1)
-        if np.any(arr[:, triu_r, triu_c] != 0.0):
+    active = ~np.all(np.isnan(arr), axis=(1, 2))
+    if np.any(active):
+        arr_active = arr[active]
+        if not np.all(np.isfinite(arr_active)):
             raise ValueError(
-                "Cholesky array must be lower-triangular "
-                "(found non-zero strict upper-triangular entries)."
+                "Cholesky factors must contain only finite entries (or all-NaN cadences)."
             )
-    diag = np.diagonal(arr, axis1=1, axis2=2)
-    if np.any(diag < 0.0):
-        raise ValueError("Cholesky factors must have non-negative diagonal entries.")
-    if not np.all(np.isfinite(arr)):
-        raise ValueError("Cholesky factors must contain only finite entries.")
+        if p_dim > 1:
+            triu_r, triu_c = np.triu_indices(p_dim, k=1)
+            if np.any(arr_active[:, triu_r, triu_c] != 0.0):
+                raise ValueError(
+                    "Cholesky array must be lower-triangular "
+                    "(found non-zero strict upper-triangular entries)."
+                )
+        diag = np.diagonal(arr_active, axis1=1, axis2=2)
+        if np.any(diag < 0.0):
+            raise ValueError("Cholesky factors must have non-negative diagonal entries.")
     tril_r, tril_c = np.tril_indices(p_dim)
     return np.asarray(arr[:, tril_r, tril_c], dtype=np.float32)
+
+
+def _poly_degree_from_basis_count(p_dim: int) -> int | None:
+    """Solve ``P = (d + 1) * (d + 2) // 2`` for integer ``d >= 0``, or return ``None``."""
+    if p_dim < 1:
+        return None
+    disc = 1 + 8 * p_dim
+    root = int(math.isqrt(disc))
+    if root * root == disc and root >= 3 and (root - 3) % 2 == 0:
+        return (root - 3) // 2
+    return None
+
+
+def infer_bkg_poly_order(tpf_or_hdul: Any) -> int | None:
+    """Infer the 2D background polynomial degree ``d`` when ``BKGSUB=True``.
+
+    Checks ``BKG_ORD`` in ``BKG_BASIS``, ``hdu[0]``, and ``hdu[1]`` headers first,
+    then falls back to solving ``P = (d + 1)(d + 2) / 2`` from ``BKG_BASIS`` shape
+    ``(P, ny, nx)``. Returns ``None`` when ``BKGSUB`` is ``False`` or no polynomial
+    background metadata are present.
+    """
+    if not read_bkgsub_state(tpf_or_hdul, warn_legacy_mundey=False):
+        return None
+
+    with _open_hdul_and_mask(tpf_or_hdul, apply_quality_mask=False) as (hdul, _):
+        _validate_halocver(hdul)
+
+        candidate_headers: list[fits.Header] = []
+        if "BKG_BASIS" in hdul:
+            candidate_headers.append(hdul["BKG_BASIS"].header)
+        if len(hdul) > 0:
+            candidate_headers.append(hdul[0].header)
+        if len(hdul) > 1:
+            candidate_headers.append(hdul[1].header)
+
+        orders_found: list[int] = []
+        for hdr in candidate_headers:
+            if "BKG_ORD" in hdr:
+                raw_ord = hdr["BKG_ORD"]
+                if isinstance(raw_ord, bool) or not isinstance(raw_ord, (int, np.integer)) or int(raw_ord) < 0:
+                    raise ValueError(
+                        f"BKG_ORD header card must be a non-negative integer, got {raw_ord!r}."
+                    )
+                orders_found.append(int(raw_ord))
+
+        if orders_found:
+            if len(set(orders_found)) > 1:
+                raise ValueError(f"Conflicting BKG_ORD header cards across HDUs: {orders_found}.")
+            return orders_found[0]
+
+        if "BKG_BASIS" in hdul:
+            basis_raw = hdul["BKG_BASIS"].data
+            if basis_raw is None or basis_raw.ndim != 3 or basis_raw.shape[0] < 1:
+                shape = None if basis_raw is None else basis_raw.shape
+                raise ValueError(
+                    f"BKG_BASIS ImageHDU must be 3D (P, ny, nx) with P >= 1, got shape {shape}."
+                )
+            inferred = _poly_degree_from_basis_count(int(basis_raw.shape[0]))
+            if inferred is None:
+                raise ValueError(
+                    f"Cannot infer 2D polynomial degree d from BKG_BASIS term count "
+                    f"P={basis_raw.shape[0]} without an explicit BKG_ORD header card."
+                )
+            return inferred
+
+        return None
 
 
 def read_bkg_covariance(
@@ -301,7 +379,8 @@ def read_bkg_covariance(
 
     Returns ``None`` if neither ``BKG_CHOL`` (in ``hdu[1]``) nor ``BKG_BASIS``
     (``ImageHDU``) is present, and raises ``ValueError`` if only one of the two
-    is present or if dimensions are inconsistent.
+    is present or if dimensions are inconsistent. All-``NaN`` cadences in
+    ``BKG_CHOL`` unpack to all-``NaN`` ``(P, P)`` slices.
     """
     with _open_hdul_and_mask(tpf_or_hdul, apply_quality_mask=apply_quality_mask) as (
         hdul,
@@ -359,10 +438,17 @@ def read_bkg_covariance(
         if qmask is not None:
             packed = packed[qmask]
 
+        all_nan_cad = np.all(np.isnan(packed), axis=1)
+        active = ~all_nan_cad
+        if np.any(active) and not np.all(np.isfinite(packed[active])):
+            raise ValueError("BKG_CHOL contains non-finite entries in partially valid cadences.")
+
         chol = np.zeros((packed.shape[0], p_dim, p_dim), dtype=np.float64)
         tril_r, tril_c = np.tril_indices(p_dim)
         chol[:, tril_r, tril_c] = packed
-        if np.any(np.diagonal(chol, axis1=1, axis2=2) < 0.0):
+        if np.any(all_nan_cad):
+            chol[all_nan_cad, :, :] = np.nan
+        if np.any(active) and np.any(np.diagonal(chol[active], axis1=1, axis2=2) < 0.0):
             raise ValueError("BKG_CHOL diagonal entries must be non-negative.")
 
         return BkgCovariance(chol=chol, basis=basis)
@@ -386,11 +472,22 @@ def write_lightcurve_fits(
 
     meta = getattr(lc, "meta", None)
     resolved_wmap = weightmap
-    if resolved_wmap is None and isinstance(meta, dict):
-        if "WEIGHTMAP" in meta:
-            resolved_wmap = meta["WEIGHTMAP"]
-        elif "weightmap" in meta:
-            resolved_wmap = meta["weightmap"]
+    resolved_werr = None
+    resolved_splits = None
+    if isinstance(meta, dict):
+        if resolved_wmap is None:
+            if "WEIGHTMAP" in meta:
+                resolved_wmap = meta["WEIGHTMAP"]
+            elif "weightmap" in meta:
+                resolved_wmap = meta["weightmap"]
+        if "WEIGHTMAP_ERR" in meta:
+            resolved_werr = meta["WEIGHTMAP_ERR"]
+        elif "weightmap_err" in meta:
+            resolved_werr = meta["weightmap_err"]
+        if "SPLIT_TIMES" in meta:
+            resolved_splits = meta["SPLIT_TIMES"]
+        elif "split_times" in meta:
+            resolved_splits = meta["split_times"]
 
     lc_export = lc.copy() if hasattr(lc, "copy") else lc
     export_meta = getattr(lc_export, "meta", None)
@@ -398,21 +495,46 @@ def write_lightcurve_fits(
         if export_meta is meta:
             export_meta = dict(meta)
             lc_export.meta = export_meta
-        if resolved_wmap is not None:
-            for key in ("WEIGHTMAP", "weightmap"):
-                export_meta.pop(key, None)
-        if (
-            "TARGETID" not in export_meta
-            and "targetid" not in export_meta
-            and not hasattr(lc_export, "targetid")
+        for key in (
+            "WEIGHTMAP",
+            "weightmap",
+            "WEIGHTMAP_ERR",
+            "weightmap_err",
+            "SPLIT_TIMES",
+            "split_times",
         ):
-            export_meta["TARGETID"] = ""
+            export_meta.pop(key, None)
+        for attr, meta_key in (
+            ("targetid", "TARGETID"),
+            ("channel", "CHANNEL"),
+            ("mission", "MISSION"),
+            ("ra", "RA"),
+            ("dec", "DEC"),
+        ):
+            if (
+                meta_key not in export_meta
+                and attr not in export_meta
+                and not hasattr(lc_export, attr)
+            ):
+                export_meta[meta_key] = "" if attr == "targetid" else None
     if not hasattr(lc_export, "quality") and hasattr(lc_export, "__setitem__"):
         lc_export["quality"] = np.zeros(len(lc_export), dtype=np.int32)
 
     hdul = lc_export.to_fits()
 
     hdul[0].header["HALOCVER"] = (HALOCVER, "Halophot pipeline contract version")
+
+    splits_arr: np.ndarray | None = None
+    if resolved_splits is not None:
+        cand_splits = np.asarray(resolved_splits, dtype=np.float64).ravel()
+        if cand_splits.size > 0:
+            if not np.all(np.isfinite(cand_splits)):
+                raise ValueError("SPLIT_TIMES must contain only finite timestamps.")
+            splits_arr = cand_splits
+            hdul[0].header["NSPLITS"] = (
+                int(splits_arr.size),
+                "Number of segment split timestamps",
+            )
 
     if resolved_wmap is not None:
         if isinstance(resolved_wmap, np.ma.MaskedArray):
@@ -424,10 +546,66 @@ def write_lightcurve_fits(
             )
         if "WEIGHTMAP" in hdul:
             del hdul["WEIGHTMAP"]
-        hdul.append(fits.ImageHDU(data=w_arr, name="WEIGHTMAP"))
+        wmap_hdu = fits.ImageHDU(data=w_arr, name="WEIGHTMAP")
+        if splits_arr is not None:
+            wmap_hdu.header["NSPLITS"] = (
+                int(splits_arr.size),
+                "Number of segment split timestamps",
+            )
+            if splits_arr.size <= 999:
+                for idx_s, st_val in enumerate(splits_arr, start=1):
+                    wmap_hdu.header[f"SPLIT{idx_s:03d}"] = (
+                        float(st_val),
+                        f"Segment split timestamp {idx_s}",
+                    )
+        hdul.append(wmap_hdu)
+
+    if resolved_werr is not None:
+        werr_arr = np.asarray(resolved_werr, dtype=np.float64)
+        if werr_arr.ndim >= 2:
+            if "WEIGHTMAP_ERR" in hdul:
+                del hdul["WEIGHTMAP_ERR"]
+            hdul.append(fits.ImageHDU(data=werr_arr, name="WEIGHTMAP_ERR"))
+
+    if splits_arr is not None:
+        if "SPLIT_TIMES" in hdul:
+            del hdul["SPLIT_TIMES"]
+        split_col = fits.Column(name="SPLIT_TIME", format="D", array=splits_arr)
+        hdul.append(fits.BinTableHDU.from_columns([split_col], name="SPLIT_TIMES"))
 
     hdul.writeto(out_path, overwrite=overwrite)
     return out_path
+
+
+def read_split_times(lc_or_hdul_or_path: Any) -> np.ndarray | None:
+    """Read segment ``SPLIT_TIMES`` from a light curve, FITS ``HDUList``, or path.
+
+    Returns ``None`` when the observation was extracted without segment splits.
+    """
+    meta = getattr(lc_or_hdul_or_path, "meta", None)
+    if isinstance(meta, dict):
+        for key in ("SPLIT_TIMES", "split_times"):
+            if key in meta and meta[key] is not None:
+                arr = np.asarray(meta[key], dtype=np.float64).ravel()
+                return arr if arr.size > 0 else None
+
+    with _open_hdul_and_mask(lc_or_hdul_or_path, apply_quality_mask=False) as (hdul, _):
+        if "SPLIT_TIMES" in hdul and hdul["SPLIT_TIMES"].data is not None:
+            names = [n.upper() for n in (hdul["SPLIT_TIMES"].data.names or ())]
+            if "SPLIT_TIME" in names:
+                arr = np.asarray(hdul["SPLIT_TIMES"].data["SPLIT_TIME"], dtype=np.float64).ravel()
+                return arr if arr.size > 0 else None
+        if "WEIGHTMAP" in hdul and "NSPLITS" in hdul["WEIGHTMAP"].header:
+            n_splits = int(hdul["WEIGHTMAP"].header["NSPLITS"])
+            if n_splits > 0:
+                cards = [
+                    float(hdul["WEIGHTMAP"].header[f"SPLIT{idx_s:03d}"])
+                    for idx_s in range(1, n_splits + 1)
+                    if f"SPLIT{idx_s:03d}" in hdul["WEIGHTMAP"].header
+                ]
+                if len(cards) == n_splits:
+                    return np.asarray(cards, dtype=np.float64)
+        return None
 
 
 def _is_under_fred(path: Path) -> bool:
