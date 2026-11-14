@@ -182,6 +182,7 @@ class HaloObservation(zdx.Base):
     lag: int = eqx.field(static=True, default=1)
     gap_tol: float = eqx.field(static=True, default=0.25)
     user_lambda_phot: float | None = eqx.field(static=True, default=None)
+    user_lambda_z: float | None = eqx.field(static=True, default=None)
 
     @classmethod
     @in_float64
@@ -218,10 +219,16 @@ class HaloObservation(zdx.Base):
             ``z_prior_centre = 0`` for exact *K2* / ``halo-tess`` DR1 reproduction.
         lambda_phot : float, optional
             Photon-noise regularization strength. When ``None`` and ``not legacy_tv``,
-            auto-calibrated to ``0.1 * |V_lag| / max(b_hat^2, median(mean_frac_var))``.
+            auto-calibrated to
+            ``0.1 * |V_lag| * dof_scale / max(b_hat^2, 2.0 * ap_var_floor, 1e-12)``,
+            where ``ap_var_floor = sum_i theta_init_i^2 * mean_frac_var_i`` is the
+            initial-aperture fractional variance floor and
+            ``dof_scale = 1 + 16 * ((M - 1) / |V_lag|)^2`` guards against
+            overfitting white noise when ``M >= |V_lag|``.
         lambda_z : float, optional
             ILR logit-damping strength around uniform-``w`` ``z_init``. Defaults
-            to ``1e-3`` when ``not legacy_tv`` and ``0.0`` when ``legacy_tv=True``.
+            to ``1e-3 * dof_scale`` when ``not legacy_tv`` and ``0.0`` when
+            ``legacy_tv=True``.
         n_pad : int, optional
             Explicit padded time length ``>= N``. Defaults to ``bucket_pad_length(N)``.
         gap_tol : float, default 0.25
@@ -320,6 +327,7 @@ class HaloObservation(zdx.Base):
             lam_phot_val = 0.0
             lam_z_val = 0.0
             user_lam_phot_val: float | None = 0.0
+            user_lam_z_val: float | None = 0.0
         else:
             theta_init = ilr_to_simplex(z_init_j)
             f_init = np.asarray(jnp.dot(theta_init, jnp.asarray(norm_p, dtype=jnp.float64)))
@@ -333,10 +341,17 @@ class HaloObservation(zdx.Base):
                 b_hat_val = max(float(np.std(f_init)), 1e-6)
 
             n_v = max(int(valid_idx.size), 1)
+            dof_ratio = float(m_pix - 1) / max(float(n_v), 1.0) if m_pix > 1 else 0.0
+            # At r = (M - 1) / n_v << 1, 16 * r^2 adds ~3% (leaving thruster-jitter cancellation
+            # unimpaired); as r -> 1, 160 * r^4 = (16 / 0.1) * r^4 compensates the 0.1 prefactor in
+            # lam_phot so simplex tangent curvature prevents white-noise interpolation when M >= N.
+            dof_scale = 1.0 + 16.0 * (dof_ratio**2) + 160.0 * (dof_ratio**4)
             if lambda_phot is None:
-                med_fv = float(np.median(frac_var)) if frac_var.size > 0 else 0.0
-                ref_var = max(b_hat_val**2, med_fv, 1e-12)
-                lam_phot_val = 0.1 * float(n_v) / ref_var
+                ap_var_floor = float(
+                    np.sum(np.square(np.asarray(theta_init, dtype=np.float64)) * frac_var)
+                )
+                ref_var = max(b_hat_val**2, 2.0 * ap_var_floor, 1e-12)
+                lam_phot_val = 0.1 * float(n_v) * dof_scale / ref_var
                 user_lam_phot_val = None
             else:
                 lam_phot_val = float(lambda_phot)
@@ -345,11 +360,13 @@ class HaloObservation(zdx.Base):
                 user_lam_phot_val = lam_phot_val
 
             if lambda_z is None:
-                lam_z_val = 1e-3
+                lam_z_val = 1e-3 * dof_scale
+                user_lam_z_val = None
             else:
                 lam_z_val = float(lambda_z)
                 if lam_z_val < 0.0:
                     raise ValueError(f"lambda_z must be >= 0, got {lambda_z!r}.")
+                user_lam_z_val = lam_z_val
 
         return cls(
             norm_pixels=jnp.asarray(norm_padded, dtype=jnp.float64),
@@ -368,6 +385,7 @@ class HaloObservation(zdx.Base):
             lag=lag_int,
             gap_tol=float(gap_tol),
             user_lambda_phot=user_lam_phot_val,
+            user_lambda_z=user_lam_z_val,
         )
 
     @in_float64
@@ -407,7 +425,7 @@ class HaloObservation(zdx.Base):
         pixel_var_est = np.asarray(self.mean_frac_var) * (old_scale**2)
 
         lam_phot_arg: float | None = 0.0 if legacy_tv else self.user_lambda_phot
-        lam_z_arg: float | None = 0.0 if legacy_tv else float(self.lambda_z)
+        lam_z_arg: float | None = 0.0 if legacy_tv else self.user_lambda_z
 
         return HaloObservation.from_arrays(
             raw_sub,

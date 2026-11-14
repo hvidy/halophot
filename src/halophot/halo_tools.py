@@ -1,4 +1,5 @@
 import functools
+import warnings
 from typing import NamedTuple
 
 import astropy.table
@@ -1175,7 +1176,46 @@ The cuts for Campaign 4 are
 -----------------------------------------------------------------"""
 
 
+_HALO_TPF_DEPRECATION_MSG = (
+    "halo_tpf is deprecated in halophot 2.0 and will be removed in a future release; "
+    "use halophot.extract_halo_lightcurve(tpf, ...) instead."
+)
+_HALO_TPF_TESS_DEPRECATION_MSG = (
+    "halo_tpf_tess is deprecated in halophot 2.0 and will be removed in a future release; "
+    "use halophot.extract_halo_lightcurve(tpf, ...) instead."
+)
+
+
+def _deprecated(message: str):
+    """PEP 702-compatible deprecation decorator supporting Python >= 3.11."""
+
+    def decorator(obj):
+        if isinstance(obj, type):
+            orig_init = obj.__init__
+
+            @functools.wraps(orig_init)
+            def wrapped_init(self, *args, **kwargs):
+                warnings.warn(message, DeprecationWarning, stacklevel=2)
+                orig_init(self, *args, **kwargs)
+
+            obj.__init__ = wrapped_init
+            obj.__deprecated__ = message
+            return obj
+
+        @functools.wraps(obj)
+        def wrapped(*args, **kwargs):
+            warnings.warn(message, DeprecationWarning, stacklevel=2)
+            return obj(*args, **kwargs)
+
+        wrapped.__deprecated__ = message
+        return wrapped
+
+    return decorator
+
+
+@_deprecated(_HALO_TPF_DEPRECATION_MSG)
 class halo_tpf(lightkurve.KeplerTargetPixelFile):
+    @_deprecated(_HALO_TPF_DEPRECATION_MSG)
     def halo(
         self,
         aperture_mask="pipeline",
@@ -1337,7 +1377,9 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
         return weightmap, lc_out
 
 
+@_deprecated(_HALO_TPF_TESS_DEPRECATION_MSG)
 class halo_tpf_tess(lightkurve.TessTargetPixelFile):
+    @_deprecated(_HALO_TPF_TESS_DEPRECATION_MSG)
     def halo(
         self,
         aperture_mask="pipeline",

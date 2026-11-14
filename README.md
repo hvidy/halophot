@@ -46,14 +46,20 @@ lc = halophot.extract_halo_lightcurve(
 )
 # Save HLSP FITS with lossless WEIGHTMAP ImageHDU and coherent flux_err
 halophot.write_fits(lc, "target_halo_lc.fits")
+
+# Reload light curve and pixel weightmap (do NOT use lc.to_fits(), which drops HALOCVER=1 extensions)
+lc_reloaded = lk.read("target_halo_lc.fits")
+wmap = halophot.read_weightmap("target_halo_lc.fits")
 ```
+
+> **Note:** Always use `halophot.write_fits(lc, path)` and `halophot.read_weightmap(path)` (plus `halophot.read_split_times(path)` when `split_times` is used) rather than `lc.to_fits(path)`. Lightkurve's built-in `to_fits()` omits the `HALOCVER = 1` extensions (`WEIGHTMAP`, `WEIGHTMAP_ERR`, `SPLIT_TIMES`), provenance header cards, and unnormalized `e-/s` flux units.
 
 Key v2.0 features:
 
 - **Convex Charnes–Cooper + ILR Simplex Core**: `HaloWeights(zdx.Base)` isolates `z_ilr` as its sole differentiable leaf, optimized in locally scoped `float64` precision via `optimistix.LBFGS` (or `zodiax.optimisation` with rank-guarded eigen-projection) without mutating global `jax_enable_x64`.
 - **Gap-Aware Charbonnier TV & $\mathcal{O}(N)$ `tv_exp`**: Smooth Charbonnier total variation strictly masks spacecraft downlink and safe-mode gaps, while `jax.lax.scan` evaluates multi-lag `tv_exp` in `< 10 MB` RAM even on 20-second *TESS* sectors.
 - **Sky-Dilution Guard & Unified Coherent `flux_err`**: Automatically excludes `PIXEL_QUALITY` strap, bleed, unresolved-smear, background-star, and `BKG_USED` pixels ($\Omega_{\text{halo}} \cap \Omega_{\text{bg}} = \emptyset$), enforces $\bar{P}_i \ge 2\,\operatorname{median}_t(B_{i,t})$ and $\operatorname{SNR}_i \ge 5$, and propagates pixel, column-orthogonalized `SMEAR_ERR`, and `BKG_CHOL` / `BKG_BASIS` uncertainties without double-counting. Pass `legacy_tv=True` to reproduce unregularized *K2* / `halo-tess` DR1 weights.
-- **HPC Templates**: Slurm array and Apptainer recipes for Swinburne Ngarrgu Tindebeek (`tooarrana`) are provided in `hpc/`.
+- **HPC Templates**: Root-mapped Apptainer (`halo.sif` via `hpc/virgil_halophot.def` and `hpc/build_halo_sif.sbatch`) and CPU/A100 Slurm templates (`hpc/halophot_survey_cpu.sbatch`, `hpc/halophot_survey_gpu.sbatch`) for Swinburne Ngarrgu Tindebeek (`tooarrana` / `trevor`) are provided in `hpc/`.
 
 ### Command-line usage
 
@@ -62,6 +68,28 @@ Call `halo` from the command line as, e.g.
 `halo ktwo200007768-c04_lpd-targ.fits --data-dir /path/to/data/directory/ --name Atlas -c 4 --do-plot`
 
 where `--name` is the star name you would like to save the outputs under, and `-c` is the campaign. Add `--hlsp-fits` (and `--offline --strict-hpc` on HPC clusters) to emit `HALOCVER = 1` `lightkurve` FITS files with `WEIGHTMAP` extensions.
+
+### Swinburne NT / OzSTAR HPC usage
+
+1. **Build the single-inode `halo.sif` container on `trevor`** (internet access required for Docker Hub, PyPI, and GitHub):
+   ```bash
+   mkdir -p "$SCRATCH/logs"
+   sbatch hpc/build_halo_sif.sbatch
+   ```
+   `hpc/virgil_halophot.def` builds directly on `python:3.12.7-bookworm` with zero `apt-get` calls so `apptainer build --fakeroot --ignore-fakeroot-command` succeeds inside OzSTAR/NT's root-mapped user namespace. The job stages its layer cache and rootfs under `$SCRATCH/apptainer/build-$SLURM_JOB_ID`, smoke-tests CPU imports (`jax`, `mundey`, `tessbkgd`, `halophot`), writes `$MYFRED/containers/halo-YYYYMMDD.sif` plus `.sha256`, and updates the `$MYFRED/containers/halo.sif` symlink (consuming a single inode on `/fred`). Measured on Swinburne NT `trevor` (Slurm job `20702665`, including a Sirius Sector 6 `mundey` -> `tessbkgd` -> `halophot` smoke test): `19m 03s` wall time and `2.05 GiB` MaxRSS (`#SBATCH --time=00:45:00`, `--mem=8G`).
+
+2. **Run CPU array or A100 GPU survey jobs on `tooarrana`**:
+   ```bash
+   mkdir -p "$SCRATCH/logs"
+   # Default: pre-calibrated SPOC, K2, or HALOCVER=1 TPFs (PIPELINE_MODE=halophot_only)
+   sbatch hpc/halophot_survey_cpu.sbatch
+   sbatch hpc/halophot_survey_gpu.sbatch
+
+   # End-to-end 3-package pass on raw MAST _tp.fits after Stage-1 `mundey prefetch`
+   sbatch --export=ALL,PIPELINE_MODE=full_e2e hpc/halophot_survey_cpu.sbatch
+   sbatch --export=ALL,PIPELINE_MODE=full_e2e hpc/halophot_survey_gpu.sbatch
+   ```
+   Both survey scripts use `set -eo pipefail` (avoiding `-u` failures when Lmod's `module -q load apptainer` inspects unset `PS1`), redirect `APPTAINER_CACHEDIR` and `APPTAINER_TMPDIR` onto `$SCRATCH` / `$JOBFS` (keeping `/home` untouched), default `SIF` to `$MYFRED/containers/halo.sif`, write Slurm logs under `/aphid/scratch-3month/%u/logs/`, and archive per-task products into single-inode `.tar` files on `/fred`. When `PIPELINE_MODE=full_e2e` is set, each target executes `mundey.recalibrate_tpf(..., offline=True, strict_hpc=True)` -> `tessbkgd.subtract_background(...)` -> `halophot.extract_halo_lightcurve(...)` -> `halophot.write_fits(...)` in one pass (override smear mode via `MUNDEY_SMEAR`, default `automatic`).
 
 ## Licence
 
