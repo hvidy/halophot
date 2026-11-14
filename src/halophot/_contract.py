@@ -23,6 +23,7 @@ from enum import IntFlag
 from pathlib import Path
 from typing import Any, NamedTuple
 
+import astropy.units as u
 import numpy as np
 from astropy.io import fits
 
@@ -461,12 +462,15 @@ def write_lightcurve_fits(
     *,
     overwrite: bool = True,
 ) -> Path:
-    """Serialize a ``lightkurve.LightCurve`` to FITS with a lossless ``WEIGHTMAP`` ``ImageHDU``.
+    """Serialize a ``lightkurve.LightCurve`` to FITS with lossless ``HALOCVER = 1`` extensions.
 
-    ``LightCurve.to_fits()`` drops 2D/3D ``ndarray`` entries from ``lc.meta``.
-    This writer preserves ``lc.meta['WEIGHTMAP']`` (or an explicit ``weightmap``
-    argument) in an appended ``ImageHDU(name='WEIGHTMAP')`` while leaving the
-    in-memory ``lc.meta`` dictionary untouched.
+    ``LightCurve.to_fits()`` drops 2D/3D ``ndarray`` entries from ``lc.meta``, omits
+    ``HALOCVER = 1`` provenance headers, and loses physical ``e-/s`` units when
+    ``normalize=False``. Always use :func:`halophot.write_fits` (alias for
+    ``write_lightcurve_fits``) and :func:`halophot.read_weightmap` instead of
+    ``lc.to_fits(path)`` to preserve ``WEIGHTMAP``, ``WEIGHTMAP_ERR``, ``SPLIT_TIMES``,
+    provenance header cards (``BKGSUB``, ``BKG_ORD``, ``HALO_OBJ``, ``HALO_LAG``,
+    ``LEGACYTV``), and physical ``TUNIT`` columns while leaving ``lc.meta`` untouched.
     """
     out_path = Path(path)
 
@@ -504,25 +508,103 @@ def write_lightcurve_fits(
             "split_times",
         ):
             export_meta.pop(key, None)
-        for attr, meta_key in (
-            ("targetid", "TARGETID"),
-            ("channel", "CHANNEL"),
-            ("mission", "MISSION"),
-            ("ra", "RA"),
-            ("dec", "DEC"),
+        # Ensure TARGETID/MISSION have string defaults (avoiding literal 'None' OBJECT cards),
+        # and satisfy KeplerLightCurve.to_fits() mandatory self.<attr> lookups when unpopulated.
+        if (
+            "TARGETID" not in export_meta
+            and "targetid" not in export_meta
+            and getattr(lc_export, "targetid", None) is None
         ):
+            export_meta["TARGETID"] = ""
+        cls_name = type(lc_export).__name__
+        if (
+            cls_name == "TessLightCurve"
+            and "MISSION" not in export_meta
+            and "mission" not in export_meta
+            and getattr(lc_export, "mission", None) is None
+        ):
+            export_meta["MISSION"] = "TESS"
+        elif cls_name == "KeplerLightCurve":
             if (
-                meta_key not in export_meta
-                and attr not in export_meta
-                and not hasattr(lc_export, attr)
+                "MISSION" not in export_meta
+                and "mission" not in export_meta
+                and getattr(lc_export, "mission", None) is None
             ):
-                export_meta[meta_key] = "" if attr == "targetid" else None
+                export_meta["MISSION"] = "Kepler"
+            for attr, meta_key in (("channel", "CHANNEL"), ("ra", "RA"), ("dec", "DEC")):
+                if (
+                    meta_key not in export_meta
+                    and attr not in export_meta
+                    and not hasattr(lc_export, attr)
+                ):
+                    export_meta[meta_key] = None
     if not hasattr(lc_export, "quality") and hasattr(lc_export, "__setitem__"):
         lc_export["quality"] = np.zeros(len(lc_export), dtype=np.int32)
 
     hdul = lc_export.to_fits()
 
+    if str(hdul[0].header.get("OBJECT", "")).strip() == "None":
+        hdul[0].header["OBJECT"] = ""
+    if str(hdul[0].header.get("INSTRUME", "")).strip() == "None":
+        del hdul[0].header["INSTRUME"]
+
+    telescop = str(hdul[0].header.get("TELESCOP", "") or "").strip().upper()
+    if not telescop and str(getattr(lc, "mission", "") or "").strip().upper() == "TESS":
+        hdul[0].header["TELESCOP"] = ("TESS", "Telescope")
+        telescop = "TESS"
+    instrume_curr = hdul[0].header.get("INSTRUME")
+    if telescop == "TESS" and (
+        instrume_curr is None or str(instrume_curr).strip() in ("", "None")
+    ):
+        hdul[0].header["INSTRUME"] = ("TESS Photometer", "Instrument name")
+
     hdul[0].header["HALOCVER"] = (HALOCVER, "Halophot pipeline contract version")
+    if isinstance(meta, dict):
+        if meta.get("BKGSUB") is not None:
+            hdul[0].header["BKGSUB"] = (
+                bool(meta["BKGSUB"]),
+                "Whether 2D background has been subtracted",
+            )
+        if meta.get("BKG_ORD") is not None:
+            hdul[0].header["BKG_ORD"] = (
+                int(meta["BKG_ORD"]),
+                "Polynomial background degree",
+            )
+        if meta.get("HALO_OBJ") is not None:
+            hdul[0].header["HALO_OBJ"] = (
+                str(meta["HALO_OBJ"]),
+                "Halophot objective function",
+            )
+        if meta.get("HALO_LAG") is not None:
+            hdul[0].header["HALO_LAG"] = (
+                int(meta["HALO_LAG"]),
+                "Halophot lag cadence step",
+            )
+        if meta.get("LEGACYTV") is not None:
+            hdul[0].header["LEGACYTV"] = (
+                bool(meta["LEGACYTV"]),
+                "Whether legacy unregularized TV was used",
+            )
+
+    flux_unit = getattr(getattr(lc, "flux", None), "unit", None)
+    if (
+        flux_unit is not None
+        and flux_unit != u.dimensionless_unscaled
+        and len(hdul) > 1
+        and hasattr(hdul[1], "columns")
+    ):
+        if flux_unit == u.electron / u.s or str(flux_unit).strip() in (
+            "electron / s",
+            "electron/s",
+            "e-/s",
+        ):
+            unit_str = "e-/s"
+        else:
+            unit_str = flux_unit.to_string("fits")
+        for idx_col, col in enumerate(hdul[1].columns, start=1):
+            if col.name.upper() in ("FLUX", "FLUX_ERR"):
+                col.unit = unit_str
+                hdul[1].header[f"TUNIT{idx_col}"] = unit_str
 
     splits_arr: np.ndarray | None = None
     if resolved_splits is not None:
@@ -577,6 +659,26 @@ def write_lightcurve_fits(
     return out_path
 
 
+def read_weightmap(lc_or_hdul_or_path: Any) -> np.ndarray | None:
+    """Read the 2D ``(ny, nx)`` or 3D ``(n_splits, ny, nx)`` ``WEIGHTMAP`` from a light curve or FITS file.
+
+    Returns ``None`` when no ``WEIGHTMAP`` metadata or ``ImageHDU`` is present.
+    """
+    meta = getattr(lc_or_hdul_or_path, "meta", None)
+    if isinstance(meta, dict):
+        for key in ("WEIGHTMAP", "weightmap"):
+            if key in meta and meta[key] is not None:
+                val = meta[key]
+                if isinstance(val, np.ma.MaskedArray):
+                    val = val.filled(np.nan)
+                return np.asarray(val, dtype=np.float64)
+
+    with _open_hdul_and_mask(lc_or_hdul_or_path, apply_quality_mask=False) as (hdul, _):
+        if "WEIGHTMAP" in hdul and hdul["WEIGHTMAP"].data is not None:
+            return np.asarray(hdul["WEIGHTMAP"].data, dtype=np.float64)
+        return None
+
+
 def read_split_times(lc_or_hdul_or_path: Any) -> np.ndarray | None:
     """Read segment ``SPLIT_TIMES`` from a light curve, FITS ``HDUList``, or path.
 
@@ -621,31 +723,48 @@ def _is_under_fred(path: Path) -> bool:
 def resolve_cache_dir(
     cache_dir: str | os.PathLike[str] | None = None,
     *,
-    strict_hpc: bool = False,
+    strict_hpc: bool = True,
+    create: bool = False,
 ) -> Path:
-    """Resolve the package cache directory, guarding ``/fred`` inode quotas in HPC mode.
+    """Resolve the package cache directory, guarding ``/fred/`` inode quotas on HPC.
 
     Precedence when ``cache_dir`` is ``None``:
-    1. ``$SCRATCH/.cache/tess_bright`` if ``SCRATCH`` is set and non-empty.
-    2. ``$XDG_CACHE_HOME/tess_bright`` if ``XDG_CACHE_HOME`` is set and non-empty.
-    3. ``~/.cache/tess_bright``.
+    1. ``$HALOPHOT_CACHE_DIR`` if set and non-empty.
+    2. ``$TESS_BRIGHT_CACHE_DIR`` if set and non-empty.
+    3. ``$SCRATCH/.cache/tess_bright`` if ``SCRATCH`` is set and non-empty.
+    4. ``$XDG_CACHE_HOME/tess_bright`` if ``XDG_CACHE_HOME`` is set and non-empty.
+    5. ``~/.cache/tess_bright``.
 
-    When ``strict_hpc=True``, raises ``ValueError`` if the resolved path points
-    to or inside ``/fred/`` (protecting Swinburne NT / OzSTAR project inode caps).
+    Symlinks are resolved via ``Path.resolve(strict=False)`` before checking
+    ``/fred/``. When ``strict_hpc=True`` (the default), raises :class:`ValueError`
+    if the resolved path points to or inside ``/fred/``; when ``strict_hpc=False``,
+    emits a :class:`UserWarning`. When ``create=True``, creates the resolved
+    directory with ``parents=True, exist_ok=True``.
     """
     if cache_dir is not None:
-        resolved = Path(cache_dir).expanduser()
-    elif os.environ.get("SCRATCH"):
-        resolved = Path(os.environ["SCRATCH"]).expanduser() / ".cache" / "tess_bright"
-    elif os.environ.get("XDG_CACHE_HOME"):
-        resolved = Path(os.environ["XDG_CACHE_HOME"]).expanduser() / "tess_bright"
+        raw = Path(cache_dir).expanduser()
+    elif os.environ.get("HALOPHOT_CACHE_DIR", "").strip():
+        raw = Path(os.environ["HALOPHOT_CACHE_DIR"].strip()).expanduser()
+    elif os.environ.get("TESS_BRIGHT_CACHE_DIR", "").strip():
+        raw = Path(os.environ["TESS_BRIGHT_CACHE_DIR"].strip()).expanduser()
+    elif os.environ.get("SCRATCH", "").strip():
+        raw = Path(os.environ["SCRATCH"].strip()).expanduser() / ".cache" / "tess_bright"
+    elif os.environ.get("XDG_CACHE_HOME", "").strip():
+        raw = Path(os.environ["XDG_CACHE_HOME"].strip()).expanduser() / "tess_bright"
     else:
-        resolved = Path.home() / ".cache" / "tess_bright"
+        raw = Path.home() / ".cache" / "tess_bright"
 
-    if strict_hpc and _is_under_fred(resolved):
-        raise ValueError(
-            f"Cache directory {resolved} lies under /fred/, which is forbidden in "
-            "strict_hpc=True mode to protect project inode quotas; use $SCRATCH or $JOBFS."
+    resolved = raw.resolve(strict=False)
+    if _is_under_fred(raw) or resolved.parts[:2] == ("/", "fred"):
+        msg = (
+            f"Cache directory {resolved} lies under /fred/, which violates "
+            "Swinburne NT/OzSTAR project inode quotas; use $SCRATCH or $JOBFS instead."
         )
+        if strict_hpc:
+            raise ValueError(msg)
+        warnings.warn(msg, UserWarning, stacklevel=2)
+
+    if create:
+        resolved.mkdir(parents=True, exist_ok=True)
 
     return resolved

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import warnings
 from pathlib import Path
 
 import equinox as eqx
@@ -18,6 +19,7 @@ from halophot.objectives import (
     AVAILABLE_OBJECTIVES,
     charbonnier_penalty,
     halo_objective,
+    photon_noise_penalty,
     tv_charbonnier_o2,
     tv_exp_scan,
 )
@@ -486,3 +488,84 @@ def test_lambda_phot_subset_zero_mean_legacy_and_sigclip_jackknife_fixes() -> No
     nb_path = Path(__file__).resolve().parents[1] / "docs" / "notebooks" / "aldebaran.ipynb"
     nb_data = json.loads(nb_path.read_text(encoding="utf-8"))
     assert "extract_halo_lightcurve" in "".join(nb_data["cells"][0]["source"])
+
+
+def test_lambda_phot_aperture_floor_invariance_and_m_over_n_guard() -> None:
+    """Verify [HALO-03]: aperture-floor M-invariance, M >= 0.5*|V_ell| warning, and short-segment pull calibration."""
+    with jax.enable_x64(True):
+        # 1. Splitting constant total flux/variance across M=4 vs M=36 pixels keeps
+        # photon_noise_penalty invariant up to dof_scale (no 1/M under-regularization).
+        n_quiet = 200
+        t_quiet = np.arange(n_quiet, dtype=np.float64) * 0.02
+        penalties_over_dof: dict[int, float] = {}
+        raw_penalties: dict[int, float] = {}
+        for m_pix in (4, 36):
+            p_m = np.full((m_pix, n_quiet), 3600.0 / m_pix, dtype=np.float64)
+            pvar_m = np.full((m_pix, n_quiet), 36.0 / m_pix, dtype=np.float64)
+            obs_m = HaloObservation.from_arrays(p_m, t_quiet, pixel_var=pvar_m)
+            theta_init_m = jnp.full((m_pix,), 1.0 / m_pix, dtype=jnp.float64)
+            pen_m = float(photon_noise_penalty(theta_init_m, obs_m))
+            r_m = float(m_pix - 1) / float(n_quiet - 1)
+            dof_scale_m = 1.0 + 16.0 * (r_m**2) + 160.0 * (r_m**4)
+            raw_penalties[m_pix] = pen_m
+            penalties_over_dof[m_pix] = pen_m / dof_scale_m
+
+        assert raw_penalties[36] > raw_penalties[4]
+        assert penalties_over_dof[4] == pytest.approx(0.025 * (n_quiet - 1), rel=1e-9)
+        assert penalties_over_dof[36] == pytest.approx(0.025 * (n_quiet - 1), rel=1e-9)
+
+        # 2. UserWarning emitted iff M >= 0.5 * |V_ell| (for M > 1).
+        rng_warn = np.random.default_rng(20261114)
+        with pytest.warns(UserWarning, match="elevated degrees of freedom"):
+            optimise_halo(
+                rng_warn.uniform(80.0, 120.0, size=(20, 36)),
+                np.arange(36, dtype=np.float64) * 0.02,
+                maxiter=25,
+            )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            optimise_halo(
+                rng_warn.uniform(80.0, 120.0, size=(8, 60)),
+                np.arange(60, dtype=np.float64) * 0.02,
+                maxiter=25,
+            )
+        assert not any("elevated degrees of freedom" in str(w.message) for w in caught)
+
+        # 3. Short segment (N=36, M=45) with pulsation + transit + shot/sky noise:
+        # auto-calibrated dof_scale prevents simplex white-noise interpolation.
+        n_short, m_large = 36, 45
+        t_short = np.arange(n_short, dtype=np.float64) * (30.0 / 1440.0)
+        s_true = (
+            1.0
+            + 0.008 * np.sin(2.0 * np.pi * t_short / 0.25)
+            - 0.012 * ((t_short > 0.30) & (t_short < 0.42)).astype(np.float64)
+        )
+
+        guarded_pulls: list[float] = []
+        unguarded_pulls: list[float] = []
+        for seed in range(8):
+            rng = np.random.default_rng(9100 + seed)
+            f0 = rng.uniform(80.0, 300.0, size=(m_large, 1))
+            pvar = np.broadcast_to(f0 + 25.0, (m_large, n_short)).copy()
+            p_mn = f0 * s_true[None, :] + rng.normal(0.0, np.sqrt(pvar))
+
+            with pytest.warns(UserWarning, match="elevated degrees of freedom"):
+                fit_g = optimise_halo(p_mn, t_short, pixel_var=pvar, maxiter=151)
+                fit_u = optimise_halo(
+                    p_mn,
+                    t_short,
+                    pixel_var=pvar,
+                    lambda_phot=0.0,
+                    lambda_z=1e-3,
+                    maxiter=151,
+                )
+
+            for fit_res, bucket in ((fit_g, guarded_pulls), (fit_u, unguarded_pulls)):
+                w_vec = fit_res.physical_weights
+                raw_true = float(w_vec @ f0[:, 0]) * s_true
+                raw_sig = np.sqrt((w_vec**2) @ pvar)
+                pull = (fit_res.raw_flux - raw_true) / raw_sig
+                bucket.append(float(np.std(pull, ddof=1)))
+
+        assert float(np.mean(guarded_pulls)) >= 0.90
+        assert float(np.mean(unguarded_pulls)) < 0.72

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+import lightkurve as lk
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
@@ -370,23 +371,41 @@ def test_halo_tpf_tess_and_time_scale_preservation(
     tess_path = tmp_path / "synth_tess_tpf.fits"
     stellar = _write_synthetic_tess_tpf(tess_path, n_cad=60, ny=4, nx=5)
 
-    ttpf = halo_tpf_tess(str(tess_path))
+    with pytest.warns(DeprecationWarning, match="extract_halo_lightcurve"):
+        ttpf = halo_tpf_tess(str(tess_path))
     capsys.readouterr()  # Clear any upstream lightkurve open output
-    meta_tess, lc_tess = ttpf.halo(
-        aperture_mask="all",
-        rr=(0.5, 5.0),
-        thresh=0.8,
-        minflux=10.0,
-        maxiter=35,
-        sigclip=False,
-        verbose=False,
-    )
+    with pytest.warns(DeprecationWarning, match="extract_halo_lightcurve"):
+        meta_tess, lc_tess = ttpf.halo(
+            aperture_mask="all",
+            rr=(0.5, 5.0),
+            thresh=0.8,
+            minflux=10.0,
+            maxiter=35,
+            sigclip=False,
+            verbose=False,
+        )
     assert capsys.readouterr().out == ""
     assert lc_tess.time.format == ttpf.time.format
     assert lc_tess.time.scale == ttpf.time.scale == "tdb"
     assert meta_tess["weightmap"].shape == (5, 4)
     flux_vals = np.asarray(lc_tess.flux.value, dtype=np.float64)
     np.testing.assert_allclose(flux_vals, stellar / np.median(stellar), atol=1e-2)
+
+    # Verify v1 __class__ mutation idiom also emits DeprecationWarning ([HALO-05])
+    tpf_mut = lk.read(str(tess_path))
+    tpf_mut.__class__ = halo_tpf_tess
+    with pytest.warns(DeprecationWarning, match="extract_halo_lightcurve"):
+        meta_mut, lc_mut = tpf_mut.halo(
+            aperture_mask="all",
+            rr=(0.5, 5.0),
+            thresh=0.8,
+            minflux=10.0,
+            maxiter=15,
+            sigclip=False,
+            verbose=False,
+        )
+    assert meta_mut["weightmap"].shape == (5, 4)
+    assert lc_mut.time.scale == "tdb"
 
     # Verify split_times propagates per-segment weightmaps and segment-local medians into flux_err:
     # rescale the second half of FLUX by 4x while keeping FLUX_ERR constant so segment 1 has 4x smaller
@@ -397,18 +416,20 @@ def test_halo_tpf_tess_and_time_scale_preservation(
         hdul_sp[1].data["FLUX"][30:] *= 4.0
         hdul_sp.flush()
 
-    ttpf_sp = halo_tpf_tess(str(tess_split_path))
+    with pytest.warns(DeprecationWarning, match="extract_halo_lightcurve"):
+        ttpf_sp = halo_tpf_tess(str(tess_split_path))
     t_mid = 0.5 * float(ttpf_sp.time.value[29] + ttpf_sp.time.value[30])
-    meta_sp, lc_sp = ttpf_sp.halo(
-        aperture_mask="all",
-        rr=(0.5, 5.0),
-        split_times=[t_mid],
-        thresh=0.8,
-        minflux=10.0,
-        maxiter=35,
-        sigclip=False,
-        verbose=False,
-    )
+    with pytest.warns(DeprecationWarning, match="extract_halo_lightcurve"):
+        meta_sp, lc_sp = ttpf_sp.halo(
+            aperture_mask="all",
+            rr=(0.5, 5.0),
+            split_times=[t_mid],
+            thresh=0.8,
+            minflux=10.0,
+            maxiter=35,
+            sigclip=False,
+            verbose=False,
+        )
     assert meta_sp["weightmaps"].shape == (2, 5, 4)
     err_sp = np.asarray(lc_sp.flux_err.value, dtype=np.float64)
     assert np.all(np.isfinite(err_sp))
@@ -445,20 +466,22 @@ def test_read_epic_mast_fits_and_cli_smoke(
         hdul[1].data = sub_data
         hdul.writeto(mini_tpf_path, overwrite=True)
 
-    htpf = halo_tpf(str(mini_tpf_path))
+    with pytest.warns(DeprecationWarning, match="extract_halo_lightcurve"):
+        htpf = halo_tpf(str(mini_tpf_path))
     # Explicitly verify scale="tdb" preservation even when time format is "jd"
     jd_tdb = Time(htpf.time.jd, format="jd", scale="tdb")
     assert jd_tdb.scale == "tdb"
     capsys.readouterr()
-    meta, lc_out = htpf.halo(
-        aperture_mask="all",
-        rr=(1.0, 4.0),
-        thresh=0.8,
-        minflux=100.0,
-        maxiter=15,
-        sigclip=False,
-        verbose=False,
-    )
+    with pytest.warns(DeprecationWarning, match="extract_halo_lightcurve"):
+        meta, lc_out = htpf.halo(
+            aperture_mask="all",
+            rr=(1.0, 4.0),
+            thresh=0.8,
+            minflux=100.0,
+            maxiter=15,
+            sigclip=False,
+            verbose=False,
+        )
     assert capsys.readouterr().out == ""
     assert lc_out.time.scale == htpf.time.scale == "tdb"
     assert "weightmap" in meta

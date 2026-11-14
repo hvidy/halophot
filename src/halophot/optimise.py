@@ -15,6 +15,7 @@ Provides:
 from __future__ import annotations
 
 import functools
+import warnings
 from dataclasses import dataclass
 
 import equinox as eqx
@@ -573,6 +574,17 @@ def optimise_halo(
         raise ValueError(
             f"Objective {objective!r} with lag={obs.lag} requires at least {min_req} cadences, "
             f"got {n_valid}."
+        )
+
+    m_pix = pix_np.shape[0]
+    n_valid_diffs = int(jnp.sum(obs.valid_diff_mask))
+    if m_pix > 1 and m_pix >= 0.5 * n_valid_diffs:
+        warnings.warn(
+            f"Active halo pixel count M={m_pix} approaches or exceeds valid cadence "
+            f"differences N_valid={n_valid_diffs} (M >= 0.5 * N_valid); simplex weights "
+            "have elevated degrees of freedom relative to cadence constraints.",
+            UserWarning,
+            stacklevel=2,
         )
 
     if w_init is None:

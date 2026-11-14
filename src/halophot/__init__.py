@@ -21,6 +21,7 @@ from ._contract import (
     read_pixel_quality,
     read_smear_err,
     read_split_times,
+    read_weightmap,
     resolve_cache_dir,
     write_lightcurve_fits,
 )
@@ -120,6 +121,7 @@ __all__ = [
     "read_pixel_quality",
     "read_smear_err",
     "read_split_times",
+    "read_weightmap",
     "remove_stars",
     "resolve_cache_dir",
     "run_in",

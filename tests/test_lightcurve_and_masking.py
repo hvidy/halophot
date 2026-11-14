@@ -740,3 +740,95 @@ def test_end_to_end_real_k2_tpf_and_epic_mast_fits(tmp_path: Path) -> None:
         assert hdul_cli["WEIGHTMAP"].data.shape == (2, ny_k2, nx_k2)
         assert "SPLIT_TIMES" in hdul_cli
         assert len(hdul_cli["SPLIT_TIMES"].data) == 1
+
+
+def test_cli_hlsp_fits_faint_tess_wings_campaign_guard_and_sector_title(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify [HALO-01]: halo --hlsp-fits preserves <100 e-/s TESS wings, ignores K2 -c cuts on TESS, and labels S07."""
+    rng = np.random.default_rng(70707)
+    n_cad, ny, nx = 64, 5, 5
+    t_rel = np.arange(n_cad, dtype=np.float64) * (2.0 / 1440.0)
+    stellar = 1.0 + 0.012 * np.sin(2.0 * np.pi * t_rel / 0.04)
+    jitter = 0.06 * ((np.arange(n_cad) % 11) / 10.0 - 0.5)
+
+    flux = np.zeros((n_cad, ny, nx), dtype=np.float64)
+    for r in range(ny):
+        for c in range(nx):
+            sens = (c - 2.0) / 2.0
+            wing_level = 45.0 + 8.0 * r + 3.0 * c  # 45..89 e-/s (< 100 e-/s legacy K2 cutoff!)
+            flux[:, r, c] = wing_level * stellar * (1.0 + sens * jitter) + rng.normal(
+                0.0, 0.25, size=n_cad
+            )
+    # Single saturated core pixel (> TESS_SAT_RATE_E_PER_S) so saturated-column masking triggers cleanly
+    flux[:, 2, 2] = 2.0e5 * stellar
+    flux_err = np.full_like(flux, 0.25)
+    flux_bkg = np.full_like(flux, 30.0)
+    pq = np.zeros((ny, nx), dtype=np.int32)
+    pq[:, 2] = int(PixelQuality.SAT_BLEED)
+
+    tpf_path = tmp_path / "tess_s07_faint_wings_tpf.fits"
+    _build_synthetic_halocver_tpf_file(
+        tpf_path,
+        flux=flux,
+        flux_err=flux_err,
+        flux_bkg=flux_bkg,
+        pixel_quality=pq,
+        bkgsub=True,
+    )
+    # Set SECTOR = 7; note TIME starts at BTJD 2000.0 (< 2470.0), which K2 Campaign 7 cut would wipe out!
+    with fits.open(tpf_path, mode="update") as hdul_upd:
+        hdul_upd[0].header["SECTOR"] = 7
+        hdul_upd.flush()
+
+    tpf_lk = lk.read(str(tpf_path))
+    lc_py = extract_halo_lightcurve(tpf_lk, maxiter=151, offline=True)
+
+    recorded_titles: list[str] = []
+    orig_plot_all = cli.plot_all
+
+    def _spy_plot_all(*args: object, **kwargs: object) -> object:
+        recorded_titles.append(str(kwargs.get("formal_name", "")))
+        return orig_plot_all(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "plot_all", _spy_plot_all)
+
+    cache_dir = tmp_path / "cli_s07_cache"
+    out_dir = tmp_path / "cli_s07_out"
+    out_dir.mkdir()
+    cli.main(
+        [
+            str(tpf_path),
+            "--hlsp-fits",
+            "-c",
+            "7",
+            "-maxiter",
+            "151",
+            "--do-plot",
+            "--name",
+            "alf_CMa",
+            "--offline",
+            "--strict-hpc",
+            "--cache-dir",
+            str(cache_dir),
+            "--quiet",
+            "--save-dir",
+            str(out_dir),
+        ]
+    )
+
+    cli_fits = out_dir / "alf_CMa_halo_lc_tv.fits"
+    assert cli_fits.exists()
+    lc_cli = lk.read(str(cli_fits))
+    assert len(lc_cli) == n_cad == len(lc_py)
+    np.testing.assert_allclose(lc_cli.flux.value, lc_py.flux.value, rtol=1e-5, atol=1e-6)
+
+    wmap_cli = halophot.read_weightmap(cli_fits)
+    wmap_py = halophot.read_weightmap(lc_py)
+    assert wmap_cli is not None and wmap_py is not None
+    assert int(np.sum(wmap_cli > 0.0)) >= 12  # Faint <100 e-/s halo wings preserved!
+    assert int(np.sum(wmap_cli > 0.0)) == int(np.sum(wmap_py > 0.0))
+    np.testing.assert_allclose(wmap_cli, wmap_py, rtol=1e-5, atol=1e-6)
+    assert len(recorded_titles) == 1
+    assert recorded_titles[0].endswith(" - S07")

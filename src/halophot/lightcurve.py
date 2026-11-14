@@ -409,6 +409,15 @@ def extract_halo_lightcurve(
     normalize : bool, default True
         When ``True``, returns unit-mean dimensionless relative ``flux`` and
         ``flux_err`` (Eq. 6.4.1). When ``False``, preserves ``tpf.flux.unit``.
+
+    Notes
+    -----
+    Always serialize returned light curves with :func:`halophot.write_fits`
+    (alias for :func:`halophot.write_lightcurve_fits`) and reload pixel weights
+    with :func:`halophot.read_weightmap` (and split boundaries with
+    :func:`halophot.read_split_times`). Calling ``lc.to_fits(path)`` directly
+    drops ``HALOCVER = 1`` extensions (``WEIGHTMAP``, ``WEIGHTMAP_ERR``,
+    ``SPLIT_TIMES``) and provenance cards.
     """
     tpf_obj = _coerce_tpf(tpf)
     if isinstance(sub, bool) or int(sub) < 1:
