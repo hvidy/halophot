@@ -1,5 +1,0 @@
-exclude data/*.fits.gz
-exclude notebooks/*
-exclude *.ipynb
-exclude *.fits
-exclude experiments/*

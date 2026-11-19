@@ -1,0 +1,24 @@
+# Virtual environments & local agent state
+.venv/
+.claude/
+
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+
+# Packaging & build artefacts
+*.egg-info/
+dist/
+build/
+
+# Test & coverage outputs
+junit/
+.coverage
+coverage.xml
+htmlcov/
+
+# OS metadata
+.DS_Store
