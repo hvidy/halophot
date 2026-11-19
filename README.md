@@ -49,10 +49,10 @@ halophot.write_fits(lc, "target_halo_lc.fits")
 
 # Reload light curve and pixel weightmap (do NOT use lc.to_fits(), which drops HALOCVER=1 extensions)
 lc_reloaded = lk.read("target_halo_lc.fits")
-wmap = halophot.read_weightmap("target_halo_lc.fits")
+wmap = halophot.read_weightmap(lc_reloaded)
 ```
 
-> **Note:** Always use `halophot.write_fits(lc, path)` and `halophot.read_weightmap(path)` (plus `halophot.read_split_times(path)` when `split_times` is used) rather than `lc.to_fits(path)`. Lightkurve's built-in `to_fits()` omits the `HALOCVER = 1` extensions (`WEIGHTMAP`, `WEIGHTMAP_ERR`, `SPLIT_TIMES`), provenance header cards, and unnormalized `e-/s` flux units.
+> **Note:** Always use `halophot.write_fits(lc, path)` and `halophot.read_weightmap(lc_or_path)` (plus `halophot.read_weightmap_err` and `halophot.read_split_times` when requested) rather than `lc.to_fits(path)`. Lightkurve's built-in `to_fits()` omits the `HALOCVER = 1` extensions (`WEIGHTMAP`, `WEIGHTMAP_ERR`, `SPLIT_TIMES`), provenance header cards, and unnormalized `e-/s` flux units.
 
 Key v2.0 features:
 
@@ -67,7 +67,7 @@ Call `halo` from the command line as, e.g.
 
 `halo ktwo200007768-c04_lpd-targ.fits --data-dir /path/to/data/directory/ --name Atlas -c 4 --do-plot`
 
-where `--name` is the star name you would like to save the outputs under, and `-c` is the campaign. Add `--hlsp-fits` (and `--offline --strict-hpc` on HPC clusters) to emit `HALOCVER = 1` `lightkurve` FITS files with `WEIGHTMAP` extensions.
+where `--name` is the star name you would like to save the outputs under, and `-c` is the campaign. Add `--hlsp-fits` (and `--offline --cache-dir "$SCRATCH/.cache/tess_bright"` on HPC clusters; `--strict-hpc` is enabled by default and can be relaxed with `--no-strict-hpc`) to emit `HALOCVER = 1` `lightkurve` FITS files with `WEIGHTMAP` extensions.
 
 ### Swinburne NT / OzSTAR HPC usage
 
@@ -75,8 +75,10 @@ where `--name` is the star name you would like to save the outputs under, and `-
    ```bash
    mkdir -p "$SCRATCH/logs"
    sbatch hpc/build_halo_sif.sbatch
+   # For pre-tag branch or commit builds, override the default v2.0.0 release refs:
+   # MUNDEY_REF=dev TESSBKGD_REF=dev HALOPHOT_REF=dev sbatch hpc/build_halo_sif.sbatch
    ```
-   `hpc/virgil_halophot.def` builds directly on `python:3.12.7-bookworm` with zero `apt-get` calls so `apptainer build --fakeroot --ignore-fakeroot-command` succeeds inside OzSTAR/NT's root-mapped user namespace. The job stages its layer cache and rootfs under `$SCRATCH/apptainer/build-$SLURM_JOB_ID`, smoke-tests CPU imports (`jax`, `mundey`, `tessbkgd`, `halophot`), writes `$MYFRED/containers/halo-YYYYMMDD.sif` plus `.sha256`, and updates the `$MYFRED/containers/halo.sif` symlink (consuming a single inode on `/fred`). Measured on Swinburne NT `trevor` (Slurm job `20702665`, including a Sirius Sector 6 `mundey` -> `tessbkgd` -> `halophot` smoke test): `19m 03s` wall time and `2.05 GiB` MaxRSS (`#SBATCH --time=00:45:00`, `--mem=8G`).
+   `hpc/virgil_halophot.def` builds directly on `python:3.12.7-bookworm` with zero `apt-get` calls so `apptainer build --fakeroot --ignore-fakeroot-command` succeeds inside OzSTAR/NT's root-mapped user namespace, defaulting `%arguments` (`mundey_ref`, `tessbkgd_ref`, `halophot_ref`) to immutable `v2.0.0` release tags and resolving `jax[cuda12]>=0.4.35` with all downstream packages in a single atomic `uv pip install` pass. The job stages its layer cache and rootfs under `$SCRATCH/apptainer/build-$SLURM_JOB_ID`, smoke-tests CPU imports (`jax`, `mundey`, `tessbkgd`, `halophot`) and `jax` / `jaxlib` / `jax-cuda12-plugin` / `jax-cuda12-pjrt` ABI parity, writes `$MYFRED/containers/halo-YYYYMMDD.sif` plus `.sha256`, and updates the `$MYFRED/containers/halo.sif` symlink (consuming a single inode on `/fred`). Measured on Swinburne NT `trevor` (Slurm job `20702665`, including a Sirius Sector 6 `mundey` -> `tessbkgd` -> `halophot` smoke test): `19m 03s` wall time and `2.05 GiB` MaxRSS (`#SBATCH --time=00:45:00`, `--mem=8G`).
 
 2. **Run CPU array or A100 GPU survey jobs on `tooarrana`**:
    ```bash

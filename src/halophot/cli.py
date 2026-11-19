@@ -199,9 +199,9 @@ def build_parser() -> ArgumentParser:
     )
     ap.add_argument(
         "--strict-hpc",
-        action="store_true",
-        default=False,
-        help="Reject cache paths under /fred/ to protect HPC inode quotas",
+        action=BooleanOptionalAction,
+        default=True,
+        help="Reject cache paths under /fred/ to protect HPC inode quotas (default: True)",
     )
     ap.add_argument(
         "--cache-dir",
@@ -279,8 +279,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     if not exists(args.save_dir):
         raise FileNotFoundError(f"Save directory {args.save_dir!r} does not exist.")
 
-    if args.strict_hpc or args.cache_dir is not None:
-        resolve_cache_dir(args.cache_dir, strict_hpc=args.strict_hpc)
+    resolved_cache_dir = resolve_cache_dir(args.cache_dir, strict_hpc=args.strict_hpc)
 
     fname = join(args.data_dir, args.fname) if args.data_dir else args.fname
     if args.hlsp_fits:
@@ -294,20 +293,31 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
 
         mission_upper = str(getattr(tpf_lk, "mission", "") or "").strip().upper()
-        if mission_upper in {"K2", "KEPLER"} and args.campaign in {7, 10, 12, 13}:
+        tpf_camp = getattr(tpf_lk, "campaign", None)
+        if mission_upper in {"K2", "KEPLER"}:
+            if args.campaign is not None:
+                eff_k2_campaign: int | None = int(args.campaign)
+            elif mission_upper == "K2" and tpf_camp is not None:
+                eff_k2_campaign = int(tpf_camp)
+            else:
+                eff_k2_campaign = None
+        else:
+            eff_k2_campaign = None
+
+        if eff_k2_campaign in {7, 10, 12, 13}:
             t_lk = np.asarray(tpf_lk.time.value, dtype=np.float64)
-            if args.campaign == 13:
+            if eff_k2_campaign == 13:
                 m1 = np.logical_or(t_lk < 2988.2553329814764, t_lk > 2988.494)
                 m2 = np.logical_and(m1, t_lk < 3064.016165412577)
                 m3 = np.logical_or(m2, t_lk > 3064.75)
                 m4 = np.logical_and(m3, t_lk < 3065.9776255118923)
                 m_camp = np.logical_or(m4, t_lk > 3066.2225)
                 tpf_lk = tpf_lk[m_camp]
-            elif args.campaign == 10:
+            elif eff_k2_campaign == 10:
                 tpf_lk = tpf_lk[t_lk > 2760]
-            elif args.campaign == 7:
+            elif eff_k2_campaign == 7:
                 tpf_lk = tpf_lk[t_lk > 2470]
-            elif args.campaign == 12:
+            elif eff_k2_campaign == 12:
                 m_camp = (t_lk > 2937.75) & (t_lk < 2938.8)
                 tpf_lk = tpf_lk[~m_camp]
 
@@ -319,7 +329,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ts_hlsp,
                 split_times=args.splits,
                 split_cadences=args.split_cadences,
-                campaign=args.campaign,
+                campaign=eff_k2_campaign,
             )
             if args.splits is not None and args.split_cadences is None:
                 hlsp_splits = np.sort(np.asarray(args.splits, dtype=np.float64).ravel())
@@ -351,6 +361,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             remove_contaminants=args.deathstar,
             catalog_table=args.catalog_table,
             offline=args.offline,
+            cache_dir=resolved_cache_dir,
+            strict_hpc=args.strict_hpc,
             compute_uncertainty=args.uncertainty,
         )
         out_fits = join(args.save_dir, f"{args.name}_halo_lc_{args.objective}.fits")
@@ -384,15 +396,19 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
             formal_name = translate_greek(args.name).replace("_", " ")
             sector = getattr(tpf_lk, "sector", None)
+            quarter = getattr(tpf_lk, "quarter", None)
             if sector is not None:
                 obs_label = f"S{int(sector):02d}"
+            elif eff_k2_campaign is not None:
+                obs_label = f"C{int(eff_k2_campaign):02d}"
+            elif tpf_camp is not None:
+                obs_label = f"C{int(tpf_camp):02d}"
+            elif quarter is not None:
+                obs_label = f"Q{int(quarter):02d}"
+            elif args.campaign is not None:
+                obs_label = f"C{int(args.campaign):02d}"
             else:
-                camp_num = (
-                    int(args.campaign)
-                    if args.campaign is not None
-                    else int(getattr(tpf_lk, "campaign", None) or 4)
-                )
-                obs_label = f"C{camp_num:02d}"
+                obs_label = "C04"
             out_png = join(args.save_dir, f"{args.name}_all_{args.objective}.png")
             fig = plot_all(
                 plot_ts,
@@ -455,6 +471,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             target_coord=tgt_coord,
             catalog_table=args.catalog_table,
             offline=args.offline,
+            cache_dir=resolved_cache_dir,
+            strict_hpc=args.strict_hpc,
         )
 
     if args.do_split:

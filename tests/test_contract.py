@@ -32,7 +32,9 @@ from halophot._contract import (
     read_bkgsub_state,
     read_pixel_quality,
     read_smear_err,
+    read_split_times,
     read_weightmap,
+    read_weightmap_err,
     resolve_cache_dir,
     write_lightcurve_fits,
 )
@@ -448,7 +450,7 @@ def _extract_python_heredocs(script_text: str) -> list[str]:
     return [m.group(1) for m in pattern.finditer(script_text)]
 
 
-def test_hpc_sbatch_and_apptainer_nt_contracts() -> None:
+def test_hpc_sbatch_and_apptainer_nt_contracts(monkeypatch: pytest.MonkeyPatch) -> None:
     repo_root = Path(__file__).resolve().parents[1]
     hpc_dir = repo_root / "hpc"
 
@@ -532,26 +534,64 @@ def test_hpc_sbatch_and_apptainer_nt_contracts() -> None:
     assert "Bootstrap: docker" in def_text
     assert "From: python:3.12.7-bookworm" in def_text
     assert "apt-get" not in def_text
-    assert "mundey_ref=dev" in def_text
-    assert "tessbkgd_ref=dev" in def_text
-    assert "halophot_ref=dev" in def_text
-    assert "--build-arg mundey_ref=v2.0.0" in def_text
+    assert "mundey_ref=v2.0.0" in def_text
+    assert "tessbkgd_ref=v2.0.0" in def_text
+    assert "halophot_ref=v2.0.0" in def_text
+    assert "--build-arg mundey_ref=" in def_text
     assert "UV_SYSTEM_PYTHON=1" in def_text
-    assert 'uv pip install -U "jax[cuda12]"' in def_text
+    assert '"jax[cuda12]>=0.4.35"' in def_text
+    assert "uv pip install -U" not in def_text
     assert "/etc/halo-sif-freeze.txt" in def_text
     assert "rm -rf /opt/.build" in def_text
 
     build_text = (hpc_dir / "build_halo_sif.sbatch").read_text(encoding="utf-8")
     assert "#SBATCH --time=00:45:00" in build_text
     assert "#SBATCH --mem=8G" in build_text
-    assert 'MUNDEY_REF="${MUNDEY_REF:-dev}"' in build_text
-    assert 'TESSBKGD_REF="${TESSBKGD_REF:-dev}"' in build_text
-    assert 'HALOPHOT_REF="${HALOPHOT_REF:-dev}"' in build_text
+    assert 'MUNDEY_REF="${MUNDEY_REF:-v2.0.0}"' in build_text
+    assert 'TESSBKGD_REF="${TESSBKGD_REF:-v2.0.0}"' in build_text
+    assert 'HALOPHOT_REF="${HALOPHOT_REF:-v2.0.0}"' in build_text
+    assert "MUNDEY_REF=dev TESSBKGD_REF=dev HALOPHOT_REF=dev" in build_text
     assert "--fakeroot" in build_text
     assert "--ignore-fakeroot-command" in build_text
     assert '--bind "$APPTAINER_TMPDIR:/tmp"' in build_text
     assert 'ln -sfn "$SIF" "$MYFRED/containers/halo.sif"' in build_text
     assert ".sha256" in build_text
+
+    # Execute the build_halo_sif.sbatch JAX/CUDA ABI parity heredoc under both lockstep and drift
+    import importlib.metadata as std_md
+
+    build_heredocs = _extract_python_heredocs(build_text)
+    assert len(build_heredocs) == 1
+    monkeypatch.setitem(sys.modules, "mundey", types.ModuleType("mundey"))
+    monkeypatch.setitem(sys.modules, "tessbkgd", types.ModuleType("tessbkgd"))
+    orig_version = std_md.version
+
+    def _lockstep_version(pkg: str) -> str:
+        overrides = {
+            "jax": "0.12.0.1",
+            "jaxlib": "0.12.0.1",
+            "jax-cuda12-plugin": "0.12.0.1",
+            "jax-cuda12-pjrt": "0.12.0",
+            "mundey": "2.0.0",
+            "tessbkgd": "2.0.0",
+            "halophot": "2.0.0",
+        }
+        return overrides[pkg] if pkg in overrides else orig_version(pkg)
+
+    monkeypatch.setattr(std_md, "version", _lockstep_version)
+    exec(compile(build_heredocs[0], "build_halo_sif.sbatch[py]", "exec"), {"__name__": "__main__"})
+
+    def _drifted_version(pkg: str) -> str:
+        if pkg == "jax-cuda12-plugin":
+            return "0.11.2"
+        return _lockstep_version(pkg)
+
+    monkeypatch.setattr(std_md, "version", _drifted_version)
+    with pytest.raises(RuntimeError, match="JAX/CUDA ABI version mismatch"):
+        exec(
+            compile(build_heredocs[0], "build_halo_sif.sbatch[py]", "exec"),
+            {"__name__": "__main__"},
+        )
 
 
 def test_hpc_survey_embedded_full_e2e_and_halophot_only(
@@ -713,7 +753,100 @@ def test_write_fits_headers_tunit_and_read_weightmap(tmp_path: Path) -> None:
 
     w_mem = halophot.read_weightmap(lc)
     w_disk = read_weightmap(out_path)
-    assert w_mem is not None and w_disk is not None
+    w_reloaded = halophot.read_weightmap(lc_back)
+    assert w_mem is not None and w_disk is not None and w_reloaded is not None
     np.testing.assert_allclose(w_mem, wmap, equal_nan=True)
     np.testing.assert_allclose(w_disk, wmap, equal_nan=True)
+    np.testing.assert_allclose(w_reloaded, wmap, equal_nan=True)
+
+
+def test_read_weightmap_err_and_split_times_roundtrip_all_inputs(tmp_path: Path) -> None:
+    """Verify [XPKG-03]: read_weightmap, read_weightmap_err, and read_split_times across LC/HDUList/Path."""
+    assert "read_weightmap_err" in halophot.__all__
+    assert "read_split_times" in halophot.__all__
+    assert halophot.read_weightmap_err is read_weightmap_err
+    assert halophot.read_split_times is read_split_times
+
+    t = Time(2100.0 + np.arange(20, dtype=np.float64) * (2.0 / 1440.0), format="btjd", scale="tdb")
+    flux = 1.0 + 1e-3 * np.cos(np.arange(20, dtype=np.float64))
+    ferr = np.full(20, 2e-4, dtype=np.float64)
+
+    # 1. Plain in-memory LightCurve without HALOCVER=1 extensions returns None (never TypeError)
+    lc_plain = lk.TessLightCurve(time=t, flux=flux, flux_err=ferr)
+    assert halophot.read_weightmap(lc_plain) is None
+    assert halophot.read_weightmap_err(lc_plain) is None
+    assert halophot.read_split_times(lc_plain) is None
+
+    # 2. Invalid non-LightCurve / non-FITS inputs raise TypeError
+    for bad_input in (42, object()):
+        with pytest.raises(TypeError, match="Expected a lightkurve.LightCurve"):
+            read_weightmap(bad_input)
+        with pytest.raises(TypeError, match="Expected a lightkurve.LightCurve"):
+            read_weightmap_err(bad_input)
+        with pytest.raises(TypeError, match="Expected a lightkurve.LightCurve"):
+            read_split_times(bad_input)
+
+    # 3. 3D segmented WEIGHTMAP + MaskedArray WEIGHTMAP_ERR + SPLIT_TIMES round-trip across
+    #    in-memory LC, lk.read(path) LightCurve, lk.read(hdul) LightCurve, HDUList, Path, and str
+    wmap_3d = np.arange(24, dtype=np.float64).reshape(2, 3, 4) / 100.0
+    werr_raw = np.linspace(0.001, 0.024, 24, dtype=np.float64).reshape(2, 3, 4)
+    werr_masked = np.ma.array(werr_raw, mask=np.zeros_like(werr_raw, dtype=bool))
+    werr_masked.mask[0, 0, 0] = True
+    expected_werr = werr_raw.copy()
+    expected_werr[0, 0, 0] = np.nan
+    splits = [float(t.value[9]) + 5e-4]
+
+    lc_seg = lk.TessLightCurve(time=t, flux=flux, flux_err=ferr)
+    lc_seg.meta["WEIGHTMAP"] = wmap_3d
+    lc_seg.meta["WEIGHTMAP_ERR"] = werr_masked
+    lc_seg.meta["SPLIT_TIMES"] = splits
+
+    np.testing.assert_allclose(halophot.read_weightmap_err(lc_seg), expected_werr, equal_nan=True)  # type: ignore[arg-type]
+    np.testing.assert_allclose(halophot.read_split_times(lc_seg), splits, rtol=0.0, atol=1e-12)  # type: ignore[arg-type]
+
+    # Also verify MappingProxyType (non-dict Mapping) works for read_* helpers
+    proxy_carrier = types.SimpleNamespace(meta=types.MappingProxyType(dict(lc_seg.meta)))
+    np.testing.assert_allclose(read_weightmap(proxy_carrier), wmap_3d)  # type: ignore[arg-type]
+    np.testing.assert_allclose(read_weightmap_err(proxy_carrier), expected_werr, equal_nan=True)  # type: ignore[arg-type]
+    np.testing.assert_allclose(read_split_times(proxy_carrier), splits)  # type: ignore[arg-type]
+
+    seg_fits = tmp_path / "seg_werr_lc.fits"
+    halophot.write_fits(lc_seg, seg_fits)
+
+    # Reload via lk.read(str_path): Lightkurve strips WEIGHTMAP/WEIGHTMAP_ERR/SPLIT_TIMES from meta,
+    # so read_* must resolve the underlying FITS file via FILENAME metadata!
+    lc_from_disk = lk.read(str(seg_fits))
+    assert "WEIGHTMAP" not in lc_from_disk.meta
+    assert "WEIGHTMAP_ERR" not in lc_from_disk.meta
+    assert "SPLIT_TIMES" not in lc_from_disk.meta
+
+    for target in (seg_fits, str(seg_fits), lc_from_disk):
+        np.testing.assert_allclose(halophot.read_weightmap(target), wmap_3d)  # type: ignore[arg-type]
+        np.testing.assert_allclose(
+            halophot.read_weightmap_err(target), expected_werr, equal_nan=True  # type: ignore[arg-type]
+        )
+        np.testing.assert_allclose(
+            halophot.read_split_times(target), splits, rtol=0.0, atol=1e-12  # type: ignore[arg-type]
+        )
+
+    with fits.open(seg_fits) as hdul:
+        np.testing.assert_allclose(halophot.read_weightmap_err(hdul), expected_werr, equal_nan=True)  # type: ignore[arg-type]
+        lc_from_hdul = lk.read(hdul)
+        np.testing.assert_allclose(
+            halophot.read_weightmap_err(lc_from_hdul), expected_werr, equal_nan=True  # type: ignore[arg-type]
+        )
+
+        # Verify NSPLITS + SPLIT001 header fallback when SPLIT_TIMES BinTableHDU is absent
+        hdul_no_tbl = fits.HDUList([h.copy() for h in hdul if h.name != "SPLIT_TIMES"])
+        np.testing.assert_allclose(
+            halophot.read_split_times(hdul_no_tbl), splits, rtol=0.0, atol=1e-12  # type: ignore[arg-type]
+        )
+
+    # 1D WEIGHTMAP_ERR must raise ValueError on write_fits
+    lc_bad_werr = lk.TessLightCurve(time=t, flux=flux, flux_err=ferr)
+    lc_bad_werr.meta["WEIGHTMAP"] = np.full((3, 4), 1.0 / 12.0)
+    lc_bad_werr.meta["WEIGHTMAP_ERR"] = np.ones(4)
+    with pytest.raises(ValueError, match="WEIGHTMAP_ERR must have at least 2 dimensions"):
+        halophot.write_fits(lc_bad_werr, tmp_path / "bad_werr.fits")
+
 

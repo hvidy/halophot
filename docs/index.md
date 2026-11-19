@@ -36,16 +36,23 @@ lc = halophot.extract_halo_lightcurve(
     sigclip=True,
     compute_uncertainty=True,
 )
+# Save HLSP FITS with lossless WEIGHTMAP ImageHDU and coherent flux_err
 halophot.write_fits(lc, "target_halo_lc.fits")
+
+# Reload light curve and pixel weightmap (do NOT use lc.to_fits(), which drops HALOCVER=1 extensions)
+lc_reloaded = lk.read("target_halo_lc.fits")
+wmap = halophot.read_weightmap(lc_reloaded)
 ```
+
+> **Note:** Always use `halophot.write_fits(lc, path)` and `halophot.read_weightmap(lc_or_path)` (plus `halophot.read_weightmap_err` and `halophot.read_split_times` when requested) rather than `lc.to_fits(path)`. Lightkurve's built-in `to_fits()` drops the `HALOCVER = 1` extensions (`WEIGHTMAP`, `WEIGHTMAP_ERR`, `SPLIT_TIMES`), provenance header cards, and unnormalized `e-/s` flux units.
 
 `extract_halo_lightcurve` returns a standard `lightkurve.LightCurve` (`KeplerLightCurve` or `TessLightCurve`) with:
 
 - `flux` and unified coherent `flux_err` propagated in `float64` across uncorrelated pixel noise, degree-$\le d$ column-projected `SMEAR_ERR`, and `BKG_CHOL` / `BKG_BASIS` background covariance;
 - flux-weighted aperture centroids in `centroid_col` / `centroid_row` (keeping `pos_corr1` / `pos_corr2` separate);
-- non-transposed `(ny, nx)` `lc.meta['WEIGHTMAP']` (or `(n_splits, ny, nx)` when `split_times` is supplied), preserved losslessly on disk via `halophot.write_fits(lc, path)`.
+- non-transposed `(ny, nx)` `lc.meta['WEIGHTMAP']` (or `(n_splits, ny, nx)` when `split_times` is supplied), preserved losslessly on disk via `halophot.write_fits(lc, path)` and read back via `halophot.read_weightmap(...)`.
 
-Legacy `halo_tpf` / `halo_tpf_tess` shims, `do_lc`, and `legacy_tv=True` remain available for *K2* and `halo-tess` DR1 compatibility. Slurm and Apptainer templates for HPC survey execution are provided in `hpc/`.
+Legacy `halo_tpf` / `halo_tpf_tess` subclass shims are **deprecated in v2.0.0** (emitting `DeprecationWarning` in favour of `extract_halo_lightcurve`), while `do_lc` and `legacy_tv=True` remain available for *K2* and `halo-tess` DR1 compatibility. Root-mapped Apptainer (`hpc/virgil_halophot.def`, `hpc/build_halo_sif.sbatch` -> `halo.sif`) and Slurm CPU/A100 survey templates (`hpc/halophot_survey_cpu.sbatch`, `hpc/halophot_survey_gpu.sbatch`) are provided in `hpc/`.
 
 ### Command-line usage
 
@@ -59,7 +66,7 @@ where `--name` is the star name you would like to save the outputs under, and `-
 - `--uncertainty`: compute orbit block-jackknife pixel weight uncertainties (`WEIGHTMAP_ERR`) in `--hlsp-fits` mode;
 - `--legacy-tv`: reproduce unregularized $w$-simplex total variation for *K2* and `halo-tess` DR1 compatibility;
 - `--deathstar --catalog-table <path>`: mask contaminant stars via WCS using a pre-cached FITS/Parquet/ECSV catalogue table (pair with `--offline` on compute nodes without internet access);
-- `--strict-hpc --cache-dir <path>`: enforce zero-`/fred` cache paths on HPC clusters.
+- `--cache-dir <path>` and `--strict-hpc` / `--no-strict-hpc`: `strict_hpc=True` is enabled by default in both `resolve_cache_dir` and the CLI (`$HALOPHOT_CACHE_DIR` -> `$TESS_BRIGHT_CACHE_DIR` -> `$SCRATCH/.cache/tess_bright`), rejecting `/fred/` cache paths to protect HPC project inode quotas.
 
 ## Licence
 

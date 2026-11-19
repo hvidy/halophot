@@ -18,11 +18,11 @@ set -eo pipefail  # omit -u: Lmod reads unset variables (PS1) inside `module loa
 : "${MYFRED:=/fred/${OZ_PROJECT:-oz440}/$USER}"
 : "${SCRATCH:=/aphid/scratch-3month/$USER}"
 
-# Default to audited `dev` branches; for post-release builds override via:
-#   MUNDEY_REF=v2.0.0 TESSBKGD_REF=v2.0.0 HALOPHOT_REF=v2.0.0 sbatch hpc/build_halo_sif.sbatch
-MUNDEY_REF="${MUNDEY_REF:-dev}"
-TESSBKGD_REF="${TESSBKGD_REF:-dev}"
-HALOPHOT_REF="${HALOPHOT_REF:-dev}"
+# Default to immutable v2.0.0 release tags; for pre-tag branch/commit builds override via:
+#   MUNDEY_REF=dev TESSBKGD_REF=dev HALOPHOT_REF=dev sbatch hpc/build_halo_sif.sbatch
+MUNDEY_REF="${MUNDEY_REF:-v2.0.0}"
+TESSBKGD_REF="${TESSBKGD_REF:-v2.0.0}"
+HALOPHOT_REF="${HALOPHOT_REF:-v2.0.0}"
 
 SUBMIT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
 if [ -n "${DEF_FILE:-}" ]; then
@@ -70,7 +70,7 @@ if ! apptainer build --fakeroot --ignore-fakeroot-command \
 fi
 mv -f "$PART" "$SIF"
 
-# Quick CPU import and CLI smoke test before updating the stable halo.sif symlink.
+# Quick CPU import, JAX/CUDA plugin ABI parity check, and CLI smoke test before updating halo.sif.
 JAX_PLATFORMS=cpu apptainer exec "$SIF" python - <<'PY'
 import importlib.metadata as md
 import jax
@@ -79,7 +79,16 @@ import tessbkgd
 import halophot
 
 print("jax", jax.__version__, jax.devices())
-for pkg in ("jaxlib", "equinox", "optimistix", "optax", "zodiax", "lightkurve", "mundey", "tessbkgd", "halophot"):
+jax_mm = tuple(md.version("jax").split(".")[:3])
+for cuda_pkg in ("jaxlib", "jax-cuda12-plugin", "jax-cuda12-pjrt"):
+    pkg_ver = md.version(cuda_pkg)
+    print(cuda_pkg, pkg_ver)
+    if tuple(pkg_ver.split(".")[:3]) != jax_mm:
+        raise RuntimeError(
+            f"JAX/CUDA ABI version mismatch: jax={md.version('jax')} vs {cuda_pkg}={pkg_ver}"
+        )
+
+for pkg in ("equinox", "optimistix", "optax", "zodiax", "lightkurve", "mundey", "tessbkgd", "halophot"):
     print(pkg, md.version(pkg))
 PY
 JAX_PLATFORMS=cpu apptainer exec "$SIF" halo --help >/dev/null

@@ -20,6 +20,7 @@ Implements Section 5.2 and Section 6.1 aperture selection rules:
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import math
 import os
@@ -38,7 +39,7 @@ from astropy.wcs.utils import proj_plane_pixel_scales
 from scipy import ndimage
 from scipy.special import erfinv
 
-from ._contract import PixelQuality
+from ._contract import PixelQuality, resolve_cache_dir
 
 __all__ = [
     "DEFAULT_EXCLUDE_QUALITY",
@@ -160,6 +161,7 @@ def _query_mast_region(
     radius_deg: float,
     *,
     catalog: str = "TIC",
+    cache_dir: Path | None = None,
 ) -> Table:
     """Query MAST ``Catalogs.query_region`` when ``offline=False``."""
     try:
@@ -170,7 +172,35 @@ def _query_mast_region(
             "Install it with `pip install astroquery` or pass a pre-cached `catalog_table`."
         ) from exc
 
-    return Catalogs.query_region(center, radius=radius_deg * u.deg, catalog=catalog)
+    if cache_dir is None:
+        return Catalogs.query_region(center, radius=radius_deg * u.deg, catalog=catalog)
+
+    if hasattr(Catalogs, "_cache_location"):
+        prev_private = Catalogs._cache_location
+        try:
+            Catalogs.cache_location = str(cache_dir)
+            return Catalogs.query_region(center, radius=radius_deg * u.deg, catalog=catalog)
+        finally:
+            if prev_private is None:
+                reset_fn = getattr(Catalogs, "reset_cache_location", None)
+                if callable(reset_fn):
+                    reset_fn()
+                else:
+                    Catalogs._cache_location = None
+            else:
+                Catalogs.cache_location = prev_private
+
+    missing = object()
+    prev_cache = getattr(Catalogs, "cache_location", missing)
+    try:
+        Catalogs.cache_location = str(cache_dir)
+        return Catalogs.query_region(center, radius=radius_deg * u.deg, catalog=catalog)
+    finally:
+        if prev_cache is missing:
+            with contextlib.suppress(AttributeError):
+                delattr(Catalogs, "cache_location")
+        else:
+            Catalogs.cache_location = prev_cache
 
 
 def _wcs_pixel_scale_arcsec(wcs: WCS) -> float:
@@ -187,7 +217,7 @@ def _coerce_obs_time(obs_time: Time | str | float | None, wcs: WCS) -> Time | No
     if obs_time is not None:
         if isinstance(obs_time, Time):
             return Time(float(obs_time.jd), format="jd", scale="tdb")
-        if isinstance(obs_time, (int, float, np.floating)):
+        if isinstance(obs_time, int | float | np.floating):
             val = float(obs_time)
             if np.isfinite(val):
                 # Values < 3000 are Julian years (e.g. 2020.5); > 2.4e6 are JD; else MJD.
@@ -275,6 +305,8 @@ def mask_background_stars(
     *,
     catalog_table: Table | str | os.PathLike[str] | None = None,
     offline: bool = False,
+    cache_dir: str | os.PathLike[str] | None = None,
+    strict_hpc: bool = True,
     target_coord: SkyCoord | tuple[float, float] | None = None,
     target_mag: float | None = None,
     target_exclusion_arcsec: float | None = None,
@@ -311,6 +343,11 @@ def mask_background_stars(
     resolved_obs_time = _coerce_obs_time(obs_time, wcs)
 
     if catalog_table is None:
+        resolved_cache = resolve_cache_dir(
+            cache_dir,
+            strict_hpc=strict_hpc,
+            create=not offline,
+        )
         if offline:
             raise RuntimeError(
                 "Live catalogue queries are disabled when offline=True; "
@@ -323,8 +360,14 @@ def mask_background_stars(
         sep_deg = float(np.max(center_sky.separation(corner_sky).deg)) * 1.15 + (
             2.0 * pix_scale_arcsec / 3600.0
         )
-        tbl = _query_mast_region(center_sky, sep_deg, catalog=catalog)
+        tbl = _query_mast_region(
+            center_sky,
+            sep_deg,
+            catalog=catalog,
+            cache_dir=resolved_cache,
+        )
     else:
+        resolve_cache_dir(cache_dir, strict_hpc=strict_hpc, create=False)
         tbl = _load_catalog_table(catalog_table)
 
     out_mask = np.zeros((ny, nx), dtype=bool)
@@ -507,6 +550,8 @@ def remove_stars(
     wcs: WCS | None = None,
     catalog_table: Table | str | os.PathLike[str] | None = None,
     offline: bool = False,
+    cache_dir: str | os.PathLike[str] | None = None,
+    strict_hpc: bool = True,
     target_coord: SkyCoord | tuple[float, float] | None = None,
     target_mag: float | None = None,
     target_exclusion_arcsec: float | None = None,
@@ -541,6 +586,8 @@ def remove_stars(
             (ny, nx),
             catalog_table=catalog_table,
             offline=offline,
+            cache_dir=cache_dir,
+            strict_hpc=strict_hpc,
             target_coord=resolved_target,
             target_mag=target_mag,
             target_exclusion_arcsec=target_exclusion_arcsec,
@@ -597,6 +644,8 @@ def remove_stars(
         (arr.shape[1], arr.shape[2]),
         catalog_table=catalog_table,
         offline=offline,
+        cache_dir=cache_dir,
+        strict_hpc=strict_hpc,
         target_coord=target_coord,
         target_mag=target_mag,
         target_exclusion_arcsec=target_exclusion_arcsec,
@@ -627,6 +676,8 @@ def build_halo_masks(
     remove_contaminants: bool = False,
     catalog_table: Table | str | os.PathLike[str] | None = None,
     offline: bool = False,
+    cache_dir: str | os.PathLike[str] | None = None,
+    strict_hpc: bool = True,
     target_exclusion_arcsec: float | None = None,
     mag_limit: float | None = None,
     star_radius_pix: float | None = None,
@@ -705,6 +756,8 @@ def build_halo_masks(
             (ny, nx),
             catalog_table=catalog_table,
             offline=offline,
+            cache_dir=cache_dir,
+            strict_hpc=strict_hpc,
             target_coord=target_coord,
             target_mag=target_mag,
             target_exclusion_arcsec=target_exclusion_arcsec,
@@ -713,6 +766,7 @@ def build_halo_masks(
             obs_time=obs_time,
         )
     else:
+        resolve_cache_dir(cache_dir, strict_hpc=strict_hpc, create=False)
         source_excl = np.zeros((ny, nx), dtype=bool)
 
     flux_cad = flux_arr[cad_mask]
