@@ -68,10 +68,10 @@ if ! apptainer build --fakeroot --ignore-fakeroot-command \
     grep -m1 -E '^(E:|FATAL|ERROR)|Error|error:' "$BUILD_LOG" || true
     exit 1
 fi
-mv -f "$PART" "$SIF"
 
-# Quick CPU import, JAX/CUDA plugin ABI parity check, and CLI smoke test before updating halo.sif.
-JAX_PLATFORMS=cpu apptainer exec "$SIF" python - <<'PY'
+# Run CPU import, JAX/CUDA plugin ABI parity check, and CLI smoke test on $PART ($SCRATCH)
+# BEFORE moving into $MYFRED/containers so a failed check never clobbers a live halo-YYYYMMDD.sif.
+JAX_PLATFORMS=cpu apptainer exec "$PART" python - <<'PY'
 import importlib.metadata as md
 import jax
 import mundey
@@ -91,8 +91,9 @@ for cuda_pkg in ("jaxlib", "jax-cuda12-plugin", "jax-cuda12-pjrt"):
 for pkg in ("equinox", "optimistix", "optax", "zodiax", "lightkurve", "mundey", "tessbkgd", "halophot"):
     print(pkg, md.version(pkg))
 PY
-JAX_PLATFORMS=cpu apptainer exec "$SIF" halo --help >/dev/null
+JAX_PLATFORMS=cpu apptainer exec "$PART" halo --help >/dev/null
 
+mv -f "$PART" "$SIF"
 (cd "$OUTDIR" && sha256sum "$(basename "$SIF")" > "$SIF.sha256")
 ln -sfn "$SIF" "$MYFRED/containers/halo.sif"
 

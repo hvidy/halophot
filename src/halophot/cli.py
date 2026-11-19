@@ -230,6 +230,23 @@ def build_parser() -> ArgumentParser:
     return ap
 
 
+def _read_tpf_header_context(fname: str) -> tuple[str, int | None, int | None, int | None]:
+    """Read ``(mission_upper, sector, quarter, campaign)`` from Primary HDU 0 of ``fname``."""
+    with fits.open(fname) as hdul:
+        hdr0 = hdul[0].header
+        raw_mission = hdr0.get("MISSION") or hdr0.get("TELESCOP") or ""
+        mission_upper = str(raw_mission).strip().upper()
+        sector = hdr0.get("SECTOR")
+        quarter = hdr0.get("QUARTER")
+        campaign = hdr0.get("CAMPAIGN")
+    return (
+        mission_upper,
+        int(sector) if isinstance(sector, int | np.integer) and not isinstance(sector, bool) else None,
+        int(quarter) if isinstance(quarter, int | np.integer) and not isinstance(quarter, bool) else None,
+        int(campaign) if isinstance(campaign, int | np.integer) and not isinstance(campaign, bool) else None,
+    )
+
+
 def _read_tpf_wcs_and_target(fname: str) -> tuple[WCS | None, tuple[float, float] | None]:
     """Extract celestial WCS and (RA_OBJ, DEC_OBJ) from a TPF FITS file."""
     with fits.open(fname) as hdul:
@@ -293,11 +310,16 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
 
         mission_upper = str(getattr(tpf_lk, "mission", "") or "").strip().upper()
+        sector = getattr(tpf_lk, "sector", None)
+        quarter = getattr(tpf_lk, "quarter", None)
         tpf_camp = getattr(tpf_lk, "campaign", None)
-        if mission_upper in {"K2", "KEPLER"}:
+        is_k2_tpf = (mission_upper == "K2") or (
+            mission_upper == "KEPLER" and quarter is None and sector is None
+        )
+        if is_k2_tpf:
             if args.campaign is not None:
                 eff_k2_campaign: int | None = int(args.campaign)
-            elif mission_upper == "K2" and tpf_camp is not None:
+            elif tpf_camp is not None:
                 eff_k2_campaign = int(tpf_camp)
             else:
                 eff_k2_campaign = None
@@ -395,16 +417,14 @@ def main(argv: Sequence[str] | None = None) -> None:
                 mask=~np.isfinite(wmap_legacy) | (wmap_legacy <= 0.0),
             )
             formal_name = translate_greek(args.name).replace("_", " ")
-            sector = getattr(tpf_lk, "sector", None)
-            quarter = getattr(tpf_lk, "quarter", None)
             if sector is not None:
                 obs_label = f"S{int(sector):02d}"
+            elif quarter is not None:
+                obs_label = f"Q{int(quarter):02d}"
             elif eff_k2_campaign is not None:
                 obs_label = f"C{int(eff_k2_campaign):02d}"
             elif tpf_camp is not None:
                 obs_label = f"C{int(tpf_camp):02d}"
-            elif quarter is not None:
-                obs_label = f"Q{int(quarter):02d}"
             elif args.campaign is not None:
                 obs_label = f"C{int(args.campaign):02d}"
             else:
@@ -422,13 +442,19 @@ def main(argv: Sequence[str] | None = None) -> None:
                 print(f"Everything saved to {out_png}")
         return
 
-    eff_campaign = 4 if args.campaign is None else int(args.campaign)
+    hdr_mission, hdr_sector, hdr_quarter, hdr_camp = _read_tpf_header_context(fname)
+    is_legacy_k2 = (hdr_mission != "TESS") and (hdr_sector is None) and (hdr_quarter is None)
+    eff_campaign = (
+        int(args.campaign)
+        if args.campaign is not None
+        else (hdr_camp if hdr_camp is not None else 4)
+    )
     eff_minflux = 100.0 if args.minflux is None else float(args.minflux)
     eff_thresh = 0.8 if args.thresh is None else float(args.thresh)
 
     tpf, ts = read_tpf(fname)
 
-    if eff_campaign == 13:
+    if is_legacy_k2 and eff_campaign == 13:
         m1 = np.logical_or(ts["time"] < 2988.2553329814764, ts["time"] > 2988.494)
         m2 = np.logical_and(m1, ts["time"] < 3064.016165412577)
         m3 = np.logical_or(m2, ts["time"] > 3064.75)
@@ -436,15 +462,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         m = np.logical_or(m4, ts["time"] > 3066.2225)
         tpf, ts = tpf[m, :, :], ts[m]
 
-    if eff_campaign == 10:
+    if is_legacy_k2 and eff_campaign == 10:
         m = ts["time"] > 2760
         tpf, ts = tpf[m, :, :], ts[m]
 
-    if eff_campaign == 7:
+    if is_legacy_k2 and eff_campaign == 7:
         m = ts["time"] > 2470
         tpf, ts = tpf[m, :, :], ts[m]
 
-    if eff_campaign == 12:
+    if is_legacy_k2 and eff_campaign == 12:
         m = (ts["time"] > 2937.75) * (ts["time"] < 2938.8)
         tpf, ts = tpf[~m, :, :], ts[~m]
 
@@ -584,13 +610,19 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.do_plot:
         formal_name = translate_greek(args.name).replace("_", " ")
+        if hdr_sector is not None:
+            legacy_label = f"S{hdr_sector:02d}"
+        elif hdr_quarter is not None:
+            legacy_label = f"Q{hdr_quarter:02d}"
+        else:
+            legacy_label = f"C{eff_campaign:02d}"
         image = np.nansum(tpf, axis=0)
         out_png = join(args.save_dir, f"{args.name}_all_{args.objective}.png")
         fig = plot_all(
             newts,
             image,
             masked_weightmap,
-            formal_name=f"{formal_name} - C{eff_campaign:02d}",
+            formal_name=f"{formal_name} - {legacy_label}",
             save_file=out_png,
         )
         plt.close(fig)

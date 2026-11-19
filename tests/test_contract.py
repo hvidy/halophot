@@ -556,6 +556,9 @@ def test_hpc_sbatch_and_apptainer_nt_contracts(monkeypatch: pytest.MonkeyPatch) 
     assert '--bind "$APPTAINER_TMPDIR:/tmp"' in build_text
     assert 'ln -sfn "$SIF" "$MYFRED/containers/halo.sif"' in build_text
     assert ".sha256" in build_text
+    # Smoke checks must run against $PART on $SCRATCH BEFORE mv -f "$PART" "$SIF"
+    assert build_text.index('apptainer exec "$PART" python') < build_text.index('mv -f "$PART" "$SIF"')
+    assert build_text.index('apptainer exec "$PART" halo --help') < build_text.index('mv -f "$PART" "$SIF"')
 
     # Execute the build_halo_sif.sbatch JAX/CUDA ABI parity heredoc under both lockstep and drift
     import importlib.metadata as std_md
@@ -643,6 +646,8 @@ def test_hpc_survey_embedded_full_e2e_and_halophot_only(
     monkeypatch.setitem(sys.modules, "mundey", fake_mundey)
     monkeypatch.setitem(sys.modules, "tessbkgd", fake_tessbkgd)
     monkeypatch.setenv("MUNDEY_SMEAR", "alternate")
+    # Set a /fred env var to prove both survey templates pass explicit cache_dir into extract_halo_lightcurve!
+    monkeypatch.setenv("HALOPHOT_CACHE_DIR", "/fred/oz440/bpo/.cache")
 
     # 1. Execute CPU survey full_e2e Python heredoc end-to-end
     cpu_out = tmp_path / "cpu_out"
@@ -682,12 +687,33 @@ def test_hpc_survey_embedded_full_e2e_and_halophot_only(
             {"__name__": "__main__"},
         )
         assert len(calls) == expected_new_calls
-        out_fits = gpu_out / f"{stem}_halo_lc.fits"
+        out_fits = gpu_out / f"{stem}_halo_lc_tv.fits"
         assert out_fits.is_file()
         summary = Table.read(gpu_out / "summary.parquet", format="parquet")
         assert len(summary) == 1
         assert str(summary["status"][0]) == "ok"
         assert str(summary["pipeline_mode"][0]) == mode
+        assert str(summary["fits_file"][0]) == f"{stem}_halo_lc_tv.fits"
+
+    # 3. Verify GPU survey exits non-zero (after writing summary.parquet) when 100% of targets fail
+    bad_manifest = tmp_path / "bad_manifest.txt"
+    bad_manifest.write_text(f"{tmp_path / 'missing_target_tp.fits'}\n", encoding="utf-8")
+    gpu_fail_out = tmp_path / "gpu_all_failed"
+    gpu_fail_out.mkdir()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["-", str(bad_manifest), str(gpu_fail_out), str(cat_dir), str(cache_dir), "halophot_only"],
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        exec(
+            compile(gpu_heredocs[0], "halophot_survey_gpu.sbatch[py]", "exec"),
+            {"__name__": "__main__"},
+        )
+    assert exc_info.value.code == 1
+    fail_summary = Table.read(gpu_fail_out / "summary.parquet", format="parquet")
+    assert len(fail_summary) == 1
+    assert str(fail_summary["status"][0]) == "failed"
 
 
 def test_license_and_pyproject_metadata() -> None:
@@ -821,13 +847,44 @@ def test_read_weightmap_err_and_split_times_roundtrip_all_inputs(tmp_path: Path)
     assert "SPLIT_TIMES" not in lc_from_disk.meta
 
     for target in (seg_fits, str(seg_fits), lc_from_disk):
-        np.testing.assert_allclose(halophot.read_weightmap(target), wmap_3d)  # type: ignore[arg-type]
-        np.testing.assert_allclose(
-            halophot.read_weightmap_err(target), expected_werr, equal_nan=True  # type: ignore[arg-type]
-        )
-        np.testing.assert_allclose(
-            halophot.read_split_times(target), splits, rtol=0.0, atol=1e-12  # type: ignore[arg-type]
-        )
+        w_got = halophot.read_weightmap(target)
+        we_got = halophot.read_weightmap_err(target)
+        st_got = halophot.read_split_times(target)
+        assert w_got is not None and w_got.flags.owndata
+        assert we_got is not None and we_got.flags.owndata
+        assert st_got is not None and st_got.flags.owndata
+        np.testing.assert_allclose(w_got, wmap_3d)
+        np.testing.assert_allclose(we_got, expected_werr, equal_nan=True)
+        np.testing.assert_allclose(st_got, splits, rtol=0.0, atol=1e-12)
+
+    # Re-saving a reloaded lk.read(path) LightCurve (both to a new path AND in-place overwrite=True)
+    # must preserve WEIGHTMAP, WEIGHTMAP_ERR, and SPLIT_TIMES losslessly!
+    resaved_fits = tmp_path / "resaved_from_reloaded_lc.fits"
+    halophot.write_fits(lc_from_disk, resaved_fits)
+    np.testing.assert_allclose(halophot.read_weightmap(resaved_fits), wmap_3d)  # type: ignore[arg-type]
+    np.testing.assert_allclose(
+        halophot.read_weightmap_err(resaved_fits), expected_werr, equal_nan=True  # type: ignore[arg-type]
+    )
+    np.testing.assert_allclose(
+        halophot.read_split_times(resaved_fits), splits, rtol=0.0, atol=1e-12  # type: ignore[arg-type]
+    )
+
+    lc_reloaded_again = lk.read(str(resaved_fits))
+    halophot.write_fits(lc_reloaded_again, resaved_fits, overwrite=True)
+    np.testing.assert_allclose(halophot.read_weightmap(resaved_fits), wmap_3d)  # type: ignore[arg-type]
+    np.testing.assert_allclose(
+        halophot.read_weightmap_err(resaved_fits), expected_werr, equal_nan=True  # type: ignore[arg-type]
+    )
+
+    # Time-slicing lc_from_disk before the split boundary drops out-of-range SPLIT_TIMES on write_fits
+    sliced_fits = tmp_path / "sliced_reloaded_lc.fits"
+    halophot.write_fits(lc_from_disk[:5], sliced_fits)
+    assert halophot.read_split_times(sliced_fits) is None
+
+    # Wrapper carrying _hdu without a .hdu attribute must resolve _hdu directly without AttributeError
+    with fits.open(seg_fits) as hdul_wrap:
+        only_private_hdu = types.SimpleNamespace(_hdu=hdul_wrap)
+        np.testing.assert_allclose(halophot.read_weightmap(only_private_hdu), wmap_3d)  # type: ignore[arg-type]
 
     with fits.open(seg_fits) as hdul:
         np.testing.assert_allclose(halophot.read_weightmap_err(hdul), expected_werr, equal_nan=True)  # type: ignore[arg-type]

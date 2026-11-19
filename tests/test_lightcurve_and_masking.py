@@ -1030,3 +1030,69 @@ def test_cli_strict_hpc_boolean_optional_and_k2_campaign_inference(
     assert not np.any((lc_c12.time.value > 2937.75) & (lc_c12.time.value < 2938.8))
     assert recorded_titles == ["k2 c12 - C12"]
 
+    # Kepler prime-mission Quarter 7 TPF (BKJD ~ 700 < 1600) passed with `-c 7` must NOT trigger
+    # K2 Campaign 7 `t > 2470` excision, and `--do-plot` must label `- Q07` in both modes!
+    kep_q7_path = tmp_path / "kplr001234567-2010355_lpd-targ.fits"
+    with fits.open(K2_TPF_FITS) as hdul_src:
+        hdul_q7 = fits.HDUList([h.copy() for h in hdul_src])
+        q7_tab = hdul_q7[1].data[:36].copy()
+        q7_tab["TIME"][:] = np.linspace(700.0, 701.0, 36, dtype=np.float64)
+        q7_tab["QUALITY"][:] = 0
+        hdul_q7[1].data = q7_tab
+        hdul_q7[0].header["MISSION"] = "Kepler"
+        hdul_q7[0].header["QUARTER"] = 7
+        if "CAMPAIGN" in hdul_q7[0].header:
+            del hdul_q7[0].header["CAMPAIGN"]
+        hdul_q7.writeto(kep_q7_path, overwrite=True)
+
+    recorded_titles.clear()
+    cli.main(
+        [
+            str(kep_q7_path),
+            "--hlsp-fits",
+            "-c",
+            "7",
+            "--rr",
+            "[1.0,4.5]",
+            "--thresh",
+            "0.8",
+            "--minflux",
+            "50.0",
+            "-maxiter",
+            "15",
+            "--do-plot",
+            "--name",
+            "kep_q7_hlsp",
+            "--quiet",
+            "--save-dir",
+            str(out_dir),
+        ]
+    )
+    lc_q7 = lk.read(str(out_dir / "kep_q7_hlsp_halo_lc_tv.fits"))
+    assert len(lc_q7) == 36
+    assert recorded_titles == ["kep q7 hlsp - Q07"]
+
+    recorded_titles.clear()
+    cli.main(
+        [
+            str(kep_q7_path),
+            "-c",
+            "7",
+            "--rr",
+            "[1.0,4.5]",
+            "--thresh",
+            "0.8",
+            "--minflux",
+            "50.0",
+            "-maxiter",
+            "10",
+            "--do-plot",
+            "--name",
+            "kep_q7_legacy",
+            "--quiet",
+            "--save-dir",
+            str(out_dir),
+        ]
+    )
+    assert recorded_titles == ["kep q7 legacy - Q07"]
+

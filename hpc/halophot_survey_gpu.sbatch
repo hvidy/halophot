@@ -128,9 +128,11 @@ for raw_line in manifest_path.read_text().splitlines():
             remove_contaminants=has_cat,
             catalog_table=cat_file if has_cat else None,
             offline=True,
+            cache_dir=cache_dir,
+            strict_hpc=True,
             compute_uncertainty=True,
         )
-        out_fits = out_dir / f"{stem}_halo_lc.fits"
+        out_fits = out_dir / f"{stem}_halo_lc_tv.fits"
         halophot.write_fits(lc, out_fits, overwrite=True)
         rows.append(
             {
@@ -160,4 +162,12 @@ for raw_line in manifest_path.read_text().splitlines():
 
 if rows:
     Table(rows=rows).write(out_dir / "summary.parquet", format="parquet", overwrite=True)
+
+if not rows or all(r["status"] == "failed" for r in rows):
+    print(
+        f"FATAL: 0/{len(rows)} targets succeeded in {manifest_path}; failing Slurm job.",
+        file=sys.stderr,
+        flush=True,
+    )
+    sys.exit(1)
 PY

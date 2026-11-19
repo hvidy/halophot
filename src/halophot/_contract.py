@@ -479,6 +479,7 @@ def write_lightcurve_fits(
     resolved_wmap = weightmap
     resolved_werr = None
     resolved_splits = None
+    splits_from_disk_fallback = False
     if isinstance(meta, Mapping):
         if resolved_wmap is None:
             if "WEIGHTMAP" in meta:
@@ -493,6 +494,18 @@ def write_lightcurve_fits(
             resolved_splits = meta["SPLIT_TIMES"]
         elif "split_times" in meta:
             resolved_splits = meta["split_times"]
+
+    # Preserve HALOCVER=1 extensions when re-saving a LightCurve loaded via lk.read(path),
+    # where Lightkurve strips WEIGHTMAP / WEIGHTMAP_ERR / SPLIT_TIMES from lc.meta.
+    if resolved_wmap is None:
+        resolved_wmap = read_weightmap(lc)
+    if resolved_werr is None:
+        resolved_werr = read_weightmap_err(lc)
+    if resolved_splits is None:
+        disk_splits = read_split_times(lc)
+        if disk_splits is not None:
+            resolved_splits = disk_splits
+            splits_from_disk_fallback = True
 
     lc_export = lc.copy() if hasattr(lc, "copy") else lc
     export_meta = getattr(lc_export, "meta", None)
@@ -612,6 +625,15 @@ def write_lightcurve_fits(
     splits_arr: np.ndarray | None = None
     if resolved_splits is not None:
         cand_splits = np.asarray(resolved_splits, dtype=np.float64).ravel()
+        if splits_from_disk_fallback and hasattr(lc, "time") and getattr(lc, "time", None) is not None:
+            t_raw = getattr(lc.time, "value", lc.time)
+            t_fin = np.asarray(t_raw, dtype=np.float64)
+            t_fin = t_fin[np.isfinite(t_fin)]
+            if t_fin.size >= 2:
+                t_min, t_max = float(np.min(t_fin)), float(np.max(t_fin))
+                cand_splits = cand_splits[(cand_splits > t_min) & (cand_splits < t_max)]
+            else:
+                cand_splits = np.empty(0, dtype=np.float64)
         if cand_splits.size > 0:
             if not np.all(np.isfinite(cand_splits)):
                 raise ValueError("SPLIT_TIMES must contain only finite timestamps.")
@@ -673,14 +695,15 @@ def _resolve_lc_hdul_target(lc_or_hdul_or_path: Any) -> Any | None:
         return lc_or_hdul_or_path
 
     # TargetPixelFile stores its live HDUList on _hdu; LightCurve.hdu is a deprecated
-    # property that leaks an unclosed fits.open(self.filename) handle, so never probe
-    # .hdu on LightCurve objects.
-    if isinstance(getattr(lc_or_hdul_or_path, "_hdu", None), fits.HDUList):
-        return lc_or_hdul_or_path
-    if not isinstance(getattr(type(lc_or_hdul_or_path), "hdu", None), property) and isinstance(
-        getattr(lc_or_hdul_or_path, "hdu", None), fits.HDUList
-    ):
-        return lc_or_hdul_or_path
+    # property that leaks an unclosed fits.open(self.filename) handle, so return the
+    # underlying HDUList directly without ever probing .hdu on LightCurve objects.
+    private_hdul = getattr(lc_or_hdul_or_path, "_hdu", None)
+    if isinstance(private_hdul, fits.HDUList):
+        return private_hdul
+    if not isinstance(getattr(type(lc_or_hdul_or_path), "hdu", None), property):
+        public_hdul = getattr(lc_or_hdul_or_path, "hdu", None)
+        if isinstance(public_hdul, fits.HDUList):
+            return public_hdul
 
     meta = getattr(lc_or_hdul_or_path, "meta", None)
     candidates: list[Any] = [getattr(lc_or_hdul_or_path, "filename", None)]
@@ -716,7 +739,7 @@ def read_weightmap(lc_or_hdul_or_path: Any) -> np.ndarray | None:
                 val = meta[key]
                 if isinstance(val, np.ma.MaskedArray):
                     val = val.filled(np.nan)
-                return np.asarray(val, dtype=np.float64)
+                return np.array(val, dtype=np.float64, copy=True)
 
     target = _resolve_lc_hdul_target(lc_or_hdul_or_path)
     if target is None:
@@ -724,7 +747,7 @@ def read_weightmap(lc_or_hdul_or_path: Any) -> np.ndarray | None:
 
     with _open_hdul_and_mask(target, apply_quality_mask=False) as (hdul, _):
         if "WEIGHTMAP" in hdul and hdul["WEIGHTMAP"].data is not None:
-            return np.asarray(hdul["WEIGHTMAP"].data, dtype=np.float64)
+            return np.array(hdul["WEIGHTMAP"].data, dtype=np.float64, copy=True)
         return None
 
 
@@ -740,7 +763,7 @@ def read_weightmap_err(lc_or_hdul_or_path: Any) -> np.ndarray | None:
                 val = meta[key]
                 if isinstance(val, np.ma.MaskedArray):
                     val = val.filled(np.nan)
-                return np.asarray(val, dtype=np.float64)
+                return np.array(val, dtype=np.float64, copy=True)
 
     target = _resolve_lc_hdul_target(lc_or_hdul_or_path)
     if target is None:
@@ -748,7 +771,7 @@ def read_weightmap_err(lc_or_hdul_or_path: Any) -> np.ndarray | None:
 
     with _open_hdul_and_mask(target, apply_quality_mask=False) as (hdul, _):
         if "WEIGHTMAP_ERR" in hdul and hdul["WEIGHTMAP_ERR"].data is not None:
-            return np.asarray(hdul["WEIGHTMAP_ERR"].data, dtype=np.float64)
+            return np.array(hdul["WEIGHTMAP_ERR"].data, dtype=np.float64, copy=True)
         return None
 
 
@@ -761,7 +784,7 @@ def read_split_times(lc_or_hdul_or_path: Any) -> np.ndarray | None:
     if isinstance(meta, Mapping):
         for key in ("SPLIT_TIMES", "split_times"):
             if key in meta and meta[key] is not None:
-                arr = np.asarray(meta[key], dtype=np.float64).ravel()
+                arr = np.asarray(meta[key], dtype=np.float64).reshape(-1).copy()
                 return arr if arr.size > 0 else None
 
     target = _resolve_lc_hdul_target(lc_or_hdul_or_path)
@@ -772,7 +795,11 @@ def read_split_times(lc_or_hdul_or_path: Any) -> np.ndarray | None:
         if "SPLIT_TIMES" in hdul and hdul["SPLIT_TIMES"].data is not None:
             names = [n.upper() for n in (hdul["SPLIT_TIMES"].data.names or ())]
             if "SPLIT_TIME" in names:
-                arr = np.asarray(hdul["SPLIT_TIMES"].data["SPLIT_TIME"], dtype=np.float64).ravel()
+                arr = (
+                    np.asarray(hdul["SPLIT_TIMES"].data["SPLIT_TIME"], dtype=np.float64)
+                    .reshape(-1)
+                    .copy()
+                )
                 return arr if arr.size > 0 else None
         if "WEIGHTMAP" in hdul and "NSPLITS" in hdul["WEIGHTMAP"].header:
             n_splits = int(hdul["WEIGHTMAP"].header["NSPLITS"])
@@ -783,7 +810,7 @@ def read_split_times(lc_or_hdul_or_path: Any) -> np.ndarray | None:
                     if f"SPLIT{idx_s:03d}" in hdul["WEIGHTMAP"].header
                 ]
                 if len(cards) == n_splits:
-                    return np.asarray(cards, dtype=np.float64)
+                    return np.array(cards, dtype=np.float64, copy=True)
         return None
 
 

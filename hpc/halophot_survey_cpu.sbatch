@@ -127,6 +127,8 @@ lc = halophot.extract_halo_lightcurve(
     remove_contaminants=has_cat,
     catalog_table=cat_file if has_cat else None,
     offline=True,
+    cache_dir=cache_dir,
+    strict_hpc=True,
     compute_uncertainty=True,
 )
 out_fits = out_dir / f"{stem}_halo_lc_tv.fits"

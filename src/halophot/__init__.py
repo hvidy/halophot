@@ -42,7 +42,13 @@ from .masking import (
     mask_background_stars,
     remove_stars,
 )
-from .models import HaloObservation, HaloWeights, bucket_pad_length, compute_gap_diff_mask
+from .models import (
+    HaloObservation,
+    HaloWeights,
+    bucket_pad_length,
+    compute_effective_constraints,
+    compute_gap_diff_mask,
+)
 from .objectives import (
     AVAILABLE_OBJECTIVES,
     charbonnier_penalty,
@@ -96,6 +102,7 @@ __all__ = [
     "charbonnier_penalty",
     "column_orthogonal_smear_weights",
     "compute_coherent_flux_err",
+    "compute_effective_constraints",
     "compute_gap_diff_mask",
     "extract_halo_lightcurve",
     "flux_share_to_weights",
