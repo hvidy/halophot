@@ -18,11 +18,12 @@ import contextlib
 import math
 import os
 import warnings
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from enum import IntFlag
 from pathlib import Path
 from typing import Any, NamedTuple
 
+import astropy.units as u
 import numpy as np
 from astropy.io import fits
 
@@ -64,7 +65,7 @@ def _open_hdul_and_mask(
     apply_quality_mask: bool = True,
 ) -> Iterator[tuple[fits.HDUList, np.ndarray | None]]:
     """Yield ``(hdul, quality_mask)`` from a ``TargetPixelFile``, ``HDUList``, or path."""
-    if isinstance(tpf_or_hdul, (str, os.PathLike)):
+    if isinstance(tpf_or_hdul, str | os.PathLike):
         with fits.open(tpf_or_hdul) as hdul:
             yield hdul, None
         return
@@ -122,7 +123,7 @@ def _tpf_shape(hdul: fits.HDUList) -> tuple[int, int, int] | None:
 
 
 def _parse_bool_card(value: object, card_name: str) -> bool:
-    if isinstance(value, (bool, np.bool_)):
+    if isinstance(value, bool | np.bool_):
         return bool(value)
     raise ValueError(
         f"Header card {card_name!r} must be a FITS logical boolean, got {value!r}."
@@ -341,7 +342,7 @@ def infer_bkg_poly_order(tpf_or_hdul: Any) -> int | None:
         for hdr in candidate_headers:
             if "BKG_ORD" in hdr:
                 raw_ord = hdr["BKG_ORD"]
-                if isinstance(raw_ord, bool) or not isinstance(raw_ord, (int, np.integer)) or int(raw_ord) < 0:
+                if isinstance(raw_ord, bool) or not isinstance(raw_ord, int | np.integer) or int(raw_ord) < 0:
                     raise ValueError(
                         f"BKG_ORD header card must be a non-negative integer, got {raw_ord!r}."
                     )
@@ -461,12 +462,16 @@ def write_lightcurve_fits(
     *,
     overwrite: bool = True,
 ) -> Path:
-    """Serialize a ``lightkurve.LightCurve`` to FITS with a lossless ``WEIGHTMAP`` ``ImageHDU``.
+    """Serialize a ``lightkurve.LightCurve`` to FITS with lossless ``HALOCVER = 1`` extensions.
 
-    ``LightCurve.to_fits()`` drops 2D/3D ``ndarray`` entries from ``lc.meta``.
-    This writer preserves ``lc.meta['WEIGHTMAP']`` (or an explicit ``weightmap``
-    argument) in an appended ``ImageHDU(name='WEIGHTMAP')`` while leaving the
-    in-memory ``lc.meta`` dictionary untouched.
+    ``LightCurve.to_fits()`` drops 2D/3D ``ndarray`` entries from ``lc.meta``, omits
+    ``HALOCVER = 1`` provenance headers, and loses physical ``e-/s`` units when
+    ``normalize=False``. Always use :func:`halophot.write_fits` (alias for
+    ``write_lightcurve_fits``) and :func:`halophot.read_weightmap` (plus
+    :func:`halophot.read_weightmap_err` and :func:`halophot.read_split_times`) instead of
+    ``lc.to_fits(path)`` to preserve ``WEIGHTMAP``, ``WEIGHTMAP_ERR``, ``SPLIT_TIMES``,
+    provenance header cards (``BKGSUB``, ``BKG_ORD``, ``HALO_OBJ``, ``HALO_LAG``,
+    ``LEGACYTV``), and physical ``TUNIT`` columns while leaving ``lc.meta`` untouched.
     """
     out_path = Path(path)
 
@@ -474,7 +479,8 @@ def write_lightcurve_fits(
     resolved_wmap = weightmap
     resolved_werr = None
     resolved_splits = None
-    if isinstance(meta, dict):
+    splits_from_disk_fallback = False
+    if isinstance(meta, Mapping):
         if resolved_wmap is None:
             if "WEIGHTMAP" in meta:
                 resolved_wmap = meta["WEIGHTMAP"]
@@ -489,11 +495,23 @@ def write_lightcurve_fits(
         elif "split_times" in meta:
             resolved_splits = meta["split_times"]
 
+    # Preserve HALOCVER=1 extensions when re-saving a LightCurve loaded via lk.read(path),
+    # where Lightkurve strips WEIGHTMAP / WEIGHTMAP_ERR / SPLIT_TIMES from lc.meta.
+    if resolved_wmap is None:
+        resolved_wmap = read_weightmap(lc)
+    if resolved_werr is None:
+        resolved_werr = read_weightmap_err(lc)
+    if resolved_splits is None:
+        disk_splits = read_split_times(lc)
+        if disk_splits is not None:
+            resolved_splits = disk_splits
+            splits_from_disk_fallback = True
+
     lc_export = lc.copy() if hasattr(lc, "copy") else lc
     export_meta = getattr(lc_export, "meta", None)
-    if isinstance(export_meta, dict):
-        if export_meta is meta:
-            export_meta = dict(meta)
+    if isinstance(export_meta, Mapping):
+        if export_meta is meta or not isinstance(export_meta, dict):
+            export_meta = dict(export_meta)
             lc_export.meta = export_meta
         for key in (
             "WEIGHTMAP",
@@ -502,31 +520,120 @@ def write_lightcurve_fits(
             "weightmap_err",
             "SPLIT_TIMES",
             "split_times",
+            "FILENAME",
+            "filename",
         ):
             export_meta.pop(key, None)
-        for attr, meta_key in (
-            ("targetid", "TARGETID"),
-            ("channel", "CHANNEL"),
-            ("mission", "MISSION"),
-            ("ra", "RA"),
-            ("dec", "DEC"),
+        # Ensure TARGETID/MISSION have string defaults (avoiding literal 'None' OBJECT cards),
+        # and satisfy KeplerLightCurve.to_fits() mandatory self.<attr> lookups when unpopulated.
+        if (
+            "TARGETID" not in export_meta
+            and "targetid" not in export_meta
+            and getattr(lc_export, "targetid", None) is None
         ):
+            export_meta["TARGETID"] = ""
+        cls_name = type(lc_export).__name__
+        if (
+            cls_name == "TessLightCurve"
+            and "MISSION" not in export_meta
+            and "mission" not in export_meta
+            and getattr(lc_export, "mission", None) is None
+        ):
+            export_meta["MISSION"] = "TESS"
+        elif cls_name == "KeplerLightCurve":
             if (
-                meta_key not in export_meta
-                and attr not in export_meta
-                and not hasattr(lc_export, attr)
+                "MISSION" not in export_meta
+                and "mission" not in export_meta
+                and getattr(lc_export, "mission", None) is None
             ):
-                export_meta[meta_key] = "" if attr == "targetid" else None
+                export_meta["MISSION"] = "Kepler"
+            for attr, meta_key in (("channel", "CHANNEL"), ("ra", "RA"), ("dec", "DEC")):
+                if (
+                    meta_key not in export_meta
+                    and attr not in export_meta
+                    and not hasattr(lc_export, attr)
+                ):
+                    export_meta[meta_key] = None
     if not hasattr(lc_export, "quality") and hasattr(lc_export, "__setitem__"):
         lc_export["quality"] = np.zeros(len(lc_export), dtype=np.int32)
 
     hdul = lc_export.to_fits()
 
+    if str(hdul[0].header.get("OBJECT", "")).strip() == "None":
+        hdul[0].header["OBJECT"] = ""
+    if str(hdul[0].header.get("INSTRUME", "")).strip() == "None":
+        del hdul[0].header["INSTRUME"]
+
+    telescop = str(hdul[0].header.get("TELESCOP", "") or "").strip().upper()
+    if not telescop and str(getattr(lc, "mission", "") or "").strip().upper() == "TESS":
+        hdul[0].header["TELESCOP"] = ("TESS", "Telescope")
+        telescop = "TESS"
+    instrume_curr = hdul[0].header.get("INSTRUME")
+    if telescop == "TESS" and (
+        instrume_curr is None or str(instrume_curr).strip() in ("", "None")
+    ):
+        hdul[0].header["INSTRUME"] = ("TESS Photometer", "Instrument name")
+
     hdul[0].header["HALOCVER"] = (HALOCVER, "Halophot pipeline contract version")
+    if isinstance(meta, Mapping):
+        if meta.get("BKGSUB") is not None:
+            hdul[0].header["BKGSUB"] = (
+                bool(meta["BKGSUB"]),
+                "Whether 2D background has been subtracted",
+            )
+        if meta.get("BKG_ORD") is not None:
+            hdul[0].header["BKG_ORD"] = (
+                int(meta["BKG_ORD"]),
+                "Polynomial background degree",
+            )
+        if meta.get("HALO_OBJ") is not None:
+            hdul[0].header["HALO_OBJ"] = (
+                str(meta["HALO_OBJ"]),
+                "Halophot objective function",
+            )
+        if meta.get("HALO_LAG") is not None:
+            hdul[0].header["HALO_LAG"] = (
+                int(meta["HALO_LAG"]),
+                "Halophot lag cadence step",
+            )
+        if meta.get("LEGACYTV") is not None:
+            hdul[0].header["LEGACYTV"] = (
+                bool(meta["LEGACYTV"]),
+                "Whether legacy unregularized TV was used",
+            )
+
+    flux_unit = getattr(getattr(lc, "flux", None), "unit", None)
+    if (
+        flux_unit is not None
+        and flux_unit != u.dimensionless_unscaled
+        and len(hdul) > 1
+        and hasattr(hdul[1], "columns")
+    ):
+        if flux_unit == u.electron / u.s or str(flux_unit).strip() in (
+            "electron / s",
+            "electron/s",
+            "e-/s",
+        ):
+            unit_str = "e-/s"
+        else:
+            unit_str = flux_unit.to_string("fits")
+        for idx_col, col in enumerate(hdul[1].columns, start=1):
+            if col.name.upper() in ("FLUX", "FLUX_ERR"):
+                col.unit = unit_str
+                hdul[1].header[f"TUNIT{idx_col}"] = unit_str
 
     splits_arr: np.ndarray | None = None
     if resolved_splits is not None:
         cand_splits = np.asarray(resolved_splits, dtype=np.float64).ravel()
+        if splits_from_disk_fallback and hasattr(lc, "time") and getattr(lc, "time", None) is not None:
+            t_raw = getattr(lc.time, "value", lc.time)
+            t_fin = np.asarray(t_raw, dtype=np.float64)
+            t_fin = t_fin[np.isfinite(t_fin)]
+            if t_fin.size >= 2:
+                t_min, t_max = float(np.min(t_fin)), float(np.max(t_fin))
+                cand_splits = cand_splits[(cand_splits > t_min) & (cand_splits < t_max)]
+            else:
+                cand_splits = np.empty(0, dtype=np.float64)
         if cand_splits.size > 0:
             if not np.all(np.isfinite(cand_splits)):
                 raise ValueError("SPLIT_TIMES must contain only finite timestamps.")
@@ -561,11 +668,16 @@ def write_lightcurve_fits(
         hdul.append(wmap_hdu)
 
     if resolved_werr is not None:
+        if isinstance(resolved_werr, np.ma.MaskedArray):
+            resolved_werr = resolved_werr.filled(np.nan)
         werr_arr = np.asarray(resolved_werr, dtype=np.float64)
-        if werr_arr.ndim >= 2:
-            if "WEIGHTMAP_ERR" in hdul:
-                del hdul["WEIGHTMAP_ERR"]
-            hdul.append(fits.ImageHDU(data=werr_arr, name="WEIGHTMAP_ERR"))
+        if werr_arr.ndim < 2:
+            raise ValueError(
+                f"WEIGHTMAP_ERR must have at least 2 dimensions (ny, nx), got shape {werr_arr.shape}."
+            )
+        if "WEIGHTMAP_ERR" in hdul:
+            del hdul["WEIGHTMAP_ERR"]
+        hdul.append(fits.ImageHDU(data=werr_arr, name="WEIGHTMAP_ERR"))
 
     if splits_arr is not None:
         if "SPLIT_TIMES" in hdul:
@@ -577,23 +689,117 @@ def write_lightcurve_fits(
     return out_path
 
 
+def _resolve_lc_hdul_target(lc_or_hdul_or_path: Any) -> Any | None:
+    """Resolve an openable FITS target for ``read_weightmap*`` / ``read_split_times``."""
+    if isinstance(lc_or_hdul_or_path, str | os.PathLike | fits.HDUList):
+        return lc_or_hdul_or_path
+
+    # TargetPixelFile stores its live HDUList on _hdu; LightCurve.hdu is a deprecated
+    # property that leaks an unclosed fits.open(self.filename) handle, so return the
+    # underlying HDUList directly without ever probing .hdu on LightCurve objects.
+    private_hdul = getattr(lc_or_hdul_or_path, "_hdu", None)
+    if isinstance(private_hdul, fits.HDUList):
+        return private_hdul
+    if not isinstance(getattr(type(lc_or_hdul_or_path), "hdu", None), property):
+        public_hdul = getattr(lc_or_hdul_or_path, "hdu", None)
+        if isinstance(public_hdul, fits.HDUList):
+            return public_hdul
+
+    meta = getattr(lc_or_hdul_or_path, "meta", None)
+    candidates: list[Any] = [getattr(lc_or_hdul_or_path, "filename", None)]
+    if isinstance(meta, Mapping):
+        candidates.extend([meta.get("FILENAME"), meta.get("filename")])
+
+    for cand in candidates:
+        if isinstance(cand, fits.HDUList):
+            return cand
+        if isinstance(cand, str | os.PathLike) and str(cand).strip():
+            path = Path(cand).expanduser()
+            if path.is_file():
+                return path
+
+    if isinstance(meta, Mapping) or hasattr(lc_or_hdul_or_path, "flux"):
+        return None
+
+    raise TypeError(
+        "Expected a lightkurve.LightCurve, lightkurve.TargetPixelFile, "
+        f"astropy.io.fits.HDUList, or FITS path; got {type(lc_or_hdul_or_path).__name__}."
+    )
+
+
+def read_weightmap(lc_or_hdul_or_path: Any) -> np.ndarray | None:
+    """Read the 2D ``(ny, nx)`` or 3D ``(n_splits, ny, nx)`` ``WEIGHTMAP`` from a light curve or FITS file.
+
+    Returns ``None`` when no ``WEIGHTMAP`` metadata or ``ImageHDU`` is present.
+    """
+    meta = getattr(lc_or_hdul_or_path, "meta", None)
+    if isinstance(meta, Mapping):
+        for key in ("WEIGHTMAP", "weightmap"):
+            if key in meta and meta[key] is not None:
+                val = meta[key]
+                if isinstance(val, np.ma.MaskedArray):
+                    val = val.filled(np.nan)
+                return np.array(val, dtype=np.float64, copy=True)
+
+    target = _resolve_lc_hdul_target(lc_or_hdul_or_path)
+    if target is None:
+        return None
+
+    with _open_hdul_and_mask(target, apply_quality_mask=False) as (hdul, _):
+        if "WEIGHTMAP" in hdul and hdul["WEIGHTMAP"].data is not None:
+            return np.array(hdul["WEIGHTMAP"].data, dtype=np.float64, copy=True)
+        return None
+
+
+def read_weightmap_err(lc_or_hdul_or_path: Any) -> np.ndarray | None:
+    """Read the 2D ``(ny, nx)`` or 3D ``(n_splits, ny, nx)`` ``WEIGHTMAP_ERR`` from a light curve or FITS file.
+
+    Returns ``None`` when no ``WEIGHTMAP_ERR`` metadata or ``ImageHDU`` is present.
+    """
+    meta = getattr(lc_or_hdul_or_path, "meta", None)
+    if isinstance(meta, Mapping):
+        for key in ("WEIGHTMAP_ERR", "weightmap_err"):
+            if key in meta and meta[key] is not None:
+                val = meta[key]
+                if isinstance(val, np.ma.MaskedArray):
+                    val = val.filled(np.nan)
+                return np.array(val, dtype=np.float64, copy=True)
+
+    target = _resolve_lc_hdul_target(lc_or_hdul_or_path)
+    if target is None:
+        return None
+
+    with _open_hdul_and_mask(target, apply_quality_mask=False) as (hdul, _):
+        if "WEIGHTMAP_ERR" in hdul and hdul["WEIGHTMAP_ERR"].data is not None:
+            return np.array(hdul["WEIGHTMAP_ERR"].data, dtype=np.float64, copy=True)
+        return None
+
+
 def read_split_times(lc_or_hdul_or_path: Any) -> np.ndarray | None:
     """Read segment ``SPLIT_TIMES`` from a light curve, FITS ``HDUList``, or path.
 
     Returns ``None`` when the observation was extracted without segment splits.
     """
     meta = getattr(lc_or_hdul_or_path, "meta", None)
-    if isinstance(meta, dict):
+    if isinstance(meta, Mapping):
         for key in ("SPLIT_TIMES", "split_times"):
             if key in meta and meta[key] is not None:
-                arr = np.asarray(meta[key], dtype=np.float64).ravel()
+                arr = np.asarray(meta[key], dtype=np.float64).reshape(-1).copy()
                 return arr if arr.size > 0 else None
 
-    with _open_hdul_and_mask(lc_or_hdul_or_path, apply_quality_mask=False) as (hdul, _):
+    target = _resolve_lc_hdul_target(lc_or_hdul_or_path)
+    if target is None:
+        return None
+
+    with _open_hdul_and_mask(target, apply_quality_mask=False) as (hdul, _):
         if "SPLIT_TIMES" in hdul and hdul["SPLIT_TIMES"].data is not None:
             names = [n.upper() for n in (hdul["SPLIT_TIMES"].data.names or ())]
             if "SPLIT_TIME" in names:
-                arr = np.asarray(hdul["SPLIT_TIMES"].data["SPLIT_TIME"], dtype=np.float64).ravel()
+                arr = (
+                    np.asarray(hdul["SPLIT_TIMES"].data["SPLIT_TIME"], dtype=np.float64)
+                    .reshape(-1)
+                    .copy()
+                )
                 return arr if arr.size > 0 else None
         if "WEIGHTMAP" in hdul and "NSPLITS" in hdul["WEIGHTMAP"].header:
             n_splits = int(hdul["WEIGHTMAP"].header["NSPLITS"])
@@ -604,7 +810,7 @@ def read_split_times(lc_or_hdul_or_path: Any) -> np.ndarray | None:
                     if f"SPLIT{idx_s:03d}" in hdul["WEIGHTMAP"].header
                 ]
                 if len(cards) == n_splits:
-                    return np.asarray(cards, dtype=np.float64)
+                    return np.array(cards, dtype=np.float64, copy=True)
         return None
 
 
@@ -621,31 +827,48 @@ def _is_under_fred(path: Path) -> bool:
 def resolve_cache_dir(
     cache_dir: str | os.PathLike[str] | None = None,
     *,
-    strict_hpc: bool = False,
+    strict_hpc: bool = True,
+    create: bool = False,
 ) -> Path:
-    """Resolve the package cache directory, guarding ``/fred`` inode quotas in HPC mode.
+    """Resolve the package cache directory, guarding ``/fred/`` inode quotas on HPC.
 
     Precedence when ``cache_dir`` is ``None``:
-    1. ``$SCRATCH/.cache/tess_bright`` if ``SCRATCH`` is set and non-empty.
-    2. ``$XDG_CACHE_HOME/tess_bright`` if ``XDG_CACHE_HOME`` is set and non-empty.
-    3. ``~/.cache/tess_bright``.
+    1. ``$HALOPHOT_CACHE_DIR`` if set and non-empty.
+    2. ``$TESS_BRIGHT_CACHE_DIR`` if set and non-empty.
+    3. ``$SCRATCH/.cache/tess_bright`` if ``SCRATCH`` is set and non-empty.
+    4. ``$XDG_CACHE_HOME/tess_bright`` if ``XDG_CACHE_HOME`` is set and non-empty.
+    5. ``~/.cache/tess_bright``.
 
-    When ``strict_hpc=True``, raises ``ValueError`` if the resolved path points
-    to or inside ``/fred/`` (protecting Swinburne NT / OzSTAR project inode caps).
+    Symlinks are resolved via ``Path.resolve(strict=False)`` before checking
+    ``/fred/``. When ``strict_hpc=True`` (the default), raises :class:`ValueError`
+    if the resolved path points to or inside ``/fred/``; when ``strict_hpc=False``,
+    emits a :class:`UserWarning`. When ``create=True``, creates the resolved
+    directory with ``parents=True, exist_ok=True``.
     """
     if cache_dir is not None:
-        resolved = Path(cache_dir).expanduser()
-    elif os.environ.get("SCRATCH"):
-        resolved = Path(os.environ["SCRATCH"]).expanduser() / ".cache" / "tess_bright"
-    elif os.environ.get("XDG_CACHE_HOME"):
-        resolved = Path(os.environ["XDG_CACHE_HOME"]).expanduser() / "tess_bright"
+        raw = Path(cache_dir).expanduser()
+    elif os.environ.get("HALOPHOT_CACHE_DIR", "").strip():
+        raw = Path(os.environ["HALOPHOT_CACHE_DIR"].strip()).expanduser()
+    elif os.environ.get("TESS_BRIGHT_CACHE_DIR", "").strip():
+        raw = Path(os.environ["TESS_BRIGHT_CACHE_DIR"].strip()).expanduser()
+    elif os.environ.get("SCRATCH", "").strip():
+        raw = Path(os.environ["SCRATCH"].strip()).expanduser() / ".cache" / "tess_bright"
+    elif os.environ.get("XDG_CACHE_HOME", "").strip():
+        raw = Path(os.environ["XDG_CACHE_HOME"].strip()).expanduser() / "tess_bright"
     else:
-        resolved = Path.home() / ".cache" / "tess_bright"
+        raw = Path.home() / ".cache" / "tess_bright"
 
-    if strict_hpc and _is_under_fred(resolved):
-        raise ValueError(
-            f"Cache directory {resolved} lies under /fred/, which is forbidden in "
-            "strict_hpc=True mode to protect project inode quotas; use $SCRATCH or $JOBFS."
+    resolved = raw.resolve(strict=False)
+    if _is_under_fred(raw) or resolved.parts[:2] == ("/", "fred"):
+        msg = (
+            f"Cache directory {resolved} lies under /fred/, which violates "
+            "Swinburne NT/OzSTAR project inode quotas; use $SCRATCH or $JOBFS instead."
         )
+        if strict_hpc:
+            raise ValueError(msg)
+        warnings.warn(msg, UserWarning, stacklevel=2)
+
+    if create:
+        resolved.mkdir(parents=True, exist_ok=True)
 
     return resolved

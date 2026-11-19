@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "Kepler/K2 and TESS halo photometry with total variation regularization in JAX."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "GPL-3.0-or-later" }
+license = { file = "LICENSE" }
 authors = [
   { name = "Tim White" },
   { name = "Benjamin Pope", email = "benjamin.pope@mq.edu.au" },
@@ -55,6 +55,11 @@ dev = [
   "pytest>=8.0",
   "ruff>=0.6",
 ]
+hpc = [
+  "pyarrow>=15.0",
+  "fsspec>=2024.2",
+  "s3fs>=2024.2",
+]
 
 [project.scripts]
 halo = "halophot.cli:main"
@@ -83,6 +88,7 @@ exclude = [
 target-version = "py311"
 line-length = 100
 src = ["src", "tests"]
+extend-exclude = ["notebooks", "docs", "tv_halo.ipynb", "halo_atlas.ipynb", "experiments"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "W"]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import types
 from pathlib import Path
 
 import astropy.units as u
@@ -740,3 +741,358 @@ def test_end_to_end_real_k2_tpf_and_epic_mast_fits(tmp_path: Path) -> None:
         assert hdul_cli["WEIGHTMAP"].data.shape == (2, ny_k2, nx_k2)
         assert "SPLIT_TIMES" in hdul_cli
         assert len(hdul_cli["SPLIT_TIMES"].data) == 1
+
+
+def test_cli_hlsp_fits_faint_tess_wings_campaign_guard_and_sector_title(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify [HALO-01]: halo --hlsp-fits preserves <100 e-/s TESS wings, ignores K2 -c cuts on TESS, and labels S07."""
+    rng = np.random.default_rng(70707)
+    n_cad, ny, nx = 64, 5, 5
+    t_rel = np.arange(n_cad, dtype=np.float64) * (2.0 / 1440.0)
+    stellar = 1.0 + 0.012 * np.sin(2.0 * np.pi * t_rel / 0.04)
+    jitter = 0.06 * ((np.arange(n_cad) % 11) / 10.0 - 0.5)
+
+    flux = np.zeros((n_cad, ny, nx), dtype=np.float64)
+    for r in range(ny):
+        for c in range(nx):
+            sens = (c - 2.0) / 2.0
+            wing_level = 45.0 + 8.0 * r + 3.0 * c  # 45..89 e-/s (< 100 e-/s legacy K2 cutoff!)
+            flux[:, r, c] = wing_level * stellar * (1.0 + sens * jitter) + rng.normal(
+                0.0, 0.25, size=n_cad
+            )
+    # Single saturated core pixel (> TESS_SAT_RATE_E_PER_S) so saturated-column masking triggers cleanly
+    flux[:, 2, 2] = 2.0e5 * stellar
+    flux_err = np.full_like(flux, 0.25)
+    flux_bkg = np.full_like(flux, 30.0)
+    pq = np.zeros((ny, nx), dtype=np.int32)
+    pq[:, 2] = int(PixelQuality.SAT_BLEED)
+
+    tpf_path = tmp_path / "tess_s07_faint_wings_tpf.fits"
+    _build_synthetic_halocver_tpf_file(
+        tpf_path,
+        flux=flux,
+        flux_err=flux_err,
+        flux_bkg=flux_bkg,
+        pixel_quality=pq,
+        bkgsub=True,
+    )
+    # Set SECTOR = 7; note TIME starts at BTJD 2000.0 (< 2470.0), which K2 Campaign 7 cut would wipe out!
+    with fits.open(tpf_path, mode="update") as hdul_upd:
+        hdul_upd[0].header["SECTOR"] = 7
+        hdul_upd.flush()
+
+    tpf_lk = lk.read(str(tpf_path))
+    lc_py = extract_halo_lightcurve(tpf_lk, maxiter=151, offline=True)
+
+    recorded_titles: list[str] = []
+    orig_plot_all = cli.plot_all
+
+    def _spy_plot_all(*args: object, **kwargs: object) -> object:
+        recorded_titles.append(str(kwargs.get("formal_name", "")))
+        return orig_plot_all(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "plot_all", _spy_plot_all)
+
+    cache_dir = tmp_path / "cli_s07_cache"
+    out_dir = tmp_path / "cli_s07_out"
+    out_dir.mkdir()
+    cli.main(
+        [
+            str(tpf_path),
+            "--hlsp-fits",
+            "-c",
+            "7",
+            "-maxiter",
+            "151",
+            "--do-plot",
+            "--name",
+            "alf_CMa",
+            "--offline",
+            "--strict-hpc",
+            "--cache-dir",
+            str(cache_dir),
+            "--quiet",
+            "--save-dir",
+            str(out_dir),
+        ]
+    )
+
+    cli_fits = out_dir / "alf_CMa_halo_lc_tv.fits"
+    assert cli_fits.exists()
+    lc_cli = lk.read(str(cli_fits))
+    assert len(lc_cli) == n_cad == len(lc_py)
+    np.testing.assert_allclose(lc_cli.flux.value, lc_py.flux.value, rtol=1e-5, atol=1e-6)
+
+    wmap_cli = halophot.read_weightmap(cli_fits)
+    wmap_py = halophot.read_weightmap(lc_py)
+    assert wmap_cli is not None and wmap_py is not None
+    assert int(np.sum(wmap_cli > 0.0)) >= 12  # Faint <100 e-/s halo wings preserved!
+    assert int(np.sum(wmap_cli > 0.0)) == int(np.sum(wmap_py > 0.0))
+    np.testing.assert_allclose(wmap_cli, wmap_py, rtol=1e-5, atol=1e-6)
+    assert len(recorded_titles) == 1
+    assert recorded_titles[0].endswith(" - S07")
+
+
+def test_mask_background_stars_cache_dir_forwarding_and_fred_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify /fred symlink guard, Catalogs.cache_location forwarding, and clean None restoration."""
+    import astroquery.mast as aq_mast
+
+    for env_key in ("HALOPHOT_CACHE_DIR", "TESS_BRIGHT_CACHE_DIR", "SCRATCH", "XDG_CACHE_HOME"):
+        monkeypatch.delenv(env_key, raising=False)
+
+    n_cad, ny, nx = 20, 6, 6
+    ra0, dec0 = 101.287, -16.716
+    wcs_2d = _make_celestial_wcs(ny, nx, ra0=ra0, dec0=dec0)
+    contam_sky = wcs_2d.pixel_to_world(4.0, 1.0)
+    cat = Table({"ra": [contam_sky.ra.deg], "dec": [contam_sky.dec.deg], "Tmag": [10.5]})
+
+    fred_link = tmp_path / "fred_cache_symlink"
+    fred_link.symlink_to("/fred/oz440/bpo/.cache/tess_bright")
+
+    # 1. /fred symlink rejected BEFORE any live MAST query (and when catalog_table is supplied)
+    def _must_not_query(*args: object, **kwargs: object) -> Table:
+        raise AssertionError("Catalogs.query_region must never execute when /fred guard rejects cache_dir!")
+
+    stub_guard = types.SimpleNamespace(cache_location=None, query_region=_must_not_query)
+    monkeypatch.setattr(aq_mast, "Catalogs", stub_guard)
+
+    with pytest.raises(ValueError, match="/fred/"):
+        mask_background_stars(wcs_2d, (ny, nx), catalog_table=None, offline=False, cache_dir=fred_link)
+    with pytest.raises(ValueError, match="/fred/"):
+        mask_background_stars(wcs_2d, (ny, nx), catalog_table=cat, offline=True, cache_dir=fred_link)
+
+    flux = np.full((n_cad, ny, nx), 600.0, dtype=np.float64)
+    tpf = _build_synthetic_halocver_tpf_file(
+        tmp_path / "fred_guard_tpf.fits",
+        flux=flux,
+        flux_err=np.sqrt(flux),
+        flux_bkg=np.full_like(flux, 20.0),
+        ra0=ra0,
+        dec0=dec0,
+    )
+    with pytest.raises(ValueError, match="/fred/"):
+        remove_stars(tpf, catalog_table=cat, offline=True, cache_dir=fred_link)
+    with pytest.raises(ValueError, match="/fred/"):
+        build_halo_masks(flux, flux_err=np.sqrt(flux), cache_dir=fred_link)
+    with pytest.raises(ValueError, match="/fred/"):
+        extract_halo_lightcurve(tpf, cache_dir=fred_link, maxiter=15)
+
+    # strict_hpc=False downgrades /fred rejection to UserWarning
+    with pytest.warns(UserWarning, match="/fred/"):
+        mask_relaxed = mask_background_stars(
+            wcs_2d, (ny, nx), catalog_table=cat, offline=True, cache_dir=fred_link, strict_hpc=False
+        )
+    assert bool(mask_relaxed[1, 4]) is True
+
+    # 2. Real CatalogsClass instance (with _cache_location initially None): forwards cache_dir
+    #    and restores _cache_location = None cleanly on both success and exception!
+    real_cat = aq_mast.CatalogsClass()
+    assert real_cat._cache_location is None
+    observed_caches: list[Path] = []
+
+    def _fake_real_query(center: object, *, radius: object, catalog: str = "TIC") -> Table:
+        observed_caches.append(Path(real_cat.cache_location))
+        return cat
+
+    monkeypatch.setattr(real_cat, "query_region", _fake_real_query)
+    monkeypatch.setattr(aq_mast, "Catalogs", real_cat)
+
+    custom_cache = tmp_path / "aphid_scratch" / "mast_cache"
+    live_mask = mask_background_stars(
+        wcs_2d,
+        (ny, nx),
+        catalog_table=None,
+        offline=False,
+        cache_dir=custom_cache,
+        radius_pix=1.2,
+    )
+    assert custom_cache.is_dir()
+    assert observed_caches == [custom_cache.resolve()]
+    assert real_cat._cache_location is None
+    assert bool(live_mask[1, 4]) is True
+
+    def _boom_query(*args: object, **kwargs: object) -> Table:
+        assert Path(real_cat.cache_location) == custom_cache.resolve()
+        raise RuntimeError("simulated MAST outage")
+
+    monkeypatch.setattr(real_cat, "query_region", _boom_query)
+    with pytest.raises(RuntimeError, match="simulated MAST outage"):
+        mask_background_stars(wcs_2d, (ny, nx), catalog_table=None, offline=False, cache_dir=custom_cache)
+    assert real_cat._cache_location is None
+
+    # 3. Plain stub Catalogs without _cache_location whose cache_location starts as None:
+    #    must ALSO restore cache_location to None!
+    seen_stub_locs: list[object] = []
+
+    def _stub_query(*args: object, **kwargs: object) -> Table:
+        seen_stub_locs.append(stub_none.cache_location)
+        return cat
+
+    stub_none = types.SimpleNamespace(cache_location=None, query_region=_stub_query)
+    monkeypatch.setattr(aq_mast, "Catalogs", stub_none)
+    mask_stub = mask_background_stars(
+        wcs_2d, (ny, nx), catalog_table=None, offline=False, cache_dir=custom_cache, radius_pix=1.2
+    )
+    assert seen_stub_locs == [str(custom_cache.resolve())]
+    assert stub_none.cache_location is None
+    assert bool(mask_stub[1, 4]) is True
+
+
+def test_cli_strict_hpc_boolean_optional_and_k2_campaign_inference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify CLI --strict-hpc (default True) / --no-strict-hpc and implicit K2 campaign cuts."""
+    parser = cli.build_parser()
+    assert parser.parse_args(["foo.fits"]).strict_hpc is True
+    assert parser.parse_args(["foo.fits", "--strict-hpc"]).strict_hpc is True
+    assert parser.parse_args(["foo.fits", "--no-strict-hpc"]).strict_hpc is False
+
+    # Build a K2 Campaign 12 TPF from the real K2 fixture spanning the (2937.75, 2938.8) safe-mode window
+    assert K2_TPF_FITS.exists()
+    n_cad = 40
+    bkjd = np.linspace(2937.0, 2940.0, n_cad, dtype=np.float64)
+    in_window = (bkjd > 2937.75) & (bkjd < 2938.8)
+    assert 4 <= int(np.sum(in_window)) <= 20
+
+    k2_c12_path = tmp_path / "ktwo205897543-c12_lpd-targ.fits"
+    with fits.open(K2_TPF_FITS) as hdul_src:
+        hdul_c12 = fits.HDUList([h.copy() for h in hdul_src])
+        sub_tab = hdul_c12[1].data[:n_cad].copy()
+        sub_tab["TIME"][:] = bkjd
+        sub_tab["QUALITY"][:] = 0
+        # Inject a step inside the C12 safe-mode window that must be excised automatically!
+        sub_tab["FLUX"][in_window, :, :] *= 3.0
+        hdul_c12[1].data = sub_tab
+        hdul_c12[0].header["CAMPAIGN"] = 12
+        hdul_c12.writeto(k2_c12_path, overwrite=True)
+
+    out_dir = tmp_path / "k2_c12_out"
+    out_dir.mkdir()
+
+    # Default strict_hpc=True rejects /fred cache dir even without --strict-hpc on CLI!
+    with pytest.raises(ValueError, match="/fred/"):
+        cli.main(
+            [
+                str(k2_c12_path),
+                "--hlsp-fits",
+                "--cache-dir",
+                "/fred/oz440/bpo/.cache",
+                "--save-dir",
+                str(out_dir),
+            ]
+        )
+
+    recorded_titles: list[str] = []
+    orig_plot_all = cli.plot_all
+
+    def _spy_plot_all(*args: object, **kwargs: object) -> object:
+        recorded_titles.append(str(kwargs.get("formal_name", "")))
+        return orig_plot_all(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "plot_all", _spy_plot_all)
+
+    # --no-strict-hpc downgrades /fred rejection to UserWarning, and omitted -c infers C12 from TPF!
+    with pytest.warns(UserWarning, match="/fred/"):
+        cli.main(
+            [
+                str(k2_c12_path),
+                "--hlsp-fits",
+                "--no-strict-hpc",
+                "--cache-dir",
+                "/fred/oz440/bpo/.cache",
+                "--rr",
+                "[1.0,4.5]",
+                "--thresh",
+                "0.8",
+                "--minflux",
+                "50.0",
+                "-maxiter",
+                "25",
+                "--do-plot",
+                "--name",
+                "k2_c12",
+                "--quiet",
+                "--save-dir",
+                str(out_dir),
+            ]
+        )
+
+    c12_fits = out_dir / "k2_c12_halo_lc_tv.fits"
+    assert c12_fits.is_file()
+    lc_c12 = lk.read(str(c12_fits))
+    assert len(lc_c12) == n_cad - int(np.sum(in_window))
+    assert not np.any((lc_c12.time.value > 2937.75) & (lc_c12.time.value < 2938.8))
+    assert recorded_titles == ["k2 c12 - C12"]
+
+    # Kepler prime-mission Quarter 7 TPF (BKJD ~ 700 < 1600) passed with `-c 7` must NOT trigger
+    # K2 Campaign 7 `t > 2470` excision, and `--do-plot` must label `- Q07` in both modes!
+    kep_q7_path = tmp_path / "kplr001234567-2010355_lpd-targ.fits"
+    with fits.open(K2_TPF_FITS) as hdul_src:
+        hdul_q7 = fits.HDUList([h.copy() for h in hdul_src])
+        q7_tab = hdul_q7[1].data[:36].copy()
+        q7_tab["TIME"][:] = np.linspace(700.0, 701.0, 36, dtype=np.float64)
+        q7_tab["QUALITY"][:] = 0
+        hdul_q7[1].data = q7_tab
+        hdul_q7[0].header["MISSION"] = "Kepler"
+        hdul_q7[0].header["QUARTER"] = 7
+        if "CAMPAIGN" in hdul_q7[0].header:
+            del hdul_q7[0].header["CAMPAIGN"]
+        hdul_q7.writeto(kep_q7_path, overwrite=True)
+
+    recorded_titles.clear()
+    cli.main(
+        [
+            str(kep_q7_path),
+            "--hlsp-fits",
+            "-c",
+            "7",
+            "--rr",
+            "[1.0,4.5]",
+            "--thresh",
+            "0.8",
+            "--minflux",
+            "50.0",
+            "-maxiter",
+            "15",
+            "--do-plot",
+            "--name",
+            "kep_q7_hlsp",
+            "--quiet",
+            "--save-dir",
+            str(out_dir),
+        ]
+    )
+    lc_q7 = lk.read(str(out_dir / "kep_q7_hlsp_halo_lc_tv.fits"))
+    assert len(lc_q7) == 36
+    assert recorded_titles == ["kep q7 hlsp - Q07"]
+
+    recorded_titles.clear()
+    cli.main(
+        [
+            str(kep_q7_path),
+            "-c",
+            "7",
+            "--rr",
+            "[1.0,4.5]",
+            "--thresh",
+            "0.8",
+            "--minflux",
+            "50.0",
+            "-maxiter",
+            "10",
+            "--do-plot",
+            "--name",
+            "kep_q7_legacy",
+            "--quiet",
+            "--save-dir",
+            str(out_dir),
+        ]
+    )
+    assert recorded_titles == ["kep q7 legacy - Q07"]
+

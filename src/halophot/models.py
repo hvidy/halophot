@@ -30,8 +30,16 @@ __all__ = [
     "HaloObservation",
     "HaloWeights",
     "bucket_pad_length",
+    "compute_effective_constraints",
     "compute_gap_diff_mask",
 ]
+
+# Baseline photon-noise regularization weight at r -> 0 and Marchenko-Pastur linear
+# discrepancy slope bounding white-noise shrinkage alpha* = 2 * sqrt(2 / pi) * r / c(r)
+# below alpha_tol = c_0 / 2 = 0.05 for all r = (M - 1) / n_eff > 0.
+_PHOT_BASE_COEFF: float = 0.1
+_PHOT_ALPHA_TOL: float = 0.05
+_PHOT_MP_SLOPE: float = 2.0 * math.sqrt(2.0 / math.pi) / _PHOT_ALPHA_TOL
 
 # Bucket ladder covering short K2 splits up to full 20-second TESS sectors (~130k cadences).
 _PAD_BUCKETS: tuple[int, ...] = (
@@ -97,6 +105,51 @@ def compute_gap_diff_mask(
     pair_ok = valid_cadence_mask[:-lag] & valid_cadence_mask[lag:] & tol_ok
     tail_false = jnp.zeros(lag, dtype=jnp.bool_)
     return jnp.concatenate([pair_ok, tail_false], axis=0)
+
+
+def compute_effective_constraints(
+    valid_diff_mask: np.ndarray | jax.Array,
+    *,
+    n_valid: int,
+    n_pad: int,
+    lag: int = 1,
+    objective: str = "tv",
+    tau: float | None = None,
+    times_padded: np.ndarray | jax.Array | None = None,
+    valid_cadence_mask: np.ndarray | jax.Array | None = None,
+    dt_nom: float | None = None,
+    gap_tol: float = 0.25,
+) -> int:
+    """Return the active scalar constraint count ``n_eff`` for ``objective``."""
+    vdm = np.asarray(valid_diff_mask, dtype=bool)
+    if objective == "owl":
+        return max(int(n_valid) - 1, 0)
+    if objective == "tv_o2":
+        if 2 * lag >= n_pad:
+            return 0
+        return int(np.sum(vdm[: n_pad - 2 * lag] & vdm[lag : n_pad - lag]))
+    if objective == "tv_exp" and times_padded is not None and valid_cadence_mask is not None and dt_nom is not None:
+        tau_val = float(lag) if tau is None else float(tau)
+        scan_len = min(max(int(math.ceil(4.0 * max(tau_val, 1e-6))), 1), max(n_pad - 1, 1))
+        t_np = np.asarray(times_padded, dtype=np.float64)
+        vc_np = np.asarray(valid_cadence_mask, dtype=bool)
+        dt_val = float(dt_nom)
+        best_count = 0
+        for ell in range(1, min(scan_len, max(int(n_valid) - 1, 0)) + 1):
+            dt_p = t_np[ell:] - t_np[:-ell]
+            exp_dt = float(ell) * dt_val
+            tol_ok = (
+                np.ones_like(dt_p, dtype=bool)
+                if math.isinf(float(gap_tol))
+                else (np.abs(dt_p - exp_dt) <= gap_tol * exp_dt)
+            )
+            cnt = int(np.sum(vc_np[:-ell] & vc_np[ell:] & tol_ok))
+            if cnt > best_count:
+                best_count = cnt
+        return best_count
+    if lag >= n_pad:
+        return 0
+    return int(np.sum(vdm[: n_pad - lag]))
 
 
 class HaloWeights(zdx.Base):
@@ -181,7 +234,32 @@ class HaloObservation(zdx.Base):
     N_pad: int = eqx.field(static=True)
     lag: int = eqx.field(static=True, default=1)
     gap_tol: float = eqx.field(static=True, default=0.25)
+    objective: str = eqx.field(static=True, default="tv")
+    tau: float | None = eqx.field(static=True, default=None)
     user_lambda_phot: float | None = eqx.field(static=True, default=None)
+    user_lambda_z: float | None = eqx.field(static=True, default=None)
+
+    def effective_constraint_count(
+        self,
+        *,
+        objective: str | None = None,
+        tau: float | None = None,
+    ) -> int:
+        """Return the active constraint count matching ``objective``."""
+        eff_obj = self.objective if objective is None else objective
+        eff_tau = self.tau if tau is None else tau
+        return compute_effective_constraints(
+            self.valid_diff_mask,
+            n_valid=int(self.n_valid),
+            n_pad=self.N_pad,
+            lag=self.lag,
+            objective=eff_obj,
+            tau=eff_tau,
+            times_padded=self.times_padded,
+            valid_cadence_mask=self.valid_cadence_mask,
+            dt_nom=float(self.dt_nom),
+            gap_tol=self.gap_tol,
+        )
 
     @classmethod
     @in_float64
@@ -192,6 +270,8 @@ class HaloObservation(zdx.Base):
         *,
         pixel_var: np.ndarray | jax.Array | None = None,
         lag: int = 1,
+        objective: str = "tv",
+        tau: float | None = None,
         legacy_tv: bool = False,
         lambda_phot: float | None = None,
         lambda_z: float | None = None,
@@ -213,15 +293,26 @@ class HaloObservation(zdx.Base):
             scaling ``P_bar_i / dt_sec``.
         lag : int, default 1
             Finite-difference lag ``ell >= 1``.
+        objective : str, default ``'tv'``
+            Target objective name used to count active constraints ``n_eff``
+            (1st-order pairs for ``'tv'``/``'l2v'``/``'l3v'``, 2nd-order triples
+            for ``'tv_o2'``, multi-lag pairs for ``'tv_exp'``, or ``N - 1``
+            centred cadences for ``'owl'``).
+        tau : float, optional
+            Exponential lag scale for ``objective='tv_exp'``.
         legacy_tv : bool, default False
             When ``True``, sets ``lambda_phot = 0``, ``lambda_z = 0``, and
             ``z_prior_centre = 0`` for exact *K2* / ``halo-tess`` DR1 reproduction.
         lambda_phot : float, optional
             Photon-noise regularization strength. When ``None`` and ``not legacy_tv``,
-            auto-calibrated to ``0.1 * |V_lag| / max(b_hat^2, median(mean_frac_var))``.
+            auto-calibrated from the tangent-space Marchenko-Pastur discrepancy balance
+            ``(0.1 + 40 * sqrt(2 / pi) * r) * n_eff / ref_var``, where
+            ``r = (M - 1) / n_eff``, ``ap_var_floor = sum_i theta_init_i^2 * mean_frac_var_i``,
+            and ``ref_var = max(b_hat^2, noise_mult * ap_var_floor, 1e-12)``.
         lambda_z : float, optional
-            ILR logit-damping strength around uniform-``w`` ``z_init``. Defaults
-            to ``1e-3`` when ``not legacy_tv`` and ``0.0`` when ``legacy_tv=True``.
+            Bounded ILR gauge-damping strength around uniform-``w`` ``z_init``.
+            Defaults to ``1e-3`` when ``not legacy_tv`` and ``0.0`` when
+            ``legacy_tv=True``.
         n_pad : int, optional
             Explicit padded time length ``>= N``. Defaults to ``bucket_pad_length(N)``.
         gap_tol : float, default 0.25
@@ -320,6 +411,7 @@ class HaloObservation(zdx.Base):
             lam_phot_val = 0.0
             lam_z_val = 0.0
             user_lam_phot_val: float | None = 0.0
+            user_lam_z_val: float | None = 0.0
         else:
             theta_init = ilr_to_simplex(z_init_j)
             f_init = np.asarray(jnp.dot(theta_init, jnp.asarray(norm_p, dtype=jnp.float64)))
@@ -332,11 +424,34 @@ class HaloObservation(zdx.Base):
             else:
                 b_hat_val = max(float(np.std(f_init)), 1e-6)
 
-            n_v = max(int(valid_idx.size), 1)
+            n_constraints = compute_effective_constraints(
+                diff_mask_j,
+                n_valid=n_cad,
+                n_pad=resolved_pad,
+                lag=lag_int,
+                objective=objective,
+                tau=tau,
+                times_padded=times_padded_np,
+                valid_cadence_mask=valid_cad,
+                dt_nom=dt_nom_val,
+                gap_tol=gap_tol,
+            )
+            n_eff = max(n_constraints, 1)
+            dof_ratio = float(m_pix - 1) / float(n_eff) if m_pix > 1 else 0.0
+            # Linear Marchenko-Pastur discrepancy balance: along the minimum-norm white-noise
+            # interpolant on the (M - 1)-dimensional zero-sum simplex tangent space,
+            # E[-Delta J_data] ~= sqrt(2 / pi) * n_eff while E[Delta J_phot] ~= c(r) * n_eff / (4 * r),
+            # yielding stationary white-noise shrinkage alpha* = 2 * sqrt(2 / pi) * r / c(r).
+            # Linear scaling c(r) = 0.1 + 40 * sqrt(2 / pi) * r bounds alpha* <= 0.05 across all r > 0
+            # without inflating high-r regularization as r^4.
+            c_phot = _PHOT_BASE_COEFF + _PHOT_MP_SLOPE * dof_ratio
             if lambda_phot is None:
-                med_fv = float(np.median(frac_var)) if frac_var.size > 0 else 0.0
-                ref_var = max(b_hat_val**2, med_fv, 1e-12)
-                lam_phot_val = 0.1 * float(n_v) / ref_var
+                ap_var_floor = float(
+                    np.sum(np.square(np.asarray(theta_init, dtype=np.float64)) * frac_var)
+                )
+                noise_mult = 1.0 if objective == "owl" else (6.0 if objective == "tv_o2" else 2.0)
+                ref_var = max(b_hat_val**2, noise_mult * ap_var_floor, 1e-12)
+                lam_phot_val = c_phot * float(n_eff) / ref_var
                 user_lam_phot_val = None
             else:
                 lam_phot_val = float(lambda_phot)
@@ -346,10 +461,12 @@ class HaloObservation(zdx.Base):
 
             if lambda_z is None:
                 lam_z_val = 1e-3
+                user_lam_z_val = None
             else:
                 lam_z_val = float(lambda_z)
                 if lam_z_val < 0.0:
                     raise ValueError(f"lambda_z must be >= 0, got {lambda_z!r}.")
+                user_lam_z_val = lam_z_val
 
         return cls(
             norm_pixels=jnp.asarray(norm_padded, dtype=jnp.float64),
@@ -367,7 +484,10 @@ class HaloObservation(zdx.Base):
             N_pad=resolved_pad,
             lag=lag_int,
             gap_tol=float(gap_tol),
+            objective=str(objective),
+            tau=None if tau is None else float(tau),
             user_lambda_phot=user_lam_phot_val,
+            user_lambda_z=user_lam_z_val,
         )
 
     @in_float64
@@ -376,13 +496,20 @@ class HaloObservation(zdx.Base):
         keep_mask: np.ndarray | jax.Array,
         *,
         legacy_tv: bool = False,
+        preserve_regularization: bool = True,
+        objective: str | None = None,
+        tau: float | None = None,
     ) -> HaloObservation:
         """Build a leave-out ``HaloObservation`` keeping ``N_pad`` static for zero recompilation.
 
         ``keep_mask`` is a boolean mask of length ``n_valid`` (or ``N_pad``) selecting
         retained cadences (e.g. for ``sigclip`` refits or orbit block-jackknife folds).
         Pixel time-means ``mean_pixel_flux`` and ``norm_pixels`` are re-centred strictly
-        over the retained subset while keeping ``(M, N_pad)`` unchanged.
+        over the retained subset while keeping ``(M, N_pad)`` unchanged. When
+        ``preserve_regularization=True`` (the default, used by ``orbit_block_jackknife``),
+        auto-calibrated ``lambda_phot``, ``lambda_z``, and ``b_hat`` preserve the full-sample
+        per-constraint regularization weight rather than re-evaluating ``(M - 1) / n_eff``
+        on the smaller leave-out subset.
         """
         n_orig = int(self.n_valid)
         mask_np = np.asarray(keep_mask, dtype=bool)
@@ -406,17 +533,44 @@ class HaloObservation(zdx.Base):
         times_sub = np.asarray(self.times_padded)[idx_keep]
         pixel_var_est = np.asarray(self.mean_frac_var) * (old_scale**2)
 
+        eff_obj = self.objective if objective is None else objective
+        eff_tau = self.tau if tau is None else tau
         lam_phot_arg: float | None = 0.0 if legacy_tv else self.user_lambda_phot
-        lam_z_arg: float | None = 0.0 if legacy_tv else float(self.lambda_z)
+        lam_z_arg: float | None = 0.0 if legacy_tv else self.user_lambda_z
 
-        return HaloObservation.from_arrays(
+        sub_obs = HaloObservation.from_arrays(
             raw_sub,
             times_sub,
             pixel_var=pixel_var_est,
             lag=self.lag,
+            objective=eff_obj,
+            tau=eff_tau,
             legacy_tv=legacy_tv,
             lambda_phot=lam_phot_arg,
             lambda_z=lam_z_arg,
             n_pad=self.N_pad,
             gap_tol=self.gap_tol,
+        )
+        if legacy_tv or not preserve_regularization:
+            return sub_obs
+
+        n_eff_full = max(self.effective_constraint_count(objective=eff_obj, tau=eff_tau), 1)
+        n_eff_sub = max(sub_obs.effective_constraint_count(objective=eff_obj, tau=eff_tau), 1)
+        count_ratio = float(n_eff_sub) / float(n_eff_full)
+
+        new_lam_phot = (
+            sub_obs.lambda_phot
+            if self.user_lambda_phot is not None
+            else jnp.asarray(float(self.lambda_phot) * count_ratio, dtype=jnp.float64)
+        )
+        new_lam_z = (
+            sub_obs.lambda_z
+            if self.user_lambda_z is not None
+            else jnp.asarray(float(self.lambda_z) * count_ratio, dtype=jnp.float64)
+        )
+        new_b_hat = sub_obs.b_hat if self.user_lambda_phot is not None else self.b_hat
+        return eqx.tree_at(
+            lambda o: (o.lambda_phot, o.lambda_z, o.b_hat),
+            sub_obs,
+            (new_lam_phot, new_lam_z, new_b_hat),
         )

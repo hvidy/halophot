@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import warnings
 from pathlib import Path
 
 import equinox as eqx
@@ -18,6 +19,7 @@ from halophot.objectives import (
     AVAILABLE_OBJECTIVES,
     charbonnier_penalty,
     halo_objective,
+    photon_noise_penalty,
     tv_charbonnier_o2,
     tv_exp_scan,
 )
@@ -486,3 +488,167 @@ def test_lambda_phot_subset_zero_mean_legacy_and_sigclip_jackknife_fixes() -> No
     nb_path = Path(__file__).resolve().parents[1] / "docs" / "notebooks" / "aldebaran.ipynb"
     nb_data = json.loads(nb_path.read_text(encoding="utf-8"))
     assert "extract_halo_lightcurve" in "".join(nb_data["cells"][0]["source"])
+
+
+def test_lambda_phot_aperture_floor_invariance_and_m_over_n_guard() -> None:
+    """Verify [HALO-03]: formula-free M-invariance, objective-aware DoF warning, and high-r jitter + JK calibration."""
+    with jax.enable_x64(True):
+        # 1. Formula-free M-invariance at matched aspect ratio r = (M - 1) / (N - 1) = 0.05:
+        #    (M=5, N=81 => n_eff=80, r=0.05) vs (M=21, N=401 => n_eff=400, r=0.05) with identical
+        #    combined aperture flux (3600) and variance (36) must yield identical per-constraint
+        #    photon_noise_penalty WITHOUT copying any internal scaling polynomial into the test!
+        per_constraint_penalties: dict[int, float] = {}
+        for m_pix, n_quiet in ((5, 81), (21, 401)):
+            t_q = np.arange(n_quiet, dtype=np.float64) * 0.02
+            p_m = np.full((m_pix, n_quiet), 3600.0 / m_pix, dtype=np.float64)
+            pvar_m = np.full((m_pix, n_quiet), 36.0 / m_pix, dtype=np.float64)
+            obs_m = HaloObservation.from_arrays(p_m, t_q, pixel_var=pvar_m)
+            theta_init_m = jnp.full((m_pix,), 1.0 / m_pix, dtype=jnp.float64)
+            per_constraint_penalties[m_pix] = float(photon_noise_penalty(theta_init_m, obs_m)) / (
+                n_quiet - 1
+            )
+            assert float(obs_m.lambda_z) == pytest.approx(1e-3)
+
+        assert per_constraint_penalties[21] == pytest.approx(per_constraint_penalties[5], rel=1e-10)
+
+        # 2. Objective-aware constraint count and warning:
+        #    - tv_o2 across two 9-cadence segments separated by a gap has 16 first-order pairs
+        #      (M=8 < 0.5*16) but only 14 second-order triples (M=8 >= 0.5*14 -> must warn!).
+        #    - owl on 40 cadences with irregular gapped timestamps (0 lag-1 pairs, 39 centred DoFs)
+        #      must NOT emit a spurious N_valid=0 warning!
+        rng_warn = np.random.default_rng(20261119)
+        t_two_seg = np.concatenate(
+            [np.arange(9, dtype=np.float64) * 0.02, 5.0 + np.arange(9, dtype=np.float64) * 0.02]
+        )
+        p_two_seg = rng_warn.uniform(100.0, 140.0, size=(8, 18))
+        with pytest.warns(UserWarning, match="N_valid=14"):
+            optimise_halo(p_two_seg, t_two_seg, objective="tv_o2", maxiter=15)
+
+        t_gapped_owl = np.cumsum(rng_warn.uniform(0.01, 0.50, size=40))
+        p_owl = rng_warn.uniform(100.0, 140.0, size=(6, 40))
+        with warnings.catch_warnings(record=True) as caught_owl:
+            warnings.simplefilter("always")
+            optimise_halo(p_owl, t_gapped_owl, objective="owl", maxiter=15)
+        assert not any("elevated degrees of freedom" in str(w.message) for w in caught_owl)
+
+        # 3. Preserve full-sample per-constraint regularization across jackknife with_cadence_subset
+        obs_auto = HaloObservation.from_arrays(
+            rng_warn.uniform(500.0, 900.0, size=(16, 20)),
+            np.arange(20, dtype=np.float64) * 0.02,
+        )
+        keep_3q = np.arange(20) >= 5
+        obs_jk_fold = obs_auto.with_cadence_subset(keep_3q)
+        assert float(obs_jk_fold.lambda_phot) / 14.0 == pytest.approx(
+            float(obs_auto.lambda_phot) / 19.0, rel=1e-12
+        )
+        assert float(obs_jk_fold.lambda_z) / 14.0 == pytest.approx(
+            float(obs_auto.lambda_z) / 19.0, rel=1e-12
+        )
+        assert float(obs_jk_fold.b_hat) == pytest.approx(float(obs_auto.b_hat), rel=1e-12)
+
+        # 4. Non-zero multiplicative thruster jitter across BOTH overdetermined (r=0.20) AND
+        #    underdetermined high-r (r=1.33 with K=4 jackknife, and r=4.00) regimes:
+        #    share static (M=17, n_pad=128) for fast single-compile verification!
+        m_test, n_pad_test = 17, 128
+        f0_vec = np.linspace(1800.0, 3200.0, m_test)[:, None]
+        sens_vec = np.concatenate([np.linspace(-1.0, -0.25, 6), np.linspace(0.35, 1.35, m_test - 6)])
+
+        for n_cad, expect_warn, check_jk in ((81, False, False), (13, True, True), (5, True, False)):
+            t_seg = np.arange(n_cad, dtype=np.float64) * (2.0 / 1440.0)
+            s_seg = 1.0 + 0.008 * np.sin(2.0 * np.pi * t_seg / 0.04)
+            jit_seg = 0.05 * ((-1.0) ** np.arange(n_cad))
+
+            pulls_quiet: list[float] = []
+            pulls_white: list[float] = []
+            pulls_ung: list[float] = []
+            supp_list: list[float] = []
+            w_mc: list[np.ndarray] = []
+            w_jk_stds: list[np.ndarray] = []
+
+            for seed in range(8):
+                rng = np.random.default_rng(9500 + 37 * n_cad + seed)
+                pvar = np.broadcast_to((f0_vec + 80.0) / 120.0, (m_test, n_cad)).copy()
+                noise = rng.normal(0.0, np.sqrt(pvar))
+                p_jit = f0_vec * s_seg[None, :] * (1.0 + sens_vec[:, None] * jit_seg[None, :]) + noise
+                p_quiet = f0_vec * s_seg[None, :] + noise
+
+                with warnings.catch_warnings(record=True) as w_rec:
+                    warnings.simplefilter("always")
+                    fit_j = optimise_halo(
+                        p_jit,
+                        t_seg,
+                        pixel_var=pvar,
+                        maxiter=80,
+                        compute_uncertainty=check_jk,
+                        jackknife_blocks=4,
+                        n_pad=n_pad_test,
+                    )
+                    fit_q = optimise_halo(
+                        p_quiet,
+                        t_seg,
+                        pixel_var=pvar,
+                        maxiter=80,
+                        n_pad=n_pad_test,
+                    )
+                has_dof_warn = any("elevated degrees of freedom" in str(x.message) for x in w_rec)
+                assert has_dof_warn is expect_warn
+
+                w_mc.append(fit_j.physical_weights)
+                if check_jk and fit_j.weight_std is not None:
+                    w_jk_stds.append(fit_j.weight_std)
+
+                w_u = np.full(m_test, 1.0 / m_test)
+                lc_u = (w_u @ p_jit) / np.mean(w_u @ p_jit)
+                s_norm = s_seg / np.mean(s_seg)
+                supp_list.append(
+                    float(np.std(lc_u - s_norm)) / max(float(np.std(fit_j.norm_flux - s_norm)), 1e-12)
+                )
+
+                wq = fit_q.physical_weights
+                pull_q = (fit_q.raw_flux - (wq @ f0_vec[:, 0]) * s_seg) / np.sqrt((wq**2) @ pvar)
+                pulls_quiet.append(float(np.std(pull_q, ddof=1)))
+
+                if n_cad == 13:
+                    p_white = f0_vec + noise
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", UserWarning)
+                        fit_w = optimise_halo(
+                            p_white,
+                            t_seg,
+                            pixel_var=pvar,
+                            maxiter=80,
+                            n_pad=n_pad_test,
+                        )
+                        fit_u = optimise_halo(
+                            p_white,
+                            t_seg,
+                            pixel_var=pvar,
+                            lambda_phot=0.0,
+                            lambda_z=0.0,
+                            maxiter=80,
+                            n_pad=n_pad_test,
+                        )
+                    ww = fit_w.physical_weights
+                    pull_w = (fit_w.raw_flux - float(ww @ f0_vec[:, 0])) / np.sqrt((ww**2) @ pvar)
+                    pulls_white.append(float(np.std(pull_w, ddof=1)))
+
+                    wu = fit_u.physical_weights
+                    pull_u = (fit_u.raw_flux - float(wu @ f0_vec[:, 0])) / np.sqrt((wu**2) @ pvar)
+                    pulls_ung.append(float(np.std(pull_u, ddof=1)))
+
+            mean_pull = float(np.mean(pulls_quiet))
+            med_supp = float(np.median(supp_list))
+            pull_lo = 0.78 if n_cad == 5 else 0.85
+            assert pull_lo <= mean_pull <= 1.15, f"Un-calibrated pull {mean_pull:.3f} at N={n_cad}"
+            # High-r jitter cancellation MUST stay strong (rejecting lambda_phot=1e30 or r^4 freeze!)
+            assert med_supp >= 5.0, f"Jitter suppression collapsed to {med_supp:.2f}x at N={n_cad}"
+            if pulls_white:
+                assert 0.85 <= float(np.mean(pulls_white)) <= 1.15
+            if pulls_ung:
+                assert float(np.mean(pulls_ung)) < 0.50
+            if check_jk:
+                emp_std = np.std(np.vstack(w_mc), axis=0, ddof=1)
+                jk_med = np.median(np.vstack(w_jk_stds), axis=0)
+                act = emp_std > 1e-5
+                jk_ratio = float(np.median(jk_med[act] / emp_std[act]))
+                assert 0.55 <= jk_ratio <= 1.65, f"Jackknife ratio {jk_ratio:.2f} miscalibrated"

@@ -2,16 +2,27 @@
 
 from __future__ import annotations
 
+import ast
+import re
+import shutil
+import subprocess
+import sys
+import tomllib
+import types
 import warnings
 from pathlib import Path
 
+import astropy.units as u
 import jax.numpy as jnp
 import lightkurve as lk
 import numpy as np
 import pytest
 from astropy.io import fits
+from astropy.table import Table
 from astropy.time import Time
+from lightkurve.targetpixelfile import TargetPixelFile
 
+import halophot
 from halophot._contract import (
     HALOCVER,
     PixelQuality,
@@ -21,6 +32,9 @@ from halophot._contract import (
     read_bkgsub_state,
     read_pixel_quality,
     read_smear_err,
+    read_split_times,
+    read_weightmap,
+    read_weightmap_err,
     resolve_cache_dir,
     write_lightcurve_fits,
 )
@@ -377,32 +391,519 @@ def test_write_lightcurve_fits_weightmap_round_trip(tmp_path: Path) -> None:
 
 
 def test_resolve_cache_dir_fred_guard(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    for env_key in ("HALOPHOT_CACHE_DIR", "TESS_BRIGHT_CACHE_DIR", "SCRATCH", "XDG_CACHE_HOME"):
+        monkeypatch.delenv(env_key, raising=False)
+
+    # Verify precedence: HALOPHOT_CACHE_DIR > TESS_BRIGHT_CACHE_DIR > SCRATCH > XDG_CACHE_HOME
+    xdg_dir = tmp_path / "xdg"
     scratch_root = tmp_path / "aphid_scratch"
+    tbc_dir = tmp_path / "tess_bright_env"
+    halo_dir = tmp_path / "halophot_env"
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(xdg_dir))
+    assert resolve_cache_dir() == (xdg_dir / "tess_bright").resolve(strict=False)
+
     monkeypatch.setenv("SCRATCH", str(scratch_root))
-    assert resolve_cache_dir(strict_hpc=True) == scratch_root / ".cache" / "tess_bright"
+    assert resolve_cache_dir() == (scratch_root / ".cache" / "tess_bright").resolve(strict=False)
 
-    # Explicit /fred path must raise in strict_hpc=True
+    monkeypatch.setenv("TESS_BRIGHT_CACHE_DIR", str(tbc_dir))
+    assert resolve_cache_dir() == tbc_dir.resolve(strict=False)
+
+    monkeypatch.setenv("HALOPHOT_CACHE_DIR", str(halo_dir))
+    created = resolve_cache_dir(create=True)
+    assert created == halo_dir.resolve(strict=False)
+    assert created.is_dir()
+
+    monkeypatch.delenv("HALOPHOT_CACHE_DIR")
+    monkeypatch.delenv("TESS_BRIGHT_CACHE_DIR")
+
+    # strict_hpc=True is the default: explicit /fred path must raise ValueError without passing strict_hpc!
     with pytest.raises(ValueError, match="/fred/"):
-        resolve_cache_dir("/fred/oz440/bpo/.cache", strict_hpc=True)
+        resolve_cache_dir("/fred/oz440/bpo/.cache")
 
     with pytest.raises(ValueError, match="/fred/"):
-        resolve_cache_dir("/fred", strict_hpc=True)
+        resolve_cache_dir("/fred")
 
-    # Allowed when strict_hpc=False
-    assert resolve_cache_dir("/fred/oz440/bpo/.cache", strict_hpc=False) == Path(
-        "/fred/oz440/bpo/.cache"
-    )
+    # Allowed when strict_hpc=False, but MUST emit UserWarning
+    with pytest.warns(UserWarning, match="/fred/"):
+        allowed = resolve_cache_dir("/fred/oz440/bpo/.cache", strict_hpc=False)
+    assert allowed == Path("/fred/oz440/bpo/.cache")
 
-    # $SCRATCH pointing into /fred must also be caught in strict_hpc=True
+    # $SCRATCH pointing into /fred must also be caught by default (strict_hpc=True)
     monkeypatch.setenv("SCRATCH", "/fred/oz440/bpo/scratch")
     with pytest.raises(ValueError, match="/fred/"):
-        resolve_cache_dir(strict_hpc=True)
+        resolve_cache_dir()
 
     # Symlink into /fred must be caught
     fred_link = tmp_path / "sneaky_link"
     fred_link.symlink_to("/fred/oz440/bpo/cache")
     with pytest.raises(ValueError, match="/fred/"):
-        resolve_cache_dir(fred_link, strict_hpc=True)
+        resolve_cache_dir(fred_link)
 
     # Prefix lookalike (/frederick) must NOT false-positive
-    assert resolve_cache_dir("/frederick/cache", strict_hpc=True) == Path("/frederick/cache")
+    assert resolve_cache_dir("/frederick/cache") == Path("/frederick/cache")
+
+
+def _extract_python_heredocs(script_text: str) -> list[str]:
+    """Extract all ``<<'PY' ... PY`` Python heredoc bodies from a shell script."""
+    pattern = re.compile(r"<<'PY'\n(.*?)\nPY(?:\n|$)", re.DOTALL)
+    return [m.group(1) for m in pattern.finditer(script_text)]
+
+
+def test_hpc_sbatch_and_apptainer_nt_contracts(monkeypatch: pytest.MonkeyPatch) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    hpc_dir = repo_root / "hpc"
+
+    sbatch_paths = sorted(hpc_dir.glob("*.sbatch"))
+    expected_sbatch = {
+        "build_halo_sif.sbatch",
+        "halophot_survey_cpu.sbatch",
+        "halophot_survey_gpu.sbatch",
+    }
+    assert expected_sbatch.issubset({p.name for p in sbatch_paths})
+
+    bash_bin = shutil.which("bash")
+
+    for sbatch_path in sbatch_paths:
+        text = sbatch_path.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        active_lines = [
+            ln.strip()
+            for ln in lines
+            if ln.strip() and not ln.lstrip().startswith("#")
+        ]
+
+        # 1. Shebang & Lmod-safe shell strict mode (never -u, which fails on unset PS1)
+        assert lines[0] == "#!/bin/bash", f"{sbatch_path.name} must start with #!/bin/bash"
+        assert "set -euo pipefail" not in text, f"{sbatch_path.name} must not set -u"
+        assert any(ln.startswith("set -eo pipefail") for ln in active_lines), (
+            f"{sbatch_path.name} must set -eo pipefail"
+        )
+
+        # 2. Slurm log paths under /aphid/scratch-3month/%u/logs/ & <= 15-char job name
+        assert re.search(
+            r"^#SBATCH\s+--output=/aphid/scratch-3month/%u/logs/\S+\.out$",
+            text,
+            re.MULTILINE,
+        ), f"{sbatch_path.name} missing scratch --output directive"
+        assert re.search(
+            r"^#SBATCH\s+--error=/aphid/scratch-3month/%u/logs/\S+\.err$",
+            text,
+            re.MULTILINE,
+        ), f"{sbatch_path.name} missing scratch --error directive"
+        job_match = re.search(r"^#SBATCH\s+--job-name=(\S+)$", text, re.MULTILINE)
+        assert job_match is not None and len(job_match.group(1)) <= 15
+
+        # 3. Module load apptainer appears BEFORE any apptainer invocation
+        mod_indices = [
+            i for i, ln in enumerate(active_lines) if ln == "module -q load apptainer"
+        ]
+        app_indices = [
+            i for i, ln in enumerate(active_lines) if ln.startswith("apptainer ") or " apptainer " in ln
+        ]
+        assert mod_indices, f"{sbatch_path.name} must call `module -q load apptainer`"
+        assert app_indices, f"{sbatch_path.name} must invoke apptainer"
+        assert mod_indices[0] < app_indices[0], (
+            f"{sbatch_path.name} must load apptainer module before invoking apptainer"
+        )
+
+        # 4. Apptainer cache/tmp redirected off /home onto scratch/jobfs, and halo.sif default
+        cachedir_lines = [ln for ln in active_lines if "APPTAINER_CACHEDIR=" in ln]
+        tmpdir_lines = [ln for ln in active_lines if "APPTAINER_TMPDIR=" in ln]
+        assert cachedir_lines and all("/home" not in ln and "~" not in ln for ln in cachedir_lines)
+        assert tmpdir_lines and all("/home" not in ln and "~" not in ln for ln in tmpdir_lines)
+        assert any(
+            any(tok in ln for tok in ("$SCRATCH", "$BUILD_DIR", "${SCRATCH"))
+            for ln in cachedir_lines
+        )
+        assert any(
+            any(tok in ln for tok in ("$SCRATCH", "$BUILD_DIR", "$JOBFS", "${JOBFS"))
+            for ln in tmpdir_lines
+        )
+        assert "halo.sif" in text, f"{sbatch_path.name} must default/link to halo.sif"
+        assert "virgil.sif" not in text, f"{sbatch_path.name} must not default to virgil.sif"
+
+        # 5. Embedded Python heredocs parse cleanly & bash -n syntax check succeeds
+        for idx, py_src in enumerate(_extract_python_heredocs(text)):
+            ast.parse(py_src, filename=f"{sbatch_path.name}[heredoc_{idx}]")
+        if bash_bin is not None:
+            subprocess.run([bash_bin, "-n", str(sbatch_path)], check=True)
+
+    # Verify root-mapped Apptainer recipe & builder specifics
+    def_text = (hpc_dir / "virgil_halophot.def").read_text(encoding="utf-8")
+    assert "Bootstrap: docker" in def_text
+    assert "From: python:3.12.7-bookworm" in def_text
+    assert "apt-get" not in def_text
+    assert "mundey_ref=v2.0.0" in def_text
+    assert "tessbkgd_ref=v2.0.0" in def_text
+    assert "halophot_ref=v2.0.0" in def_text
+    assert "--build-arg mundey_ref=" in def_text
+    assert "UV_SYSTEM_PYTHON=1" in def_text
+    assert '"jax[cuda12]>=0.4.35"' in def_text
+    assert "uv pip install -U" not in def_text
+    assert "/etc/halo-sif-freeze.txt" in def_text
+    assert "rm -rf /opt/.build" in def_text
+
+    build_text = (hpc_dir / "build_halo_sif.sbatch").read_text(encoding="utf-8")
+    assert "#SBATCH --time=00:45:00" in build_text
+    assert "#SBATCH --mem=8G" in build_text
+    assert 'MUNDEY_REF="${MUNDEY_REF:-v2.0.0}"' in build_text
+    assert 'TESSBKGD_REF="${TESSBKGD_REF:-v2.0.0}"' in build_text
+    assert 'HALOPHOT_REF="${HALOPHOT_REF:-v2.0.0}"' in build_text
+    assert "MUNDEY_REF=dev TESSBKGD_REF=dev HALOPHOT_REF=dev" in build_text
+    assert "--fakeroot" in build_text
+    assert "--ignore-fakeroot-command" in build_text
+    assert '--bind "$APPTAINER_TMPDIR:/tmp"' in build_text
+    assert 'ln -sfn "$SIF" "$MYFRED/containers/halo.sif"' in build_text
+    assert ".sha256" in build_text
+    # Smoke checks must run against $PART on $SCRATCH BEFORE mv -f "$PART" "$SIF"
+    assert build_text.index('apptainer exec "$PART" python') < build_text.index('mv -f "$PART" "$SIF"')
+    assert build_text.index('apptainer exec "$PART" halo --help') < build_text.index('mv -f "$PART" "$SIF"')
+
+    # Execute the build_halo_sif.sbatch JAX/CUDA ABI parity heredoc under both lockstep and drift
+    import importlib.metadata as std_md
+
+    build_heredocs = _extract_python_heredocs(build_text)
+    assert len(build_heredocs) == 1
+    monkeypatch.setitem(sys.modules, "mundey", types.ModuleType("mundey"))
+    monkeypatch.setitem(sys.modules, "tessbkgd", types.ModuleType("tessbkgd"))
+    orig_version = std_md.version
+
+    def _lockstep_version(pkg: str) -> str:
+        overrides = {
+            "jax": "0.12.0.1",
+            "jaxlib": "0.12.0.1",
+            "jax-cuda12-plugin": "0.12.0.1",
+            "jax-cuda12-pjrt": "0.12.0",
+            "mundey": "2.0.0",
+            "tessbkgd": "2.0.0",
+            "halophot": "2.0.0",
+        }
+        return overrides[pkg] if pkg in overrides else orig_version(pkg)
+
+    monkeypatch.setattr(std_md, "version", _lockstep_version)
+    exec(compile(build_heredocs[0], "build_halo_sif.sbatch[py]", "exec"), {"__name__": "__main__"})
+
+    def _drifted_version(pkg: str) -> str:
+        if pkg == "jax-cuda12-plugin":
+            return "0.11.2"
+        return _lockstep_version(pkg)
+
+    monkeypatch.setattr(std_md, "version", _drifted_version)
+    with pytest.raises(RuntimeError, match="JAX/CUDA ABI version mismatch"):
+        exec(
+            compile(build_heredocs[0], "build_halo_sif.sbatch[py]", "exec"),
+            {"__name__": "__main__"},
+        )
+
+
+def test_hpc_survey_embedded_full_e2e_and_halophot_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    hpc_dir = repo_root / "hpc"
+
+    cpu_text = (hpc_dir / "halophot_survey_cpu.sbatch").read_text(encoding="utf-8")
+    gpu_text = (hpc_dir / "halophot_survey_gpu.sbatch").read_text(encoding="utf-8")
+    for text in (cpu_text, gpu_text):
+        assert 'PIPELINE_MODE="${PIPELINE_MODE:-halophot_only}"' in text
+        assert 'APPTAINER_BIND="/fred,/aphid/scratch-3month${JOBFS:+,$JOBFS}"' in text
+
+    cpu_heredocs = _extract_python_heredocs(cpu_text)
+    gpu_heredocs = _extract_python_heredocs(gpu_text)
+    assert len(cpu_heredocs) == 1
+    assert len(gpu_heredocs) == 1
+
+    hdul, *_ = _make_contract_tpf_hdulist(n_raw=20, ny=4, nx=5, p_dim=3, bkgsub=True)
+    tpf_path = tmp_path / "tess2019001-s0006-0000000123456789-0126-s_tp.fits"
+    hdul.writeto(tpf_path, overwrite=True)
+
+    cache_dir = tmp_path / "scratch_cache" / "tess_bright"
+    cache_dir.mkdir(parents=True)
+    cat_dir = tmp_path / "catalogs"
+    cat_dir.mkdir(parents=True)
+
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    fake_mundey = types.ModuleType("mundey")
+
+    def _fake_recalibrate_tpf(path: object, **kwargs: object) -> TargetPixelFile:
+        calls.append(("recalibrate_tpf", {"path": Path(str(path)), **kwargs}))
+        loaded = lk.read(str(path))
+        assert isinstance(loaded, TargetPixelFile)
+        return loaded
+
+    fake_mundey.recalibrate_tpf = _fake_recalibrate_tpf  # type: ignore[attr-defined]
+
+    fake_tessbkgd = types.ModuleType("tessbkgd")
+
+    def _fake_subtract_background(tpf_in: TargetPixelFile) -> TargetPixelFile:
+        calls.append(("subtract_background", {"tpf_type": type(tpf_in).__name__}))
+        return tpf_in
+
+    fake_tessbkgd.subtract_background = _fake_subtract_background  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "mundey", fake_mundey)
+    monkeypatch.setitem(sys.modules, "tessbkgd", fake_tessbkgd)
+    monkeypatch.setenv("MUNDEY_SMEAR", "alternate")
+    # Set a /fred env var to prove both survey templates pass explicit cache_dir into extract_halo_lightcurve!
+    monkeypatch.setenv("HALOPHOT_CACHE_DIR", "/fred/oz440/bpo/.cache")
+
+    # 1. Execute CPU survey full_e2e Python heredoc end-to-end
+    cpu_out = tmp_path / "cpu_out"
+    cpu_out.mkdir()
+    stem = tpf_path.name.removesuffix(".fits")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["-", str(tpf_path), stem, str(cpu_out), str(cache_dir), str(cat_dir / f"{stem}_cat.parquet")],
+    )
+    exec(compile(cpu_heredocs[0], "halophot_survey_cpu.sbatch[py]", "exec"), {"__name__": "__main__"})
+
+    cpu_fits = cpu_out / f"{stem}_halo_lc_tv.fits"
+    assert cpu_fits.is_file()
+    assert len(calls) == 2
+    assert calls[0][0] == "recalibrate_tpf"
+    assert calls[0][1]["smear"] == "alternate"
+    assert calls[0][1]["offline"] is True
+    assert calls[0][1]["strict_hpc"] is True
+    assert calls[1][0] == "subtract_background"
+
+    # 2. Execute GPU survey Python heredoc in both halophot_only and full_e2e modes
+    manifest = tmp_path / "manifest.txt"
+    manifest.write_text(f"# comment\n{tpf_path}\n", encoding="utf-8")
+
+    for mode, expected_new_calls in (("halophot_only", 0), ("full_e2e", 2)):
+        calls.clear()
+        gpu_out = tmp_path / f"gpu_{mode}"
+        gpu_out.mkdir()
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["-", str(manifest), str(gpu_out), str(cat_dir), str(cache_dir), mode],
+        )
+        exec(
+            compile(gpu_heredocs[0], "halophot_survey_gpu.sbatch[py]", "exec"),
+            {"__name__": "__main__"},
+        )
+        assert len(calls) == expected_new_calls
+        out_fits = gpu_out / f"{stem}_halo_lc_tv.fits"
+        assert out_fits.is_file()
+        summary = Table.read(gpu_out / "summary.parquet", format="parquet")
+        assert len(summary) == 1
+        assert str(summary["status"][0]) == "ok"
+        assert str(summary["pipeline_mode"][0]) == mode
+        assert str(summary["fits_file"][0]) == f"{stem}_halo_lc_tv.fits"
+
+    # 3. Verify GPU survey exits non-zero (after writing summary.parquet) when 100% of targets fail
+    bad_manifest = tmp_path / "bad_manifest.txt"
+    bad_manifest.write_text(f"{tmp_path / 'missing_target_tp.fits'}\n", encoding="utf-8")
+    gpu_fail_out = tmp_path / "gpu_all_failed"
+    gpu_fail_out.mkdir()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["-", str(bad_manifest), str(gpu_fail_out), str(cat_dir), str(cache_dir), "halophot_only"],
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        exec(
+            compile(gpu_heredocs[0], "halophot_survey_gpu.sbatch[py]", "exec"),
+            {"__name__": "__main__"},
+        )
+    assert exc_info.value.code == 1
+    fail_summary = Table.read(gpu_fail_out / "summary.parquet", format="parquet")
+    assert len(fail_summary) == 1
+    assert str(fail_summary["status"][0]) == "failed"
+
+
+def test_license_and_pyproject_metadata() -> None:
+    """Verify [HALO-02] and [HALO-06]: GPLv3 LICENSE, pyproject.toml extras/excludes, and no .pyc."""
+    repo_root = Path(__file__).resolve().parents[1]
+    lic_path = repo_root / "LICENSE"
+    assert lic_path.is_file()
+    lic_text = lic_path.read_text(encoding="utf-8")
+    assert "GNU GENERAL PUBLIC LICENSE" in lic_text
+    assert "Version 3, 29 June 2007" in lic_text
+
+    pyproject = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))
+    assert pyproject["project"]["license"] == {"file": "LICENSE"}
+    hpc_deps = " ".join(pyproject["project"]["optional-dependencies"]["hpc"])
+    assert "pyarrow" in hpc_deps
+    assert "fsspec" in hpc_deps
+    assert "s3fs" in hpc_deps
+    ruff_excl = set(pyproject["tool"]["ruff"]["extend-exclude"])
+    assert {"notebooks", "docs", "tv_halo.ipynb", "halo_atlas.ipynb", "experiments"}.issubset(
+        ruff_excl
+    )
+    assert not (repo_root / "experiments" / "psf_sim.pyc").exists()
+
+
+def test_write_fits_headers_tunit_and_read_weightmap(tmp_path: Path) -> None:
+    """Verify [HALO-04]: INSTRUME='TESS Photometer', provenance cards, e-/s TUNIT, and read_weightmap."""
+    t = Time(1900.0 + np.arange(16, dtype=np.float64) * (2.0 / 1440.0), format="btjd", scale="tdb")
+    flux_q = u.Quantity(np.linspace(800.0, 820.0, 16, dtype=np.float64), u.electron / u.s)
+    ferr_q = u.Quantity(np.full(16, 2.5, dtype=np.float64), u.electron / u.s)
+    lc = lk.TessLightCurve(time=t, flux=flux_q, flux_err=ferr_q)
+    wmap = np.array([[0.25, 0.25, 0.0], [0.25, 0.25, np.nan]], dtype=np.float64)
+    lc.meta.update(
+        {
+            "WEIGHTMAP": wmap,
+            "BKGSUB": True,
+            "BKG_ORD": 2,
+            "HALO_OBJ": "tv_exp",
+            "HALO_LAG": 2,
+            "LEGACYTV": False,
+        }
+    )
+
+    out_path = tmp_path / "tess_raw_halo_lc.fits"
+    halophot.write_fits(lc, out_path)
+
+    with fits.open(out_path) as hdul:
+        hdr0 = hdul[0].header
+        assert hdr0["TELESCOP"] == "TESS"
+        assert hdr0["INSTRUME"] == "TESS Photometer"
+        assert hdr0.get("OBJECT") != "None"
+        assert hdr0["HALOCVER"] == HALOCVER
+        assert hdr0["BKGSUB"] is True
+        assert hdr0["BKG_ORD"] == 2
+        assert hdr0["HALO_OBJ"] == "tv_exp"
+        assert hdr0["HALO_LAG"] == 2
+        assert hdr0["LEGACYTV"] is False
+
+    lc_back = lk.read(str(out_path))
+    assert lc_back.flux.unit == u.electron / u.s
+    assert lc_back.flux_err.unit == u.electron / u.s
+    np.testing.assert_allclose(lc_back.flux.value, flux_q.value, rtol=1e-6)
+    np.testing.assert_allclose(lc_back.flux_err.value, ferr_q.value, rtol=1e-6)
+
+    w_mem = halophot.read_weightmap(lc)
+    w_disk = read_weightmap(out_path)
+    w_reloaded = halophot.read_weightmap(lc_back)
+    assert w_mem is not None and w_disk is not None and w_reloaded is not None
+    np.testing.assert_allclose(w_mem, wmap, equal_nan=True)
+    np.testing.assert_allclose(w_disk, wmap, equal_nan=True)
+    np.testing.assert_allclose(w_reloaded, wmap, equal_nan=True)
+
+
+def test_read_weightmap_err_and_split_times_roundtrip_all_inputs(tmp_path: Path) -> None:
+    """Verify [XPKG-03]: read_weightmap, read_weightmap_err, and read_split_times across LC/HDUList/Path."""
+    assert "read_weightmap_err" in halophot.__all__
+    assert "read_split_times" in halophot.__all__
+    assert halophot.read_weightmap_err is read_weightmap_err
+    assert halophot.read_split_times is read_split_times
+
+    t = Time(2100.0 + np.arange(20, dtype=np.float64) * (2.0 / 1440.0), format="btjd", scale="tdb")
+    flux = 1.0 + 1e-3 * np.cos(np.arange(20, dtype=np.float64))
+    ferr = np.full(20, 2e-4, dtype=np.float64)
+
+    # 1. Plain in-memory LightCurve without HALOCVER=1 extensions returns None (never TypeError)
+    lc_plain = lk.TessLightCurve(time=t, flux=flux, flux_err=ferr)
+    assert halophot.read_weightmap(lc_plain) is None
+    assert halophot.read_weightmap_err(lc_plain) is None
+    assert halophot.read_split_times(lc_plain) is None
+
+    # 2. Invalid non-LightCurve / non-FITS inputs raise TypeError
+    for bad_input in (42, object()):
+        with pytest.raises(TypeError, match="Expected a lightkurve.LightCurve"):
+            read_weightmap(bad_input)
+        with pytest.raises(TypeError, match="Expected a lightkurve.LightCurve"):
+            read_weightmap_err(bad_input)
+        with pytest.raises(TypeError, match="Expected a lightkurve.LightCurve"):
+            read_split_times(bad_input)
+
+    # 3. 3D segmented WEIGHTMAP + MaskedArray WEIGHTMAP_ERR + SPLIT_TIMES round-trip across
+    #    in-memory LC, lk.read(path) LightCurve, lk.read(hdul) LightCurve, HDUList, Path, and str
+    wmap_3d = np.arange(24, dtype=np.float64).reshape(2, 3, 4) / 100.0
+    werr_raw = np.linspace(0.001, 0.024, 24, dtype=np.float64).reshape(2, 3, 4)
+    werr_masked = np.ma.array(werr_raw, mask=np.zeros_like(werr_raw, dtype=bool))
+    werr_masked.mask[0, 0, 0] = True
+    expected_werr = werr_raw.copy()
+    expected_werr[0, 0, 0] = np.nan
+    splits = [float(t.value[9]) + 5e-4]
+
+    lc_seg = lk.TessLightCurve(time=t, flux=flux, flux_err=ferr)
+    lc_seg.meta["WEIGHTMAP"] = wmap_3d
+    lc_seg.meta["WEIGHTMAP_ERR"] = werr_masked
+    lc_seg.meta["SPLIT_TIMES"] = splits
+
+    np.testing.assert_allclose(halophot.read_weightmap_err(lc_seg), expected_werr, equal_nan=True)  # type: ignore[arg-type]
+    np.testing.assert_allclose(halophot.read_split_times(lc_seg), splits, rtol=0.0, atol=1e-12)  # type: ignore[arg-type]
+
+    # Also verify MappingProxyType (non-dict Mapping) works for read_* helpers
+    proxy_carrier = types.SimpleNamespace(meta=types.MappingProxyType(dict(lc_seg.meta)))
+    np.testing.assert_allclose(read_weightmap(proxy_carrier), wmap_3d)  # type: ignore[arg-type]
+    np.testing.assert_allclose(read_weightmap_err(proxy_carrier), expected_werr, equal_nan=True)  # type: ignore[arg-type]
+    np.testing.assert_allclose(read_split_times(proxy_carrier), splits)  # type: ignore[arg-type]
+
+    seg_fits = tmp_path / "seg_werr_lc.fits"
+    halophot.write_fits(lc_seg, seg_fits)
+
+    # Reload via lk.read(str_path): Lightkurve strips WEIGHTMAP/WEIGHTMAP_ERR/SPLIT_TIMES from meta,
+    # so read_* must resolve the underlying FITS file via FILENAME metadata!
+    lc_from_disk = lk.read(str(seg_fits))
+    assert "WEIGHTMAP" not in lc_from_disk.meta
+    assert "WEIGHTMAP_ERR" not in lc_from_disk.meta
+    assert "SPLIT_TIMES" not in lc_from_disk.meta
+
+    for target in (seg_fits, str(seg_fits), lc_from_disk):
+        w_got = halophot.read_weightmap(target)
+        we_got = halophot.read_weightmap_err(target)
+        st_got = halophot.read_split_times(target)
+        assert w_got is not None and w_got.flags.owndata
+        assert we_got is not None and we_got.flags.owndata
+        assert st_got is not None and st_got.flags.owndata
+        np.testing.assert_allclose(w_got, wmap_3d)
+        np.testing.assert_allclose(we_got, expected_werr, equal_nan=True)
+        np.testing.assert_allclose(st_got, splits, rtol=0.0, atol=1e-12)
+
+    # Re-saving a reloaded lk.read(path) LightCurve (both to a new path AND in-place overwrite=True)
+    # must preserve WEIGHTMAP, WEIGHTMAP_ERR, and SPLIT_TIMES losslessly!
+    resaved_fits = tmp_path / "resaved_from_reloaded_lc.fits"
+    halophot.write_fits(lc_from_disk, resaved_fits)
+    np.testing.assert_allclose(halophot.read_weightmap(resaved_fits), wmap_3d)  # type: ignore[arg-type]
+    np.testing.assert_allclose(
+        halophot.read_weightmap_err(resaved_fits), expected_werr, equal_nan=True  # type: ignore[arg-type]
+    )
+    np.testing.assert_allclose(
+        halophot.read_split_times(resaved_fits), splits, rtol=0.0, atol=1e-12  # type: ignore[arg-type]
+    )
+
+    lc_reloaded_again = lk.read(str(resaved_fits))
+    halophot.write_fits(lc_reloaded_again, resaved_fits, overwrite=True)
+    np.testing.assert_allclose(halophot.read_weightmap(resaved_fits), wmap_3d)  # type: ignore[arg-type]
+    np.testing.assert_allclose(
+        halophot.read_weightmap_err(resaved_fits), expected_werr, equal_nan=True  # type: ignore[arg-type]
+    )
+
+    # Time-slicing lc_from_disk before the split boundary drops out-of-range SPLIT_TIMES on write_fits
+    sliced_fits = tmp_path / "sliced_reloaded_lc.fits"
+    halophot.write_fits(lc_from_disk[:5], sliced_fits)
+    assert halophot.read_split_times(sliced_fits) is None
+
+    # Wrapper carrying _hdu without a .hdu attribute must resolve _hdu directly without AttributeError
+    with fits.open(seg_fits) as hdul_wrap:
+        only_private_hdu = types.SimpleNamespace(_hdu=hdul_wrap)
+        np.testing.assert_allclose(halophot.read_weightmap(only_private_hdu), wmap_3d)  # type: ignore[arg-type]
+
+    with fits.open(seg_fits) as hdul:
+        np.testing.assert_allclose(halophot.read_weightmap_err(hdul), expected_werr, equal_nan=True)  # type: ignore[arg-type]
+        lc_from_hdul = lk.read(hdul)
+        np.testing.assert_allclose(
+            halophot.read_weightmap_err(lc_from_hdul), expected_werr, equal_nan=True  # type: ignore[arg-type]
+        )
+
+        # Verify NSPLITS + SPLIT001 header fallback when SPLIT_TIMES BinTableHDU is absent
+        hdul_no_tbl = fits.HDUList([h.copy() for h in hdul if h.name != "SPLIT_TIMES"])
+        np.testing.assert_allclose(
+            halophot.read_split_times(hdul_no_tbl), splits, rtol=0.0, atol=1e-12  # type: ignore[arg-type]
+        )
+
+    # 1D WEIGHTMAP_ERR must raise ValueError on write_fits
+    lc_bad_werr = lk.TessLightCurve(time=t, flux=flux, flux_err=ferr)
+    lc_bad_werr.meta["WEIGHTMAP"] = np.full((3, 4), 1.0 / 12.0)
+    lc_bad_werr.meta["WEIGHTMAP_ERR"] = np.ones(4)
+    with pytest.raises(ValueError, match="WEIGHTMAP_ERR must have at least 2 dimensions"):
+        halophot.write_fits(lc_bad_werr, tmp_path / "bad_werr.fits")
+
+

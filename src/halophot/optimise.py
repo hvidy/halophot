@@ -15,6 +15,7 @@ Provides:
 from __future__ import annotations
 
 import functools
+import warnings
 from dataclasses import dataclass
 
 import equinox as eqx
@@ -484,7 +485,13 @@ def orbit_block_jackknife(
         keep[blk] = False
         if int(np.sum(keep)) < min_req:
             continue
-        obs_k = obs.with_cadence_subset(keep, legacy_tv=legacy_tv)
+        obs_k = obs.with_cadence_subset(
+            keep,
+            legacy_tv=legacy_tv,
+            preserve_regularization=True,
+            objective=objective,
+            tau=tau,
+        )
         w0_k = HaloWeights.from_physical_weights(
             w_full,
             obs_k.mean_pixel_flux,
@@ -560,6 +567,8 @@ def optimise_halo(
         times,
         pixel_var=pixel_var,
         lag=lag,
+        objective=objective,
+        tau=tau,
         legacy_tv=legacy_tv,
         lambda_phot=lambda_phot,
         lambda_z=lambda_z,
@@ -573,6 +582,17 @@ def optimise_halo(
         raise ValueError(
             f"Objective {objective!r} with lag={obs.lag} requires at least {min_req} cadences, "
             f"got {n_valid}."
+        )
+
+    m_pix = pix_np.shape[0]
+    n_valid_diffs = obs.effective_constraint_count(objective=objective, tau=tau)
+    if m_pix > 1 and m_pix >= 0.5 * n_valid_diffs:
+        warnings.warn(
+            f"Active halo pixel count M={m_pix} approaches or exceeds valid cadence "
+            f"constraints N_valid={n_valid_diffs} (M >= 0.5 * N_valid); simplex weights "
+            "have elevated degrees of freedom relative to cadence constraints.",
+            UserWarning,
+            stacklevel=2,
         )
 
     if w_init is None:
@@ -619,7 +639,13 @@ def optimise_halo(
         if np.any(~inliers) and int(np.sum(inliers)) >= min_req:
             mean_sub = np.mean(pix_np[:, inliers], axis=1)
             if legacy_tv or np.all(mean_sub > 0.0):
-                obs_sub = obs.with_cadence_subset(inliers, legacy_tv=legacy_tv)
+                obs_sub = obs.with_cadence_subset(
+                    inliers,
+                    legacy_tv=legacy_tv,
+                    preserve_regularization=False,
+                    objective=objective,
+                    tau=tau,
+                )
                 w0_init_sub = (
                     HaloWeights.from_uniform(obs_sub.mean_pixel_flux, legacy_tv=legacy_tv)
                     if w_init is None

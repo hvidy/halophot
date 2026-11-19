@@ -263,7 +263,7 @@ def _strip_quantity(val: Any) -> np.ndarray:
 def _coerce_tpf(tpf_or_path: Any) -> TargetPixelFile:
     if isinstance(tpf_or_path, TargetPixelFile):
         return tpf_or_path
-    if isinstance(tpf_or_path, (str, os.PathLike, fits.HDUList)):
+    if isinstance(tpf_or_path, str | os.PathLike | fits.HDUList):
         loaded = lk.read(tpf_or_path)
         if isinstance(loaded, TargetPixelFile):
             return loaded
@@ -289,6 +289,8 @@ def _construct_lightcurve_from_tpf(
     time_obj = Time(tpf.time.value, format=tpf.time.format, scale=tpf.time.scale)
 
     base_meta = dict(tpf.meta) if getattr(tpf, "meta", None) is not None else {}
+    base_meta.pop("FILENAME", None)
+    base_meta.pop("filename", None)
     base_meta.update(extra_meta)
 
     common_keys: dict[str, Any] = {
@@ -377,6 +379,8 @@ def extract_halo_lightcurve(
     remove_contaminants: bool = False,
     catalog_table: Table | str | os.PathLike[str] | None = None,
     offline: bool = False,
+    cache_dir: str | os.PathLike[str] | None = None,
+    strict_hpc: bool = True,
     target_exclusion_arcsec: float | None = None,
     mag_limit: float | None = None,
     star_radius_pix: float | None = None,
@@ -409,6 +413,21 @@ def extract_halo_lightcurve(
     normalize : bool, default True
         When ``True``, returns unit-mean dimensionless relative ``flux`` and
         ``flux_err`` (Eq. 6.4.1). When ``False``, preserves ``tpf.flux.unit``.
+    cache_dir : path-like, optional
+        Explicit cache directory for live catalogue queries, validated via
+        :func:`halophot.resolve_cache_dir`.
+    strict_hpc : bool, default True
+        When ``True``, rejects ``/fred/`` cache paths (including symlinks) with
+        :class:`ValueError` to protect HPC project inode quotas.
+
+    Notes
+    -----
+    Always serialize returned light curves with :func:`halophot.write_fits`
+    (alias for :func:`halophot.write_lightcurve_fits`) and reload pixel weights
+    with :func:`halophot.read_weightmap` (plus :func:`halophot.read_weightmap_err`
+    and :func:`halophot.read_split_times`). Calling ``lc.to_fits(path)`` directly
+    drops ``HALOCVER = 1`` extensions (``WEIGHTMAP``, ``WEIGHTMAP_ERR``,
+    ``SPLIT_TIMES``) and provenance cards.
     """
     tpf_obj = _coerce_tpf(tpf)
     if isinstance(sub, bool) or int(sub) < 1:
@@ -487,6 +506,8 @@ def extract_halo_lightcurve(
                 remove_contaminants=remove_contaminants,
                 catalog_table=catalog_table,
                 offline=offline,
+                cache_dir=cache_dir,
+                strict_hpc=strict_hpc,
                 target_exclusion_arcsec=target_exclusion_arcsec,
                 mag_limit=mag_limit,
                 star_radius_pix=star_radius_pix,
@@ -573,6 +594,8 @@ def extract_halo_lightcurve(
         remove_contaminants=remove_contaminants,
         catalog_table=catalog_table,
         offline=offline,
+        cache_dir=cache_dir,
+        strict_hpc=strict_hpc,
         target_exclusion_arcsec=target_exclusion_arcsec,
         mag_limit=mag_limit,
         star_radius_pix=star_radius_pix,
