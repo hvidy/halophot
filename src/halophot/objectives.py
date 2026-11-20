@@ -18,7 +18,9 @@ import math
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
+from ._precision import in_float64
 from .models import HaloObservation, HaloWeights
 
 __all__ = [
@@ -38,26 +40,35 @@ __all__ = [
 AVAILABLE_OBJECTIVES: tuple[str, ...] = ("tv", "tv_o2", "tv_exp", "l2v", "l3v", "owl")
 
 
-def charbonnier_penalty(r: jax.Array, epsilon: float = 1e-5) -> jax.Array:
-    """Evaluate ``phi_eps(r) = r^2 / (sqrt(r^2 + eps^2) + eps)`` without cancellation.
-
-    Algebraically identical to ``sqrt(r^2 + eps^2) - eps`` in exact arithmetic,
-    this rationalized form avoids catastrophic floating-point cancellation when
-    ``|r| << eps`` and has finite derivatives of all orders at ``r = 0``.
-    """
+def _charbonnier_penalty(r: jax.Array, epsilon: float | jax.Array = 1e-5) -> jax.Array:
+    """Undecorated cancellation-free Charbonnier penalty kernel."""
     r_arr = jnp.asarray(r)
     eps = jnp.maximum(jnp.asarray(epsilon, dtype=r_arr.dtype), jnp.finfo(r_arr.dtype).tiny)
     r2 = jnp.square(r_arr)
     return r2 / (jnp.sqrt(r2 + eps * eps) + eps)
 
 
-def tv_charbonnier_o1(
+@in_float64
+def charbonnier_penalty(
+    r: jax.Array | np.ndarray,
+    epsilon: float = 1e-5,
+) -> jax.Array:
+    """Evaluate ``phi_eps(r) = r^2 / (sqrt(r^2 + eps^2) + eps)`` without cancellation.
+
+    Algebraically identical to ``sqrt(r^2 + eps^2) - eps`` in exact arithmetic,
+    this rationalized form avoids catastrophic floating-point cancellation when
+    ``|r| << eps`` and has finite derivatives of all orders at ``r = 0``.
+    """
+    return _charbonnier_penalty(jnp.asarray(r, dtype=jnp.float64), epsilon=epsilon)
+
+
+def _tv_charbonnier_o1(
     f_tilde: jax.Array,
     obs: HaloObservation,
     *,
-    epsilon: float = 1e-5,
+    epsilon: float | jax.Array = 1e-5,
 ) -> tuple[jax.Array, jax.Array]:
-    """Return ``(mean_tv_o1, n_valid_pairs)`` for 1st-order gap-masked Charbonnier TV."""
+    """Undecorated 1st-order gap-masked Charbonnier TV kernel."""
     lag = obs.lag
     if lag >= obs.N_pad:
         zero = jnp.zeros((), dtype=f_tilde.dtype)
@@ -65,19 +76,30 @@ def tv_charbonnier_o1(
 
     mask = obs.valid_diff_mask[:-lag]
     diffs = jnp.where(mask, f_tilde[lag:] - f_tilde[:-lag], 0.0)
-    penalties = jnp.where(mask, charbonnier_penalty(diffs, epsilon=epsilon), 0.0)
+    penalties = jnp.where(mask, _charbonnier_penalty(diffs, epsilon=epsilon), 0.0)
     count = jnp.sum(mask.astype(f_tilde.dtype))
     mean_tv = jnp.where(count > 0.0, jnp.sum(penalties) / jnp.maximum(count, 1.0), 0.0)
     return mean_tv, count
 
 
-def tv_charbonnier_o2(
-    f_tilde: jax.Array,
+@in_float64
+def tv_charbonnier_o1(
+    f_tilde: jax.Array | np.ndarray,
     obs: HaloObservation,
     *,
     epsilon: float = 1e-5,
 ) -> tuple[jax.Array, jax.Array]:
-    """Return ``(mean_tv_o2, n_valid_triples)`` for 2nd-order gap-masked Charbonnier TV."""
+    """Return ``(mean_tv_o1, n_valid_pairs)`` for 1st-order gap-masked Charbonnier TV."""
+    return _tv_charbonnier_o1(jnp.asarray(f_tilde, dtype=jnp.float64), obs, epsilon=epsilon)
+
+
+def _tv_charbonnier_o2(
+    f_tilde: jax.Array,
+    obs: HaloObservation,
+    *,
+    epsilon: float | jax.Array = 1e-5,
+) -> tuple[jax.Array, jax.Array]:
+    """Undecorated 2nd-order gap-masked Charbonnier TV kernel."""
     lag = obs.lag
     if 2 * lag >= obs.N_pad:
         zero = jnp.zeros((), dtype=f_tilde.dtype)
@@ -89,26 +111,31 @@ def tv_charbonnier_o2(
         2.0 * f_tilde[lag:-lag] - f_tilde[2 * lag :] - f_tilde[: -2 * lag],
         0.0,
     )
-    penalties = jnp.where(mask, charbonnier_penalty(diffs2, epsilon=epsilon), 0.0)
+    penalties = jnp.where(mask, _charbonnier_penalty(diffs2, epsilon=epsilon), 0.0)
     count = jnp.sum(mask.astype(f_tilde.dtype))
     mean_tv = jnp.where(count > 0.0, jnp.sum(penalties) / jnp.maximum(count, 1.0), 0.0)
     return mean_tv, count
 
 
-def tv_exp_scan(
+@in_float64
+def tv_charbonnier_o2(
+    f_tilde: jax.Array | np.ndarray,
+    obs: HaloObservation,
+    *,
+    epsilon: float = 1e-5,
+) -> tuple[jax.Array, jax.Array]:
+    """Return ``(mean_tv_o2, n_valid_triples)`` for 2nd-order gap-masked Charbonnier TV."""
+    return _tv_charbonnier_o2(jnp.asarray(f_tilde, dtype=jnp.float64), obs, epsilon=epsilon)
+
+
+def _tv_exp_scan(
     f_tilde: jax.Array,
     obs: HaloObservation,
     *,
     tau: float | None = None,
-    epsilon: float = 1e-5,
+    epsilon: float | jax.Array = 1e-5,
 ) -> tuple[jax.Array, jax.Array]:
-    """Evaluate multi-lag exponential TV via ``jax.lax.scan`` in O(N) memory.
-
-    Accumulates ``sum_{ell=1}^{L_max} exp(-ell / tau) * L_TV^(1)(ell)`` normalized
-    by ``sum_{ell=1}^{L_max} exp(-ell / tau)`` over ``L_max = min(ceil(4 * tau), N - 1)``
-    with per-step gradient checkpointing so reverse-mode AD never materializes an
-    ``(L_max, N)`` or ``(N, N)`` tensor.
-    """
+    """Undecorated O(N) scan multi-lag exponential TV kernel."""
     tau_val = float(obs.lag) if tau is None else float(tau)
     if tau_val <= 0.0:
         raise ValueError(f"tau must be > 0, got {tau_val!r}.")
@@ -125,10 +152,10 @@ def tv_exp_scan(
 
     @jax.checkpoint
     def _scan_step(
-        carry: tuple[jax.Array, jax.Array],
+        carry: tuple[jax.Array, jax.Array, jax.Array],
         ell: jax.Array,
-    ) -> tuple[tuple[jax.Array, jax.Array], None]:
-        num_acc, den_acc = carry
+    ) -> tuple[tuple[jax.Array, jax.Array, jax.Array], None]:
+        num_acc, den_acc, max_count = carry
         in_bounds = idx < (n_pad - ell)
         both_active = in_bounds & obs.valid_cadence_mask & jnp.roll(obs.valid_cadence_mask, -ell)
 
@@ -137,33 +164,51 @@ def tv_exp_scan(
         tol_ok = (
             jnp.ones_like(dt_pair, dtype=jnp.bool_)
             if math.isinf(float(gap_tol))
-            else (jnp.abs(dt_pair - expected_dt) <= gap_tol * expected_dt)
+            else (jnp.abs(dt_pair - expected_dt) <= float(gap_tol) * obs.dt_nom)
         )
         mask_ell = both_active & tol_ok
 
         diffs = jnp.where(mask_ell, jnp.roll(f_tilde, -ell) - f_tilde, 0.0)
-        phi = jnp.where(mask_ell, charbonnier_penalty(diffs, epsilon=epsilon), 0.0)
+        phi = jnp.where(mask_ell, _charbonnier_penalty(diffs, epsilon=epsilon), 0.0)
         count = jnp.sum(mask_ell.astype(f_tilde.dtype))
         l_tv_ell = jnp.where(count > 0.0, jnp.sum(phi) / jnp.maximum(count, 1.0), 0.0)
 
         active_lag = (ell < obs.n_valid) & (count > 0.0)
         w_ell = jnp.where(active_lag, jnp.exp(-ell.astype(f_tilde.dtype) / tau_arr), 0.0)
-        return (num_acc + w_ell * l_tv_ell, den_acc + w_ell), None
+        next_max_count = jnp.maximum(max_count, jnp.where(active_lag, count, 0.0))
+        return (num_acc + w_ell * l_tv_ell, den_acc + w_ell, next_max_count), None
 
     lags = jnp.arange(1, scan_len + 1, dtype=jnp.int32)
     zero = jnp.zeros((), dtype=f_tilde.dtype)
-    (num_sum, den_sum), _ = jax.lax.scan(_scan_step, (zero, zero), lags)
+    (num_sum, den_sum, max_count), _ = jax.lax.scan(_scan_step, (zero, zero, zero), lags)
     l_tv_exp = jnp.where(den_sum > 0.0, num_sum / jnp.maximum(den_sum, 1e-30), 0.0)
 
-    n_eff = jnp.sum(obs.valid_diff_mask.astype(f_tilde.dtype))
-    return l_tv_exp, n_eff
+    return l_tv_exp, max_count
 
 
-def l2v_gap_masked(
+@in_float64
+def tv_exp_scan(
+    f_tilde: jax.Array | np.ndarray,
+    obs: HaloObservation,
+    *,
+    tau: float | None = None,
+    epsilon: float = 1e-5,
+) -> tuple[jax.Array, jax.Array]:
+    """Evaluate multi-lag exponential TV via ``jax.lax.scan`` in O(N) memory.
+
+    Accumulates ``sum_{ell=1}^{L_max} exp(-ell / tau) * L_TV^(1)(ell)`` normalized
+    by ``sum_{ell=1}^{L_max} exp(-ell / tau)`` over ``L_max = min(ceil(4 * tau), N - 1)``
+    with per-step gradient checkpointing so reverse-mode AD never materializes an
+    ``(L_max, N)`` or ``(N, N)`` tensor. Returns ``(l_tv_exp, max_valid_pairs)``.
+    """
+    return _tv_exp_scan(jnp.asarray(f_tilde, dtype=jnp.float64), obs, tau=tau, epsilon=epsilon)
+
+
+def _l2v_gap_masked(
     f_tilde: jax.Array,
     obs: HaloObservation,
 ) -> tuple[jax.Array, jax.Array]:
-    """Return ``(mean_l2v, n_valid_pairs)`` for gap-masked squared 1st differences."""
+    """Undecorated gap-masked squared 1st-difference kernel."""
     lag = obs.lag
     if lag >= obs.N_pad:
         zero = jnp.zeros((), dtype=f_tilde.dtype)
@@ -177,13 +222,22 @@ def l2v_gap_masked(
     return mean_l2, count
 
 
-def l3v_gap_masked(
+@in_float64
+def l2v_gap_masked(
+    f_tilde: jax.Array | np.ndarray,
+    obs: HaloObservation,
+) -> tuple[jax.Array, jax.Array]:
+    """Return ``(mean_l2v, n_valid_pairs)`` for gap-masked squared 1st differences."""
+    return _l2v_gap_masked(jnp.asarray(f_tilde, dtype=jnp.float64), obs)
+
+
+def _l3v_gap_masked(
     f_tilde: jax.Array,
     obs: HaloObservation,
     *,
-    epsilon: float = 1e-5,
+    epsilon: float | jax.Array = 1e-5,
 ) -> tuple[jax.Array, jax.Array]:
-    """Return ``(mean_l3v, n_valid_pairs)`` using strictly convex smooth ``r^2 * phi_eps(r)``."""
+    """Undecorated strictly convex smooth cubic 1st-difference kernel."""
     lag = obs.lag
     if lag >= obs.N_pad:
         zero = jnp.zeros((), dtype=f_tilde.dtype)
@@ -191,20 +245,31 @@ def l3v_gap_masked(
 
     mask = obs.valid_diff_mask[:-lag]
     diffs = jnp.where(mask, f_tilde[lag:] - f_tilde[:-lag], 0.0)
-    cubic_smooth = jnp.square(diffs) * charbonnier_penalty(diffs, epsilon=epsilon)
+    cubic_smooth = jnp.square(diffs) * _charbonnier_penalty(diffs, epsilon=epsilon)
     vals = jnp.where(mask, cubic_smooth, 0.0)
     count = jnp.sum(mask.astype(f_tilde.dtype))
     mean_l3 = jnp.where(count > 0.0, jnp.sum(vals) / jnp.maximum(count, 1.0), 0.0)
     return mean_l3, count
 
 
-def owl_masked(
-    f_tilde: jax.Array,
+@in_float64
+def l3v_gap_masked(
+    f_tilde: jax.Array | np.ndarray,
     obs: HaloObservation,
     *,
     epsilon: float = 1e-5,
 ) -> tuple[jax.Array, jax.Array]:
-    """Return ``(smooth_std, n_active_cadences)`` over active cadences."""
+    """Return ``(mean_l3v, n_valid_pairs)`` using strictly convex smooth ``r^2 * phi_eps(r)``."""
+    return _l3v_gap_masked(jnp.asarray(f_tilde, dtype=jnp.float64), obs, epsilon=epsilon)
+
+
+def _owl_masked(
+    f_tilde: jax.Array,
+    obs: HaloObservation,
+    *,
+    epsilon: float | jax.Array = 1e-5,
+) -> tuple[jax.Array, jax.Array]:
+    """Undecorated active-cadence smooth standard deviation kernel."""
     mask = obs.valid_cadence_mask.astype(f_tilde.dtype)
     count = jnp.sum(mask)
     safe_count = jnp.maximum(count, 1.0)
@@ -216,19 +281,100 @@ def owl_masked(
     return smooth_std, count
 
 
-def photon_noise_penalty(theta: jax.Array, obs: HaloObservation) -> jax.Array:
-    """Evaluate ``(lambda_phot / 2) * sum_i theta_i^2 * mean_frac_var_i``."""
+@in_float64
+def owl_masked(
+    f_tilde: jax.Array | np.ndarray,
+    obs: HaloObservation,
+    *,
+    epsilon: float = 1e-5,
+) -> tuple[jax.Array, jax.Array]:
+    """Return ``(smooth_std, n_active_cadences)`` over active cadences."""
+    return _owl_masked(jnp.asarray(f_tilde, dtype=jnp.float64), obs, epsilon=epsilon)
+
+
+def _photon_noise_penalty(theta: jax.Array, obs: HaloObservation) -> jax.Array:
+    """Undecorated photon-noise penalty kernel."""
     return 0.5 * obs.lambda_phot * jnp.sum(jnp.square(theta) * obs.mean_frac_var)
 
 
-def logit_damping_penalty(z_ilr: jax.Array, obs: HaloObservation) -> jax.Array:
-    """Evaluate ``(lambda_z / 2) * ||z_ilr - z_prior_centre||_2^2``."""
+@in_float64
+def photon_noise_penalty(theta: jax.Array | np.ndarray, obs: HaloObservation) -> jax.Array:
+    """Evaluate ``(lambda_phot / 2) * sum_i theta_i^2 * mean_frac_var_i``."""
+    return _photon_noise_penalty(jnp.asarray(theta, dtype=jnp.float64), obs)
+
+
+def _logit_damping_penalty(z_ilr: jax.Array, obs: HaloObservation) -> jax.Array:
+    """Undecorated ILR logit-damping penalty kernel."""
     if z_ilr.shape[0] == 0:
         return jnp.zeros((), dtype=z_ilr.dtype)
     diff = z_ilr - obs.z_prior_centre
     return 0.5 * obs.lambda_z * jnp.sum(jnp.square(diff))
 
 
+@in_float64
+def logit_damping_penalty(z_ilr: jax.Array | np.ndarray, obs: HaloObservation) -> jax.Array:
+    """Evaluate ``(lambda_z / 2) * ||z_ilr - z_prior_centre||_2^2``."""
+    return _logit_damping_penalty(jnp.asarray(z_ilr, dtype=jnp.float64), obs)
+
+
+def _halo_objective(
+    weights: HaloWeights,
+    obs: HaloObservation,
+    *,
+    objective: str = "tv",
+    epsilon: float = 1e-5,
+    tau: float | None = None,
+) -> jax.Array:
+    """Undecorated regularized v2.0 halo photometry objective kernel for JIT/AD."""
+    if objective not in AVAILABLE_OBJECTIVES:
+        valid = ", ".join(AVAILABLE_OBJECTIVES)
+        raise ValueError(f"Unknown objective {objective!r}; expected one of: {valid}.")
+    if epsilon <= 0.0:
+        raise ValueError(f"epsilon must be > 0, got {epsilon!r}.")
+
+    f_tilde = weights._evaluate_lightcurve_raw(obs)
+    tiny = jnp.finfo(f_tilde.dtype).tiny
+    b_scale = jnp.maximum(obs.b_hat, tiny)
+    # Dynamically cap Charbonnier smoothing at 0.1 * b_scale so ultra-bright (<10 ppm)
+    # targets remain strictly in the robust L1 regime rather than quadratic L2.
+    eps_req = jnp.asarray(epsilon, dtype=f_tilde.dtype)
+    eps_eff = (
+        eps_req
+        if weights.legacy_tv
+        else jnp.maximum(jnp.minimum(eps_req, 0.1 * b_scale), tiny)
+    )
+
+    if objective == "tv":
+        mean_val, count = _tv_charbonnier_o1(f_tilde, obs, epsilon=eps_eff)
+        data_term = (count / b_scale) * mean_val
+    elif objective == "tv_o2":
+        mean_val, count = _tv_charbonnier_o2(f_tilde, obs, epsilon=eps_eff)
+        data_term = (count / b_scale) * mean_val
+    elif objective == "tv_exp":
+        mean_val, count = _tv_exp_scan(f_tilde, obs, tau=tau, epsilon=eps_eff)
+        data_term = (count / b_scale) * mean_val
+    elif objective == "l2v":
+        mean_val, count = _l2v_gap_masked(f_tilde, obs)
+        data_term = (count / jnp.square(b_scale)) * mean_val
+    elif objective == "l3v":
+        mean_val, count = _l3v_gap_masked(f_tilde, obs, epsilon=eps_eff)
+        data_term = (count / (b_scale * jnp.square(b_scale))) * mean_val
+    else:  # objective == "owl"
+        std_val, count = _owl_masked(f_tilde, obs, epsilon=eps_eff)
+        data_term = std_val if weights.legacy_tv else (count / b_scale) * std_val
+
+    if weights.legacy_tv:
+        return data_term
+
+    theta = weights._flux_shares_raw()
+    return (
+        data_term
+        + _photon_noise_penalty(theta, obs)
+        + _logit_damping_penalty(weights.z_ilr, obs)
+    )
+
+
+@in_float64
 def halo_objective(
     weights: HaloWeights,
     obs: HaloObservation,
@@ -238,40 +384,4 @@ def halo_objective(
     tau: float | None = None,
 ) -> jax.Array:
     """Evaluate the regularized v2.0 halo photometry objective ``J(z)`` (Eq. 6.4)."""
-    if objective not in AVAILABLE_OBJECTIVES:
-        valid = ", ".join(AVAILABLE_OBJECTIVES)
-        raise ValueError(f"Unknown objective {objective!r}; expected one of: {valid}.")
-    if epsilon <= 0.0:
-        raise ValueError(f"epsilon must be > 0, got {epsilon!r}.")
-
-    f_tilde = weights.evaluate_lightcurve(obs)
-    b_scale = jnp.maximum(obs.b_hat, jnp.finfo(f_tilde.dtype).tiny)
-
-    if objective == "tv":
-        mean_val, count = tv_charbonnier_o1(f_tilde, obs, epsilon=epsilon)
-        data_term = (count / b_scale) * mean_val
-    elif objective == "tv_o2":
-        mean_val, count = tv_charbonnier_o2(f_tilde, obs, epsilon=epsilon)
-        data_term = (count / b_scale) * mean_val
-    elif objective == "tv_exp":
-        mean_val, count = tv_exp_scan(f_tilde, obs, tau=tau, epsilon=epsilon)
-        data_term = (count / b_scale) * mean_val
-    elif objective == "l2v":
-        mean_val, count = l2v_gap_masked(f_tilde, obs)
-        data_term = (count / jnp.square(b_scale)) * mean_val
-    elif objective == "l3v":
-        mean_val, count = l3v_gap_masked(f_tilde, obs, epsilon=epsilon)
-        data_term = (count / (b_scale * jnp.square(b_scale))) * mean_val
-    else:  # objective == "owl"
-        std_val, count = owl_masked(f_tilde, obs, epsilon=epsilon)
-        data_term = std_val if weights.legacy_tv else (count / b_scale) * std_val
-
-    if weights.legacy_tv:
-        return data_term
-
-    theta = weights.flux_shares()
-    return (
-        data_term
-        + photon_noise_penalty(theta, obs)
-        + logit_damping_penalty(weights.z_ilr, obs)
-    )
+    return _halo_objective(weights, obs, objective=objective, epsilon=epsilon, tau=tau)
