@@ -922,3 +922,95 @@ def test_math05_06_09_tv_exp_count_tvo2_gap_and_legacy_chamber() -> None:
     w_zero, lc_zero, _ = tv_tpf(np.vstack([z_wave, -z_wave]), verbose=False)
     assert np.all(np.isfinite(w_zero)) and np.all(np.isfinite(lc_zero))
 
+
+def test_carbon_review_subset_unit_mean_asymmetric_jk_heteroscedastic_and_fisher() -> None:
+    """Verify Carbon review fixes: subset unit-mean, Busing-Meijer delete-m_k JK, harmonic floor, Fisher eps_gn."""
+    dt = 2.0 / 1440.0
+    rng = np.random.default_rng(20261120)
+
+    # 1. with_cadence_subset re-centres norm_pixels to exact unit mean BOTH when all mean_sub > 0
+    #    AND when a wing pixel dips mean_sub <= 0; legacy_tv persists automatically.
+    n_c = 80
+    t_c = np.arange(n_c, dtype=np.float64) * dt
+    p_drift = np.vstack(
+        [
+            np.concatenate([np.full(40, 800.0), np.full(40, 1400.0)]),
+            np.concatenate([np.full(40, 1300.0), np.full(40, 900.0)]),
+        ]
+    ) + rng.normal(0.0, 1.0, size=(2, n_c))
+    obs_drift = HaloObservation.from_arrays(p_drift, t_c)
+    obs_half = obs_drift.with_cadence_subset(np.arange(n_c) < 40, preserve_regularization=True)
+    w_probe = HaloWeights.from_physical_weights([0.3, 0.7], obs_half.mean_pixel_flux)
+    lc_half = np.asarray(w_probe.evaluate_lightcurve(obs_half))[:40]
+    assert float(np.mean(lc_half)) == pytest.approx(1.0, abs=1e-13)
+
+    # Wing pixel dipping negative on subset still yields exact unit-mean evaluate_lightcurve
+    wing = np.concatenate([np.full(60, -2.0), np.full(20, 40.0)])
+    p_wing = np.vstack([wing, 1000.0 + rng.normal(0.0, 1.0, size=n_c)])
+    obs_wing = HaloObservation.from_arrays(p_wing, t_c)
+    obs_wing_sub = obs_wing.with_cadence_subset(np.arange(n_c) < 60, preserve_regularization=True)
+    w_wp = HaloWeights.from_physical_weights([0.2, 0.8], obs_wing_sub.mean_pixel_flux)
+    lc_wp = np.asarray(w_wp.evaluate_lightcurve(obs_wing_sub))[:60]
+    assert float(np.mean(lc_wp)) == pytest.approx(1.0, abs=1e-12)
+
+    # legacy_tv persists on HaloObservation across with_cadence_subset without repeating legacy_tv=True
+    obs_leg = HaloObservation.from_arrays(p_wing - 10.0, t_c, legacy_tv=True)
+    obs_leg_sub = obs_leg.with_cadence_subset(np.arange(n_c) < 40)
+    assert obs_leg_sub.legacy_tv is True
+
+    # 2. Heteroscedastic high-variance smear pixel must NOT crush lambda_phot on clean pixels
+    m_clean = 16
+    n_het = 25
+    t_het = np.arange(n_het, dtype=np.float64) * dt
+    pulls_het = []
+    for sd in range(8):
+        rg = np.random.default_rng(7100 + sd)
+        f_clean = np.full((m_clean, n_het), 20000.0, dtype=np.float64)
+        v_clean = np.full((m_clean, n_het), 20000.0 / 120.0, dtype=np.float64)
+        # Add 1 catastrophic smear pixel with 1e5x larger variance at same mean flux
+        f_all = np.vstack([f_clean, np.full((1, n_het), 20000.0, dtype=np.float64)])
+        v_all = np.vstack([v_clean, np.full((1, n_het), 1e9, dtype=np.float64)])
+        nz_all = rg.normal(0.0, np.sqrt(v_all))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            fit_h = optimise_halo(f_all + nz_all, t_het, pixel_var=v_all, n_pad=32)
+        wh = fit_h.physical_weights
+        assert float(wh[-1]) < 1e-3
+        pulls_het.append(float(np.std((wh @ nz_all) / np.sqrt((wh**2) @ v_all), ddof=1)))
+    assert 0.85 <= float(np.mean(pulls_het)) <= 1.15
+
+    # 3. Asymmetric orbit split (48, 48, 4) delete-m_k jackknife calibration & fold non-convergence warning
+    t_asym = np.concatenate(
+        [
+            np.arange(48, dtype=np.float64) * dt,
+            2.0 + np.arange(48, dtype=np.float64) * dt,
+            4.0 + np.arange(4, dtype=np.float64) * dt,
+        ]
+    )
+    w_asym_mc, jk_asym_stds = [], []
+    for sd in range(10):
+        rg = np.random.default_rng(8200 + sd)
+        f0_a = np.array([[2000.0], [2000.0], [1000.0], [1000.0]])
+        s_a = np.array([[-1.0], [0.5], [-0.3], [1.1]])
+        jit_a = 0.04 * ((-1.0) ** np.arange(t_asym.size))
+        pv_a = np.broadcast_to(f0_a / 120.0, (4, t_asym.size)).copy()
+        p_a = f0_a * (1.0 + s_a * jit_a[None, :]) + rg.normal(0.0, np.sqrt(pv_a))
+        fit_a = optimise_halo(p_a, t_asym, pixel_var=pv_a, compute_uncertainty=True, jackknife_blocks=3, n_pad=128)
+        w_asym_mc.append(fit_a.physical_weights)
+        assert fit_a.weight_std is not None
+        jk_asym_stds.append(fit_a.weight_std)
+    emp_a = np.std(np.vstack(w_asym_mc), axis=0, ddof=1)
+    jk_a = np.median(np.vstack(jk_asym_stds), axis=0)
+    act_a = emp_a > 1e-5
+    ratio_a = float(np.median(jk_a[act_a] / emp_a[act_a]))
+    assert 0.55 <= ratio_a <= 1.65
+
+    # Fold non-convergence RuntimeWarning in orbit_block_jackknife & zodiax converged=False at maxiter=2
+    obs_a = HaloObservation.from_arrays(p_a, t_asym, pixel_var=pv_a)
+    with pytest.warns(RuntimeWarning, match="orbit_block_jackknife"):
+        orbit_block_jackknife(obs_a, fit_a.physical_weights, n_blocks=3, maxiter=1)
+
+    fit_zdx_2 = optimise_halo(p_a, t_asym, pixel_var=pv_a, solver="zodiax", maxiter=2)
+    assert fit_zdx_2.converged is False
+
+

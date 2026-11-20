@@ -22,6 +22,7 @@ from ._precision import in_float64
 from .simplex import (
     _flux_share_to_weights,
     _ilr_to_simplex,
+    _simplex_to_ilr,
     _uniform_weights_ilr,
     _weights_to_ilr,
 )
@@ -191,6 +192,38 @@ def _objective_noise_calibration(objective: str) -> tuple[float, float]:
     return noise_mult, obj_slope
 
 
+def _minvar_aperture_floor_and_centre(
+    mean_p_j: jax.Array,
+    frac_var: np.ndarray,
+) -> tuple[float, jax.Array]:
+    """Compute harmonic simplex minimum-variance floor and matching ILR prior centre.
+
+    When all pixels have positive finite fractional variance ``frac_var_i > 0``, the
+    exact simplex minimum of ``sum_i theta_i^2 * frac_var_i`` is attained at
+    ``theta_mv_i = (1 / frac_var_i) / sum_j (1 / frac_var_j)`` with value
+    ``ap_var_floor = 1 / sum_j (1 / frac_var_j)``. This coincides identically with
+    uniform physical weights ``w_i = 1 / M`` on Poisson-limited and homoscedastic
+    stamps, while remaining invariant to high-variance smear or wing pixels on
+    heteroscedastic stamps.
+    """
+    if frac_var.size >= 1 and np.all(np.isfinite(frac_var)) and np.all(frac_var > 0.0):
+        inv_fv = 1.0 / frac_var
+        inv_sum = float(np.sum(inv_fv))
+        ap_var_floor = 1.0 / inv_sum
+        theta_mv = inv_fv / inv_sum
+        if frac_var.size == 1:
+            return ap_var_floor, jnp.zeros(0, dtype=jnp.float64)
+        interior = np.maximum(theta_mv, 1e-15)
+        interior = interior / np.sum(interior)
+        z_centre = _simplex_to_ilr(jnp.asarray(interior, dtype=jnp.float64))
+        return ap_var_floor, z_centre
+
+    z_unif = _uniform_weights_ilr(mean_p_j, legacy_tv=False)
+    theta_init_np = np.asarray(_ilr_to_simplex(z_unif), dtype=np.float64)
+    ap_var_floor = float(np.sum(np.square(theta_init_np) * frac_var))
+    return ap_var_floor, z_unif
+
+
 class HaloWeights(zdx.Base):
     """Differentiable halo weight PyTree with ``z_ilr`` as its sole array leaf."""
 
@@ -251,7 +284,14 @@ class HaloWeights(zdx.Base):
     def _evaluate_lightcurve_raw(self, obs: HaloObservation) -> jax.Array:
         if not self.legacy_tv:
             theta = _ilr_to_simplex(self.z_ilr)
-            return jnp.dot(theta, obs.norm_pixels)
+            lc_scaled = jnp.dot(theta, obs.norm_pixels)
+            mean_ratio = jnp.dot(theta, obs.norm_mean_ratio)
+            safe_ratio = jnp.where(
+                jnp.abs(mean_ratio) > 1e-30,
+                mean_ratio,
+                jnp.ones_like(mean_ratio),
+            )
+            return lc_scaled / safe_ratio
 
         w = _ilr_to_simplex(self.z_ilr)
         safe_scale = jnp.where(jnp.abs(obs.mean_pixel_flux) > 1e-30, obs.mean_pixel_flux, 1.0)
@@ -275,6 +315,7 @@ class HaloObservation(zdx.Base):
 
     norm_pixels: jax.Array
     mean_pixel_flux: jax.Array
+    norm_mean_ratio: jax.Array
     mean_frac_var: jax.Array
     valid_diff_mask: jax.Array
     z_prior_centre: jax.Array
@@ -291,6 +332,7 @@ class HaloObservation(zdx.Base):
     gap_tol: float = eqx.field(static=True, default=0.25)
     objective: str = eqx.field(static=True, default="tv")
     tau: float | None = eqx.field(static=True, default=None)
+    legacy_tv: bool = eqx.field(static=True, default=False)
     user_lambda_phot: float | None = eqx.field(static=True, default=None)
     user_lambda_z: float | None = eqx.field(static=True, default=None)
 
@@ -365,11 +407,12 @@ class HaloObservation(zdx.Base):
             ``b_hat = 1`` for exact *K2* / ``halo-tess`` DR1 reproduction.
         lambda_phot : float, optional
             Photon-noise regularization strength. When ``None`` and ``not legacy_tv``,
-            auto-calibrated from the operator-matched aperture photon-noise floor
-            ``ap_var_floor = sum_i theta_init_i^2 * mean_frac_var_i`` so pointing
-            jitter and common-mode pulsations never suppress regularization.
+            auto-calibrated from the harmonic minimum-variance aperture photon-noise
+            floor ``ap_var_floor = 1 / sum_i (1 / mean_frac_var_i)`` so pointing
+            jitter, common-mode pulsations, and high-variance smear pixels never
+            suppress photon-noise regularization.
         lambda_z : float, optional
-            Bounded ILR gauge-damping strength around uniform-``w`` ``z_init``.
+            Bounded ILR gauge-damping strength around ``z_prior_centre``.
             Defaults to ``1e-3`` when ``not legacy_tv`` and ``0.0`` when
             ``legacy_tv=True``.
         n_pad : int, optional
@@ -474,7 +517,6 @@ class HaloObservation(zdx.Base):
         )
 
         mean_p_j = jnp.asarray(mean_p, dtype=jnp.float64)
-        z_init_j = _uniform_weights_ilr(mean_p_j, legacy_tv=legacy_tv)
 
         n_constraints = compute_effective_constraints(
             diff_mask_j,
@@ -491,29 +533,23 @@ class HaloObservation(zdx.Base):
         n_eff = max(n_constraints, 1)
 
         if legacy_tv:
+            z_centre_j = _uniform_weights_ilr(mean_p_j, legacy_tv=True)
             b_hat_val = 1.0
             lam_phot_val = 0.0
             lam_z_val = 0.0
             user_lam_phot_val: float | None = 0.0
             user_lam_z_val: float | None = 0.0
         else:
-            theta_init = _ilr_to_simplex(z_init_j)
-            theta_init_np = np.asarray(theta_init, dtype=np.float64)
-            ap_var_floor = float(np.sum(np.square(theta_init_np) * frac_var))
+            ap_var_floor, z_centre_j = _minvar_aperture_floor_and_centre(mean_p_j, frac_var)
             noise_mult, obj_slope = _objective_noise_calibration(objective)
 
             # Anchor both the data-term denominator b_hat and lambda_phot strictly to the
-            # operator-matched aperture photon-noise floor so raw pointing jitter and
-            # common-mode stellar pulsations never crush photon-noise regularization.
+            # operator-matched minimum-variance aperture photon-noise floor so pointing
+            # jitter, common-mode pulsations, and noisy smear pixels never crush lambda_phot.
             ref_var = max(noise_mult * ap_var_floor, 1e-12)
             b_hat_val = math.sqrt(ref_var)
 
             dof_ratio = float(m_pix - 1) / float(n_eff) if m_pix > 1 else 0.0
-            # Linear Marchenko-Pastur discrepancy balance: along the minimum-norm white-noise
-            # interpolant on the (M - 1)-dimensional zero-sum simplex tangent space,
-            # E[-Delta J_data] ~= obj_slope * sqrt(2 / pi) * n_eff while
-            # E[Delta J_phot] ~= obj_slope * c(r) * n_eff / (4 * r), bounding white-noise
-            # amplitude shrinkage alpha* <= 0.05 across all r > 0 and all 6 objectives.
             c_phot = _PHOT_BASE_COEFF + _PHOT_MP_SLOPE * dof_ratio
             if lambda_phot is None:
                 phot_ref_var = max(2.0 * ap_var_floor, 1e-12)
@@ -537,9 +573,10 @@ class HaloObservation(zdx.Base):
         return cls(
             norm_pixels=jnp.asarray(norm_padded, dtype=jnp.float64),
             mean_pixel_flux=mean_p_j,
+            norm_mean_ratio=jnp.ones(m_pix, dtype=jnp.float64),
             mean_frac_var=jnp.asarray(frac_var, dtype=jnp.float64),
             valid_diff_mask=diff_mask_j,
-            z_prior_centre=z_init_j,
+            z_prior_centre=z_centre_j,
             times_padded=times_j,
             valid_cadence_mask=valid_cad_j,
             dt_nom=dt_nom_j,
@@ -553,6 +590,7 @@ class HaloObservation(zdx.Base):
             gap_tol=float(gap_tol),
             objective=str(objective),
             tau=None if tau is None else float(tau),
+            legacy_tv=bool(legacy_tv),
             user_lambda_phot=user_lam_phot_val,
             user_lambda_z=user_lam_z_val,
         )
@@ -562,7 +600,7 @@ class HaloObservation(zdx.Base):
         self,
         keep_mask: np.ndarray | jax.Array,
         *,
-        legacy_tv: bool = False,
+        legacy_tv: bool | None = None,
         preserve_regularization: bool = True,
         objective: str | None = None,
         tau: float | None = None,
@@ -572,12 +610,13 @@ class HaloObservation(zdx.Base):
         ``keep_mask`` is a boolean mask of length ``n_valid`` (or ``N_pad``) selecting
         retained cadences (e.g. for ``sigclip`` refits or orbit block-jackknife folds).
         ``self.dt_nom`` is always preserved so removing cadences never distorts gap masks.
-        When ``preserve_regularization=True`` and ``not legacy_tv`` (used by
-        ``orbit_block_jackknife``), the positive full-sample reference scale
-        ``self.mean_pixel_flux``, ``self.mean_frac_var``, ``self.z_prior_centre``, and
-        ``self.b_hat`` are preserved so wing pixels whose leave-out mean dips ``<= 0``
-        never violate Charnes-Cooper positivity, while auto-calibrated ``lambda_phot`` and
-        ``lambda_z`` scale with ``n_eff_sub / n_eff_full``.
+        Active pixel fluxes are always re-centred on the retained subset means ``mean_sub``;
+        if any faint wing pixel dips ``mean_sub_i <= 0`` under ``not legacy_tv``, only that
+        pixel's positive Charnes-Cooper chart scale falls back to ``self.mean_pixel_flux[i]``
+        while ``norm_mean_ratio = mean_sub / chart_scale`` keeps ``evaluate_lightcurve``
+        strictly unit-mean on the subset. When ``preserve_regularization=True`` (used by
+        ``orbit_block_jackknife``), ``self.b_hat`` is preserved and auto-calibrated
+        ``lambda_phot`` / ``lambda_z`` scale with ``n_eff_sub / n_eff_full``.
         """
         n_orig = int(self.n_valid)
         mask_np = np.asarray(keep_mask, dtype=bool)
@@ -596,55 +635,114 @@ class HaloObservation(zdx.Base):
         if n_sub < 2:
             raise ValueError("At least 2 active cadences are required in with_cadence_subset.")
 
+        eff_legacy = self.legacy_tv if legacy_tv is None else bool(legacy_tv)
         eff_obj = self.objective if objective is None else objective
         eff_tau = self.tau if tau is None else tau
         dt_nom_val = float(self.dt_nom)
+
         mean_orig = np.asarray(self.mean_pixel_flux, dtype=np.float64)
-        times_sub = np.asarray(self.times_padded)[idx_keep]
+        old_scale = np.where(np.abs(mean_orig) > 1e-30, mean_orig, 1.0)
+        raw_sub = old_scale[:, np.newaxis] * np.asarray(self.norm_pixels, dtype=np.float64)[:, idx_keep]
+        times_sub = np.asarray(self.times_padded, dtype=np.float64)[idx_keep]
+        pixel_var_est = np.asarray(self.mean_frac_var, dtype=np.float64) * (old_scale**2)
+        mean_sub = np.mean(raw_sub, axis=1)
 
-        # Preserve full-sample positive reference mean & calibration when requested (e.g. jackknife)
-        # so leave-out wing pixels that dip <= 0 remain strictly valid in Charnes-Cooper coordinates.
-        if not legacy_tv and preserve_regularization and np.all(mean_orig > 0.0):
-            m_pix = mean_orig.shape[0]
-            norm_padded = np.ones((m_pix, self.N_pad), dtype=np.float64)
-            norm_padded[:, :n_sub] = np.asarray(self.norm_pixels, dtype=np.float64)[:, idx_keep]
-
-            valid_cad = np.zeros(self.N_pad, dtype=bool)
-            valid_cad[:n_sub] = True
-
-            times_padded_np = np.empty(self.N_pad, dtype=np.float64)
-            times_padded_np[:n_sub] = times_sub
-            if self.N_pad > n_sub:
-                pad_offsets = np.arange(1, self.N_pad - n_sub + 1, dtype=np.float64)
-                times_padded_np[n_sub:] = times_sub[-1] + 1e6 * dt_nom_val * pad_offsets
-
-            times_j = jnp.asarray(times_padded_np, dtype=jnp.float64)
-            valid_cad_j = jnp.asarray(valid_cad, dtype=jnp.bool_)
-            dt_nom_j = jnp.asarray(dt_nom_val, dtype=jnp.float64)
-            diff_mask_j = _compute_gap_diff_mask(
-                times_j,
-                valid_cad_j,
-                self.lag,
-                dt_nom_j,
+        if eff_legacy or np.all(mean_sub > 0.0):
+            lam_phot_arg: float | None = 0.0 if eff_legacy else self.user_lambda_phot
+            lam_z_arg: float | None = 0.0 if eff_legacy else self.user_lambda_z
+            sub_obs = HaloObservation.from_arrays(
+                raw_sub,
+                times_sub,
+                pixel_var=pixel_var_est,
+                lag=self.lag,
+                objective=eff_obj,
+                tau=eff_tau,
+                legacy_tv=eff_legacy,
+                lambda_phot=lam_phot_arg,
+                lambda_z=lam_z_arg,
+                n_pad=self.N_pad,
                 gap_tol=self.gap_tol,
+                dt_nom=dt_nom_val,
             )
+            if eff_legacy or not preserve_regularization:
+                return sub_obs
 
             n_eff_full = max(self.effective_constraint_count(objective=eff_obj, tau=eff_tau), 1)
-            n_eff_sub = max(
-                compute_effective_constraints(
-                    diff_mask_j,
-                    n_valid=n_sub,
-                    n_pad=self.N_pad,
-                    lag=self.lag,
-                    objective=eff_obj,
-                    tau=eff_tau,
-                    times_padded=times_padded_np,
-                    valid_cadence_mask=valid_cad,
-                    dt_nom=dt_nom_val,
-                    gap_tol=self.gap_tol,
-                ),
-                1,
+            n_eff_sub = max(int(sub_obs.n_eff), 1)
+            count_ratio = float(n_eff_sub) / float(n_eff_full)
+            new_lam_phot = (
+                sub_obs.lambda_phot
+                if self.user_lambda_phot is not None
+                else jnp.asarray(float(self.lambda_phot) * count_ratio, dtype=jnp.float64)
             )
+            new_lam_z = (
+                sub_obs.lambda_z
+                if self.user_lambda_z is not None
+                else jnp.asarray(float(self.lambda_z) * count_ratio, dtype=jnp.float64)
+            )
+            new_b_hat = sub_obs.b_hat if self.user_lambda_phot is not None else self.b_hat
+            return eqx.tree_at(
+                lambda o: (o.lambda_phot, o.lambda_z, o.b_hat),
+                sub_obs,
+                (new_lam_phot, new_lam_z, new_b_hat),
+            )
+
+        # At least one faint wing pixel dipped mean_sub <= 0 under not legacy_tv:
+        # keep strictly positive chart_scale_i = mean_sub_i when > 0 else mean_orig_i (> 0),
+        # while norm_mean_ratio = mean_sub / chart_scale guarantees exact unit-mean light curves.
+        if not np.all(mean_orig > 0.0):
+            raise ValueError(
+                "Charnes-Cooper coordinates require strictly positive mean pixel flux "
+                "on all active halo pixels (mean_pixel_flux > 0)."
+            )
+        m_pix = mean_sub.shape[0]
+        chart_scale = np.where(mean_sub > 0.0, mean_sub, mean_orig)
+        norm_sub = raw_sub / chart_scale[:, np.newaxis]
+        norm_ratio = mean_sub / chart_scale
+        frac_var_sub = np.maximum(pixel_var_est / np.maximum(chart_scale**2, 1e-30), 0.0)
+
+        norm_padded = np.ones((m_pix, self.N_pad), dtype=np.float64)
+        norm_padded[:, :n_sub] = norm_sub
+        valid_cad = np.zeros(self.N_pad, dtype=bool)
+        valid_cad[:n_sub] = True
+        times_padded_np = np.empty(self.N_pad, dtype=np.float64)
+        times_padded_np[:n_sub] = times_sub
+        if self.N_pad > n_sub:
+            pad_offsets = np.arange(1, self.N_pad - n_sub + 1, dtype=np.float64)
+            times_padded_np[n_sub:] = times_sub[-1] + 1e6 * dt_nom_val * pad_offsets
+
+        times_j = jnp.asarray(times_padded_np, dtype=jnp.float64)
+        valid_cad_j = jnp.asarray(valid_cad, dtype=jnp.bool_)
+        dt_nom_j = jnp.asarray(dt_nom_val, dtype=jnp.float64)
+        diff_mask_j = _compute_gap_diff_mask(
+            times_j,
+            valid_cad_j,
+            self.lag,
+            dt_nom_j,
+            gap_tol=self.gap_tol,
+        )
+        chart_scale_j = jnp.asarray(chart_scale, dtype=jnp.float64)
+        ap_var_floor_sub, z_centre_sub = _minvar_aperture_floor_and_centre(
+            chart_scale_j, frac_var_sub
+        )
+        n_eff_sub = max(
+            compute_effective_constraints(
+                diff_mask_j,
+                n_valid=n_sub,
+                n_pad=self.N_pad,
+                lag=self.lag,
+                objective=eff_obj,
+                tau=eff_tau,
+                times_padded=times_padded_np,
+                valid_cadence_mask=valid_cad,
+                dt_nom=dt_nom_val,
+                gap_tol=self.gap_tol,
+            ),
+            1,
+        )
+
+        if preserve_regularization:
+            n_eff_full = max(self.effective_constraint_count(objective=eff_obj, tau=eff_tau), 1)
             count_ratio = float(n_eff_sub) / float(n_eff_full)
             new_lam_phot = (
                 jnp.asarray(float(self.user_lambda_phot), dtype=jnp.float64)
@@ -656,48 +754,48 @@ class HaloObservation(zdx.Base):
                 if self.user_lambda_z is not None
                 else jnp.asarray(float(self.lambda_z) * count_ratio, dtype=jnp.float64)
             )
-
-            return HaloObservation(
-                norm_pixels=jnp.asarray(norm_padded, dtype=jnp.float64),
-                mean_pixel_flux=self.mean_pixel_flux,
-                mean_frac_var=self.mean_frac_var,
-                valid_diff_mask=diff_mask_j,
-                z_prior_centre=self.z_prior_centre,
-                times_padded=times_j,
-                valid_cadence_mask=valid_cad_j,
-                dt_nom=dt_nom_j,
-                b_hat=self.b_hat,
-                lambda_phot=new_lam_phot,
-                lambda_z=new_lam_z,
-                n_valid=jnp.asarray(n_sub, dtype=jnp.int32),
-                n_eff=jnp.asarray(n_eff_sub, dtype=jnp.float64),
-                N_pad=self.N_pad,
-                lag=self.lag,
-                gap_tol=self.gap_tol,
-                objective=str(eff_obj),
-                tau=None if eff_tau is None else float(eff_tau),
-                user_lambda_phot=self.user_lambda_phot,
-                user_lambda_z=self.user_lambda_z,
+            new_b_hat = self.b_hat
+        else:
+            noise_mult, obj_slope = _objective_noise_calibration(eff_obj)
+            ref_var = max(noise_mult * ap_var_floor_sub, 1e-12)
+            new_b_hat = jnp.asarray(math.sqrt(ref_var), dtype=jnp.float64)
+            dof_ratio = float(m_pix - 1) / float(n_eff_sub) if m_pix > 1 else 0.0
+            c_phot = _PHOT_BASE_COEFF + _PHOT_MP_SLOPE * dof_ratio
+            new_lam_phot = (
+                jnp.asarray(float(self.user_lambda_phot), dtype=jnp.float64)
+                if self.user_lambda_phot is not None
+                else jnp.asarray(
+                    obj_slope * c_phot * float(n_eff_sub) / max(2.0 * ap_var_floor_sub, 1e-12),
+                    dtype=jnp.float64,
+                )
+            )
+            new_lam_z = (
+                jnp.asarray(float(self.user_lambda_z), dtype=jnp.float64)
+                if self.user_lambda_z is not None
+                else jnp.asarray(1e-3, dtype=jnp.float64)
             )
 
-        old_scale = np.where(np.abs(mean_orig) > 1e-30, mean_orig, 1.0)
-        raw_sub = old_scale[:, np.newaxis] * np.asarray(self.norm_pixels)[:, idx_keep]
-        pixel_var_est = np.asarray(self.mean_frac_var) * (old_scale**2)
-
-        lam_phot_arg: float | None = 0.0 if legacy_tv else self.user_lambda_phot
-        lam_z_arg: float | None = 0.0 if legacy_tv else self.user_lambda_z
-
-        return HaloObservation.from_arrays(
-            raw_sub,
-            times_sub,
-            pixel_var=pixel_var_est,
+        return HaloObservation(
+            norm_pixels=jnp.asarray(norm_padded, dtype=jnp.float64),
+            mean_pixel_flux=chart_scale_j,
+            norm_mean_ratio=jnp.asarray(norm_ratio, dtype=jnp.float64),
+            mean_frac_var=jnp.asarray(frac_var_sub, dtype=jnp.float64),
+            valid_diff_mask=diff_mask_j,
+            z_prior_centre=z_centre_sub,
+            times_padded=times_j,
+            valid_cadence_mask=valid_cad_j,
+            dt_nom=dt_nom_j,
+            b_hat=new_b_hat,
+            lambda_phot=new_lam_phot,
+            lambda_z=new_lam_z,
+            n_valid=jnp.asarray(n_sub, dtype=jnp.int32),
+            n_eff=jnp.asarray(n_eff_sub, dtype=jnp.float64),
+            N_pad=self.N_pad,
             lag=self.lag,
-            objective=eff_obj,
-            tau=eff_tau,
-            legacy_tv=legacy_tv,
-            lambda_phot=lam_phot_arg,
-            lambda_z=lam_z_arg,
-            n_pad=self.N_pad,
             gap_tol=self.gap_tol,
-            dt_nom=dt_nom_val,
+            objective=str(eff_obj),
+            tau=None if eff_tau is None else float(eff_tau),
+            legacy_tv=False,
+            user_lambda_phot=self.user_lambda_phot,
+            user_lambda_z=self.user_lambda_z,
         )

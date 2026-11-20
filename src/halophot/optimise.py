@@ -58,7 +58,13 @@ __all__ = [
 
 @dataclass(frozen=True)
 class HaloFitResult:
-    """Result of ``optimise_halo`` on active halo pixels ``Omega_halo``."""
+    """Result of ``optimise_halo`` on active halo pixels ``Omega_halo``.
+
+    ``converged`` indicates L-BFGS termination at ``optx.RESULTS.successful`` for
+    ``solver='lbfgs'``, or finite objective with preconditioned max-norm gradient
+    within ``atol + rtol * max(|loss / n_eff|, 1.0)`` for fixed-schedule first-order
+    solvers (``'zodiax'`` / ``'adam'``).
+    """
 
     weights_tree: HaloWeights
     physical_weights: np.ndarray
@@ -164,13 +170,14 @@ def safe_eigen_projection(
 def _get_fisher_fn(
     objective: str,
     tau: float | None,
+    epsilon: float = 1e-5,
 ):
     """Build and cache a JIT-compiled Gauss-Newton Fisher curvature evaluator wrt ``z_ilr``.
 
     Evaluates the convex simplex Hessian ``H_theta`` of the ``1 / max(n_eff, 1)``-normalized
-    objective at scale ``eps_gn = max(obs.b_hat, 1e-3)`` and pulls it back through
-    ``J_theta = d(theta)/d(z_ilr)`` so ``F_z`` is strictly symmetric positive definite
-    without indefinite softmax second-derivative terms.
+    objective at a noise-matched smoothing scale ``eps_gn`` (``max(b_hat, eps_eff)`` in
+    regularized mode, or the active difference scale at ``theta0`` floored at ``epsilon``
+    under ``legacy_tv=True``) and pulls it back through ``J_theta = d(theta)/d(z_ilr)``.
     """
 
     @eqx.filter_jit
@@ -178,12 +185,44 @@ def _get_fisher_fn(
         z0 = w0.z_ilr
         theta0 = _ilr_to_simplex(z0)
         jac_theta = jax.jacrev(_ilr_to_simplex)(z0)
-        eps_gn = jnp.maximum(obs.b_hat, 1e-3)
         inv_n = 1.0 / jnp.maximum(obs.n_eff, 1.0)
+        tiny = jnp.finfo(z0.dtype).tiny
+        b_scale0 = jnp.maximum(obs.b_hat, tiny)
+        eps_req = jnp.asarray(epsilon, dtype=z0.dtype)
+        if not w0.legacy_tv:
+            eps_eff = jnp.maximum(jnp.minimum(eps_req, 0.1 * b_scale0), tiny)
+            eps_gn = jnp.maximum(b_scale0, eps_eff)
+        else:
+            f0 = w0._evaluate_lightcurve_raw(obs)
+            lag = obs.lag
+            if objective == "owl":
+                mask_c = obs.valid_cadence_mask.astype(z0.dtype)
+                cnt_c = jnp.maximum(jnp.sum(mask_c), 1.0)
+                mu_c = jnp.sum(mask_c * f0) / cnt_c
+                var_c = jnp.sum(jnp.where(obs.valid_cadence_mask, jnp.square(f0 - mu_c), 0.0)) / cnt_c
+                scale0 = jnp.sqrt(jnp.maximum(var_c, 0.0))
+            elif objective == "tv_o2" and 2 * lag < obs.N_pad:
+                m2 = obs.valid_diff_mask[: -2 * lag] & obs.valid_diff_mask[lag:-lag]
+                d2 = jnp.where(m2, jnp.abs(2.0 * f0[lag:-lag] - f0[2 * lag :] - f0[: -2 * lag]), 0.0)
+                scale0 = jnp.sum(d2) / jnp.maximum(jnp.sum(m2.astype(z0.dtype)), 1.0)
+            elif lag < obs.N_pad:
+                m1 = obs.valid_diff_mask[:-lag]
+                d1 = jnp.where(m1, jnp.abs(f0[lag:] - f0[:-lag]), 0.0)
+                scale0 = jnp.sum(d1) / jnp.maximum(jnp.sum(m1.astype(z0.dtype)), 1.0)
+            else:
+                scale0 = eps_req
+            eps_gn = jnp.maximum(scale0, eps_req)
 
         def _simplex_loss(theta: jax.Array) -> jax.Array:
             if not w0.legacy_tv:
-                f_tilde = jnp.dot(theta, obs.norm_pixels)
+                lc_scaled = jnp.dot(theta, obs.norm_pixels)
+                mean_ratio = jnp.dot(theta, obs.norm_mean_ratio)
+                safe_ratio = jnp.where(
+                    jnp.abs(mean_ratio) > 1e-30,
+                    mean_ratio,
+                    jnp.ones_like(mean_ratio),
+                )
+                f_tilde = lc_scaled / safe_ratio
             else:
                 safe_scale = jnp.where(
                     jnp.abs(obs.mean_pixel_flux) > 1e-30,
@@ -290,6 +329,8 @@ def _get_zodiax_runner(
     tau: float | None,
     learning_rate: float,
     max_steps: int,
+    rtol: float = 1e-9,
+    atol: float = 1e-9,
 ):
     """Build and cache a Tier-2 ``zodiax.optimisation`` + ``optax.adam`` runner."""
 
@@ -346,9 +387,11 @@ def _get_zodiax_runner(
         end_val = _xi_loss(p_end)
         use_end = jnp.isfinite(end_val) & (end_val < best_val)
         final_xi = jnp.where(use_end, p_end["xi"], best_xi)
-        final_val_norm = jnp.where(use_end, end_val, best_val)
+        final_val_norm, final_grad = vg_fn({"xi": final_xi})
+        grad_norm = jnp.max(jnp.abs(final_grad["xi"]))
+        tol_thresh = atol + rtol * jnp.maximum(jnp.abs(final_val_norm), 1.0)
         z_best = z0 + jnp.dot(proj, final_xi)
-        converged = jnp.isfinite(final_val_norm)
+        converged = jnp.isfinite(final_val_norm) & jnp.isfinite(grad_norm) & (grad_norm <= tol_thresh)
         n_steps = jnp.asarray(max_steps, dtype=jnp.int64)
         return (
             HaloWeights(z_ilr=z_best, legacy_tv=legacy_tv),
@@ -384,10 +427,16 @@ def cadence_scaled_sigclip_mask(
 
     Filters finite ``(flux, times)`` cadences before segmenting across gaps so
     ``NaN``-represented downlink blocks are never interpolated across, then predicts
-    each cadence from a narrow 5-point leave-one-out local median (with robust
-    7-point Theil-Sen linear prediction at segment boundaries). This detects
-    single-cadence cosmic-ray and thruster spikes while preserving astrophysical
-    eclipses, transits, and multi-periodic pulsations.
+    each cadence from a fixed narrow 5-point (``hw = 2``) leave-one-out local median
+    (with robust 7-point Theil-Sen linear prediction at segment boundaries). This
+    detects single-cadence cosmic-ray and thruster spikes while preserving
+    astrophysical eclipses, transits, and multi-periodic pulsations.
+
+    Notes
+    -----
+    ``window_days`` is retained for API compatibility and input validation (checked
+    via :func:`cadence_scaled_savgol_window`), while the local spike baseline uses
+    the fixed narrow 5-point window rather than a multi-hour polynomial baseline.
     """
     y = np.asarray(flux, dtype=np.float64)
     n_cad = y.shape[0]
@@ -513,7 +562,7 @@ def _solve_single_pass(
 
     if solver in ("zodiax", "adam"):
         if precondition and m_minus_1 <= 256:
-            fisher_fn = _get_fisher_fn(objective, tau)
+            fisher_fn = _get_fisher_fn(objective, tau, epsilon)
             f_mat = fisher_fn(w0, obs)
             proj = safe_eigen_projection(fmat=f_mat, rcond=1e-4)
             # In Fisher-whitened coordinates Adam takes steps of Euclidean norm
@@ -523,7 +572,7 @@ def _solve_single_pass(
             proj = jnp.eye(m_minus_1, dtype=jnp.float64)
             eff_lr = float(learning_rate)
 
-        runner_zdx = _get_zodiax_runner(objective, epsilon, tau, eff_lr, maxiter)
+        runner_zdx = _get_zodiax_runner(objective, epsilon, tau, eff_lr, maxiter, rtol, atol)
         w_best, loss0, loss_end, conv, n_steps = runner_zdx(w0, obs, proj)
         return w_best, float(loss0), float(loss_end), bool(conv), int(n_steps)
 
@@ -620,6 +669,7 @@ def orbit_block_jackknife(
 
     jk_weights: list[np.ndarray] = []
     dropped_counts: list[float] = []
+    n_unconverged = 0
     for blk in blocks:
         keep = np.ones(n_valid, dtype=bool)
         keep[blk] = False
@@ -637,7 +687,7 @@ def orbit_block_jackknife(
             obs_k.mean_pixel_flux,
             legacy_tv=legacy_tv,
         )
-        w_tree_k, _, _, _, _ = _solve_single_pass(
+        w_tree_k, _, _, conv_k, _ = _solve_single_pass(
             w0_k,
             obs_k,
             objective=objective,
@@ -650,6 +700,8 @@ def orbit_block_jackknife(
             learning_rate=learning_rate,
             precondition=precondition,
         )
+        if solver == "lbfgs" and not conv_k:
+            n_unconverged += 1
         jk_weights.append(
             np.asarray(w_tree_k._physical_weights_raw(obs_k.mean_pixel_flux), dtype=np.float64)
         )
@@ -662,18 +714,28 @@ def orbit_block_jackknife(
             np.full((k_req, m_pix), np.nan, dtype=np.float64),
         )
 
+    if n_unconverged > 0:
+        warnings.warn(
+            f"orbit_block_jackknife: {n_unconverged}/{len(jk_weights)} L-BFGS folds did not "
+            f"converge within maxiter={maxiter} steps; WEIGHTMAP_ERR may be underestimated.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
     w_jk = np.vstack(jk_weights)
     k_used = w_jk.shape[0]
     m_k = np.asarray(dropped_counts, dtype=np.float64)
     m_tot = float(np.sum(m_k))
-    # Delete-m_k jackknife variance weighting: for equal m_k, h_k = K and this reduces
-    # identically to ((K - 1) / K) * sum_k (w_(-k) - w_mean)^2.
+    # Busing, Meijer & van der Leeden (1999) unequal-block delete-m_k jackknife:
+    # centre around the complement-weighted mean (m_tot - m_k) and weight squared
+    # deviations by h_k - 1 = (m_tot - m_k) / m_k; reduces identically to
+    # ((K - 1) / K) * sum_k (w_(-k) - mean(w_jk))^2 when all m_k are equal.
+    comp_weights = np.maximum(m_tot - m_k, 0.0)
+    comp_sum = float(np.sum(comp_weights))
     h_k = np.maximum(m_tot / m_k, 1.0)
-    weights_var = h_k - 1.0
-    w_var_sum = float(np.sum(weights_var))
-    if w_var_sum > 0.0:
-        w_mean = np.sum(weights_var[:, None] * w_jk, axis=0, keepdims=True) / w_var_sum
-        var_jk = np.sum(weights_var[:, None] * np.square(w_jk - w_mean), axis=0) / float(k_used)
+    if comp_sum > 0.0:
+        w_mean = np.sum(comp_weights[:, None] * w_jk, axis=0, keepdims=True) / comp_sum
+        var_jk = np.sum((h_k - 1.0)[:, None] * np.square(w_jk - w_mean), axis=0) / float(k_used)
     else:
         w_mean = np.mean(w_jk, axis=0, keepdims=True)
         var_jk = ((k_used - 1.0) / float(k_used)) * np.sum(np.square(w_jk - w_mean), axis=0)
@@ -827,12 +889,10 @@ def optimise_halo(
             sigma_upper=sigma_upper,
         )
         if np.any(~inliers) and int(np.sum(inliers)) >= min_req:
-            mean_sub = np.mean(pix_np[:, inliers], axis=1)
-            use_preserve_ref = (not legacy_tv) and bool(np.any(mean_sub <= 0.0))
             obs_sub = obs.with_cadence_subset(
                 inliers,
                 legacy_tv=legacy_tv,
-                preserve_regularization=use_preserve_ref,
+                preserve_regularization=False,
                 objective=objective,
                 tau=tau,
             )
