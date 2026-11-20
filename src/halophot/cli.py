@@ -31,6 +31,7 @@ from .halo_tools import (
     translate_greek,
 )
 from .lightcurve import extract_halo_lightcurve
+from .masking import _estimate_target_mag
 from .optimise import cadence_scaled_savgol_window
 
 
@@ -133,7 +134,7 @@ def build_parser() -> ArgumentParser:
     )
     ap.add_argument("-sub", type=int, default=1, help="Subsampling parameter")
     ap.add_argument("--lag", type=int, default=1, help="Lag parameter")
-    ap.add_argument("-maxiter", type=int, default=151, help="Maximum # iterations")
+    ap.add_argument("-maxiter", type=int, default=500, help="Maximum # iterations")
     ap.add_argument(
         "--splits",
         default=None,
@@ -306,6 +307,40 @@ def _read_raw_tpf_times(fname: str) -> np.ndarray:
         return np.asarray(hdul[1].data["TIME"], dtype=np.float64)
 
 
+def _read_tpf_header_mag(fname: str) -> float | None:
+    """Read primary target magnitude from TPF Primary HDU 0 header cards when available."""
+    with fits.open(fname) as hdul:
+        hdr0 = hdul[0].header
+        for key in ("TESSMAG", "TMAG", "KEPMAG", "GMAG", "VMAG"):
+            val = hdr0.get(key)
+            if val is not None and not isinstance(val, bool):
+                try:
+                    fval = float(val)
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(fval):
+                    return fval
+    return None
+
+
+def _k2_campaign_time_mask(t_vals: np.ndarray, campaign: int | None) -> np.ndarray:
+    """Return the standard *K2* Campaign 7/10/12/13 cadence-keep mask for ``t_vals``."""
+    t_arr = np.asarray(t_vals, dtype=np.float64)
+    if campaign == 13:
+        m1 = np.logical_or(t_arr < 2988.2553329814764, t_arr > 2988.494)
+        m2 = np.logical_and(m1, t_arr < 3064.016165412577)
+        m3 = np.logical_or(m2, t_arr > 3064.75)
+        m4 = np.logical_and(m3, t_arr < 3065.9776255118923)
+        return np.logical_or(m4, t_arr > 3066.2225)
+    if campaign == 10:
+        return t_arr > 2760
+    if campaign == 7:
+        return t_arr > 2470
+    if campaign == 12:
+        return ~((t_arr > 2937.75) & (t_arr < 2938.8))
+    return np.ones(t_arr.shape, dtype=bool)
+
+
 def _attach_trend_and_whitened(ts: Table) -> None:
     """Populate gap-aware Savitzky-Golay ``trend`` and ``whitened`` columns on ``ts`` in-place."""
     fin_idx = np.flatnonzero(np.isfinite(ts["time"]) & np.isfinite(ts["corr_flux"]))
@@ -395,26 +430,17 @@ def main(argv: Sequence[str] | None = None) -> None:
 
         if eff_k2_campaign in {7, 10, 12, 13}:
             t_lk = np.asarray(tpf_lk.time.value, dtype=np.float64)
-            if eff_k2_campaign == 13:
-                m1 = np.logical_or(t_lk < 2988.2553329814764, t_lk > 2988.494)
-                m2 = np.logical_and(m1, t_lk < 3064.016165412577)
-                m3 = np.logical_or(m2, t_lk > 3064.75)
-                m4 = np.logical_and(m3, t_lk < 3065.9776255118923)
-                m_camp = np.logical_or(m4, t_lk > 3066.2225)
-                tpf_lk = tpf_lk[m_camp]
-            elif eff_k2_campaign == 10:
-                tpf_lk = tpf_lk[t_lk > 2760]
-            elif eff_k2_campaign == 7:
-                tpf_lk = tpf_lk[t_lk > 2470]
-            elif eff_k2_campaign == 12:
-                m_camp = (t_lk > 2937.75) & (t_lk < 2938.8)
-                tpf_lk = tpf_lk[~m_camp]
+            tpf_lk = tpf_lk[_k2_campaign_time_mask(t_lk, eff_k2_campaign)]
 
         hlsp_splits: np.ndarray | None = None
         if args.do_split or args.splits is not None or args.split_cadences is not None:
+            if args.splits is not None and args.split_cadences is not None:
+                raise ValueError(
+                    "Cannot specify both --splits (timestamps) and --split-cadences (indices)."
+                )
             t_col = np.asarray(tpf_lk.time.value, dtype=np.float64)
-            if args.splits is not None and args.split_cadences is None:
-                ts_hlsp = Table({"time": t_col})
+            ts_hlsp = Table({"time": t_col})
+            if args.splits is not None:
                 _resolve_split_indices(
                     ts_hlsp,
                     split_times=args.splits,
@@ -423,9 +449,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                 )
                 hlsp_splits = np.sort(np.asarray(args.splits, dtype=np.float64).ravel())
             else:
-                # Resolve integer cadence splits against raw unfiltered HDU 1 TIME before
-                # quality_bitmask filtering so --split-cadences and -c 4 match legacy mode.
+                # Resolve integer cadence splits against raw unfiltered HDU 1 TIME (after
+                # matching K2 Campaign 7/10/12/13 cuts) so --split-cadences and -c 4 match
+                # legacy mode regardless of Lightkurve quality_bitmask filtering.
                 raw_t = _read_raw_tpf_times(fname)
+                if eff_k2_campaign in {7, 10, 12, 13}:
+                    raw_t = raw_t[_k2_campaign_time_mask(raw_t, eff_k2_campaign)]
                 split_indices = _resolve_split_indices(
                     Table({"time": raw_t}),
                     split_times=None,
@@ -442,6 +471,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                         )
                     split_ts.append(0.5 * (float(left_fin[-1]) + float(right_fin[0])))
                 hlsp_splits = np.asarray(split_ts, dtype=np.float64)
+                _resolve_split_indices(
+                    ts_hlsp,
+                    split_times=hlsp_splits,
+                    split_cadences=None,
+                    campaign=eff_k2_campaign,
+                )
 
         rr_tuple = (float(args.rr[0]), float(args.rr[1])) if args.rr is not None else None
         lc = extract_halo_lightcurve(
@@ -543,30 +578,22 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     tpf, ts = read_tpf(fname)
 
-    if is_legacy_k2 and eff_campaign == 13:
-        m1 = np.logical_or(ts["time"] < 2988.2553329814764, ts["time"] > 2988.494)
-        m2 = np.logical_and(m1, ts["time"] < 3064.016165412577)
-        m3 = np.logical_or(m2, ts["time"] > 3064.75)
-        m4 = np.logical_and(m3, ts["time"] < 3065.9776255118923)
-        m = np.logical_or(m4, ts["time"] > 3066.2225)
-        tpf, ts = tpf[m, :, :], ts[m]
-
-    if is_legacy_k2 and eff_campaign == 10:
-        m = ts["time"] > 2760
-        tpf, ts = tpf[m, :, :], ts[m]
-
-    if is_legacy_k2 and eff_campaign == 7:
-        m = ts["time"] > 2470
-        tpf, ts = tpf[m, :, :], ts[m]
-
-    if is_legacy_k2 and eff_campaign == 12:
-        m = (ts["time"] > 2937.75) * (ts["time"] < 2938.8)
-        tpf, ts = tpf[~m, :, :], ts[~m]
+    if is_legacy_k2 and eff_campaign in {7, 10, 12, 13}:
+        m_leg = _k2_campaign_time_mask(np.asarray(ts["time"], dtype=np.float64), eff_campaign)
+        tpf, ts = tpf[m_leg, :, :], ts[m_leg]
 
     if not args.quiet:
         print(f"Loaded {args.fname}!")
 
     start = clock()
+
+    # Estimate target_mag from header or unmasked stamp BEFORE get_annulus NaN-masks the core.
+    eff_mission_legacy = hdr_mission if hdr_mission else ("K2" if is_legacy_k2 else "TESS")
+    deathstar_target_mag: float | None = None
+    if args.deathstar:
+        deathstar_target_mag = _read_tpf_header_mag(fname)
+        if deathstar_target_mag is None:
+            deathstar_target_mag = _estimate_target_mag(flux=tpf, mission=eff_mission_legacy)
 
     if args.rr is not None:
         rmin, rmax = args.rr
@@ -585,7 +612,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             tpf,
             wcs=wcs_obj,
             target_coord=tgt_coord,
+            target_mag=deathstar_target_mag,
             obs_time=obs_time_cli,
+            mission=eff_mission_legacy,
             catalog_table=args.catalog_table,
             offline=args.offline,
             cache_dir=resolved_cache_dir,

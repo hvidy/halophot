@@ -602,6 +602,30 @@ def test_do_lc_inclusive_final_cadence_and_cli_v201_fixes(tmp_path: Path) -> Non
         split_times_by_mask["hard"], rel=0.0, abs=1e-12
     )
 
+    # Passing both --splits and --split-cadences in --hlsp-fits mode MUST raise ValueError
+    with pytest.raises(ValueError, match="Cannot specify both"):
+        cli.main(
+            [
+                str(mini_k2),
+                "--hlsp-fits",
+                "--do-split",
+                "--splits",
+                "[2145.0]",
+                "--split-cadences",
+                "[40]",
+                "--name",
+                "conflict_hlsp",
+                "--quiet",
+                "--save-dir",
+                str(tmp_path),
+            ]
+        )
+
+    # K2 Campaign 7/10/12/13 time cuts apply to raw_t before --split-cadences indexing
+    t_c7 = np.linspace(2460.0, 2540.0, 80)
+    m_c7 = cli._k2_campaign_time_mask(t_c7, 7)
+    assert np.all(t_c7[m_c7] > 2470.0) and int(np.sum(m_c7)) < 80
+
     # 4. Mode-mismatched CLI flags emit UserWarning
     warn_dir = tmp_path / "cli_warn"
     warn_dir.mkdir()

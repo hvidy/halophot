@@ -6,11 +6,13 @@ Implements Section 5.1 and Section 6.4 of the ``halophot`` v2.0 architecture:
   ``g_c = sum_{r} W_{r,c}`` orthogonal to degree-``<= d`` horizontal column
   polynomials already cancelled by ``tessbkgd`` when ``BKGSUB=True``.
 * :func:`compute_coherent_flux_err`: exact ``float64`` error propagation combining
-  uncorrelated pixel variance, projected column-coherent ``SMEAR_ERR``, and
+  uncorrelated pixel variance (with a ``float32``-ULP floor), exact per-cadence
+  WLS oblique column-smear sensitivity (falling back to unweighted OLS /
+  orthogonal projection when ``BKG_BASIS`` or ``BKG_USED`` is absent), and
   ``BKG_CHOL`` / ``BKG_BASIS`` sandwich background covariance without double-counting.
 * :func:`extract_halo_lightcurve`: functional ``TargetPixelFile -> LightCurve``
   entry point returning standard ``KeplerLightCurve`` / ``TessLightCurve`` objects
-  with genuine ``estimate_centroids()`` centroids, separate ``pos_corr1`` /
+  with positive-flux weightmap-weighted centroids, separate ``pos_corr1`` /
   ``pos_corr2`` columns, and non-transposed ``(ny, nx)`` (or ``(n_splits, ny, nx)``)
   ``lc.meta['WEIGHTMAP']``.
 """
@@ -44,7 +46,14 @@ from ._contract import (
 from ._precision import in_float64
 from .masking import (
     DEFAULT_EXCLUDE_QUALITY,
+    KEPLER_SAT_RATE_E_PER_S,
+    TESS_SAT_RATE_E_PER_S,
     _estimate_target_mag,
+    _integrated_to_rate_unit,
+    _is_integrated_count_unit,
+    _resolve_cadence_exposure_sec,
+    _resolve_hdu_unit,
+    _resolve_tpf_column_unit,
     _resolve_tpf_obs_time,
     _resolve_tpf_wcs,
     build_halo_masks,
@@ -262,20 +271,35 @@ def compute_coherent_flux_err(
             assert bg_bool is not None
             bg_rows, bg_cols = np.where(bg_bool)
             m_bg = bg_rows.size
+            n_basis = basis_arr.shape[0]
             phi_bg = basis_arr[:, bg_rows, bg_cols]  # (P, M_bg)
             phi_w = phi_halo @ w_star  # (P,)
             col_inc = np.zeros((m_bg, nx), dtype=np.float64)
             col_inc[np.arange(m_bg), bg_cols] = 1.0
 
+            # Precompute unweighted OLS oblique projection on bg_bool (or column-orthogonal
+            # fallback if even the unweighted design is rank-deficient) for fe_arr=None and
+            # for individual cadences where WLS weights lose rank due to NaN FLUX_ERR.
+            gram_ols = phi_bg @ phi_bg.T
+            gram_ols_sym = 0.5 * (gram_ols + gram_ols.T)
+            ols_ev, ols_vec = np.linalg.eigh(gram_ols_sym)
+            ols_max = float(ols_ev[-1]) if ols_ev.size > 0 else 0.0
+            if ols_max > 0.0 and int(np.sum(ols_ev > 1e-12 * ols_max)) == n_basis:
+                u_ols = ols_vec @ ((ols_vec.T @ phi_w) / ols_ev)
+                rhs_ols = phi_bg @ col_inc  # (P, nx)
+                g_fallback_1d = col_g - u_ols @ rhs_ols
+            else:
+                g_fallback_1d = column_orthogonal_smear_weights(col_g, bkg_order)
+
             for start in range(0, n_cad, _ERR_CHUNK_CADENCES):
                 stop = min(start + _ERR_CHUNK_CADENCES, n_cad)
                 se_chunk = se_arr[start:stop]  # (chunk, nx)
-                se_bg_sq = np.square(se_chunk[:, bg_cols])
-                se_bg_sq_clean = np.where(np.isfinite(se_bg_sq), se_bg_sq, 0.0)
                 chol_sub = chol_arr[start:stop]
                 nan_chol = np.all(np.isnan(chol_sub), axis=(1, 2))
 
                 if fe_arr is not None:
+                    se_bg_sq = np.square(se_chunk[:, bg_cols])
+                    se_bg_sq_clean = np.where(np.isfinite(se_bg_sq), se_bg_sq, 0.0)
                     fe_bg = fe_arr[start:stop, bg_rows, bg_cols]
                     fe_bg_sq = np.square(fe_bg)
                     lt_phi_bg = np.einsum("tqp,qm->tpm", chol_sub, phi_bg)
@@ -287,21 +311,28 @@ def compute_coherent_flux_err(
                         np.maximum(se_bg_sq_clean, 1e-12),
                     )
                     w_bg = np.where(valid_bg, 1.0 / u_var_bg, 0.0)
-                else:
-                    valid_bg = np.isfinite(se_bg_sq) & (se_bg_sq > 0.0) & (~nan_chol[:, None])
-                    w_bg = np.where(valid_bg, 1.0 / np.maximum(se_bg_sq_clean, 1e-12), 0.0)
 
-                gram = np.einsum("pm,tm,qm->tpq", phi_bg, w_bg, phi_bg)
-                gram_sym = 0.5 * (gram + np.swapaxes(gram, -1, -2))
-                evals, evecs = np.linalg.eigh(gram_sym)
-                max_ev = np.max(evals, axis=-1, keepdims=True)
-                cutoff = np.maximum(1e-12 * max_ev, 0.0)
-                safe_ev = np.where(evals > cutoff, evals, 1.0)
-                inv_evals = np.where((max_ev > 0.0) & (evals > cutoff), 1.0 / safe_ev, 0.0)
-                # Solve G_t u_t = phi_w via Moore-Penrose pseudoinverse, then phi_w^T s_{t,c} = u_t^T rhs_{t,c}.
-                u_t = np.einsum("tpi,ti,tqi,q->tp", evecs, inv_evals, evecs, phi_w)
-                rhs_cols = np.einsum("pm,tm,mc->tpc", phi_bg, w_bg, col_inc)
-                g_tilde = col_g[None, :] - np.einsum("tp,tpc->tc", u_t, rhs_cols)
+                    gram = np.einsum("pm,tm,qm->tpq", phi_bg, w_bg, phi_bg)
+                    gram_sym = 0.5 * (gram + np.swapaxes(gram, -1, -2))
+                    evals, evecs = np.linalg.eigh(gram_sym)
+                    max_ev = np.max(evals, axis=-1, keepdims=True)
+                    cutoff = np.maximum(1e-12 * max_ev, 0.0)
+                    safe_ev = np.where(evals > cutoff, evals, 1.0)
+                    inv_evals = np.where((max_ev > 0.0) & (evals > cutoff), 1.0 / safe_ev, 0.0)
+                    full_rank_wls = (max_ev[:, 0] > 0.0) & (
+                        np.sum(evals > cutoff, axis=-1) == n_basis
+                    )
+                    # Solve G_t u_t = phi_w on full-rank WLS cadences; fall back to OLS
+                    # oblique projection on any rank-deficient cadence so polynomial smear
+                    # cancellation is preserved without double-counting BKG_CHOL.
+                    u_t = np.einsum("tpi,ti,tqi,q->tp", evecs, inv_evals, evecs, phi_w)
+                    rhs_cols = np.einsum("pm,tm,mc->tpc", phi_bg, w_bg, col_inc)
+                    g_tilde_wls = col_g[None, :] - np.einsum("tp,tpc->tc", u_t, rhs_cols)
+                    g_tilde = np.where(
+                        full_rank_wls[:, None], g_tilde_wls, g_fallback_1d[None, :]
+                    )
+                else:
+                    g_tilde = np.broadcast_to(g_fallback_1d[None, :], (stop - start, nx))
 
                 active_t = np.abs(g_tilde) > 0.0
                 se_sq_safe = np.where(active_t & np.isfinite(se_chunk), np.square(se_chunk), 0.0)
@@ -347,76 +378,6 @@ def _strip_quantity(val: Any) -> np.ndarray:
     if hasattr(val, "value"):
         return np.asarray(val.value, dtype=np.float64)
     return np.asarray(val, dtype=np.float64)
-
-
-def _is_integrated_count_unit(unit_obj: Any) -> bool:
-    """Return True if ``unit_obj`` represents integrated counts/electrons per cadence."""
-    if unit_obj is None or unit_obj == u.dimensionless_unscaled:
-        return False
-    if unit_obj in (u.electron, u.count):
-        return True
-    text = str(unit_obj).strip().lower()
-    return text in ("electron", "electrons", "e-", "count", "counts", "ct", "adu")
-
-
-def _resolve_tpf_column_unit(tpf: TargetPixelFile, col_name: str, attr_unit: Any) -> Any:
-    """Resolve column unit from Lightkurve Quantity or raw HDU 1 ``TUNIT*`` header."""
-    if attr_unit is not None and attr_unit != u.dimensionless_unscaled:
-        return attr_unit
-    hdul = getattr(tpf, "hdu", None)
-    if hdul is not None and len(hdul) > 1 and hasattr(hdul[1], "columns"):
-        target_upper = col_name.upper()
-        for idx_c, col in enumerate(hdul[1].columns, start=1):
-            if col.name.upper() == target_upper:
-                hdr_unit = hdul[1].header.get(f"TUNIT{idx_c}") or col.unit
-                if isinstance(hdr_unit, str) and hdr_unit.strip():
-                    return hdr_unit.strip()
-    return attr_unit
-
-
-def _resolve_cadence_exposure_sec(tpf: TargetPixelFile, dt_days: float) -> float:
-    """Resolve per-cadence effective integration time in seconds for count->rate conversion."""
-    hdul = getattr(tpf, "hdu", None)
-    headers: list[Any] = []
-    if hdul is not None:
-        if len(hdul) > 1:
-            headers.append(hdul[1].header)
-        if len(hdul) > 0:
-            headers.append(hdul[0].header)
-    meta = getattr(tpf, "meta", None)
-    if meta is not None:
-        headers.append(meta)
-
-    for hdr in headers:
-        timedel = hdr.get("TIMEDEL") if hasattr(hdr, "get") else None
-        if timedel is not None and not isinstance(timedel, bool):
-            try:
-                td_val = float(timedel)
-            except (TypeError, ValueError):
-                td_val = np.nan
-            if np.isfinite(td_val) and td_val > 0.0:
-                deadc_raw = hdr.get("DEADC", 1.0) if hasattr(hdr, "get") else 1.0
-                try:
-                    deadc_val = float(deadc_raw)
-                except (TypeError, ValueError):
-                    deadc_val = 1.0
-                if not np.isfinite(deadc_val) or deadc_val <= 0.0 or deadc_val > 1.0:
-                    deadc_val = 1.0
-                return td_val * 86400.0 * deadc_val
-
-        int_time = hdr.get("INT_TIME") if hasattr(hdr, "get") else None
-        n_readout = hdr.get("NREADOUT") if hasattr(hdr, "get") else None
-        num_frm = hdr.get("NUM_FRM") if hasattr(hdr, "get") else None
-        if int_time is not None and (n_readout is not None or num_frm is not None):
-            try:
-                it_val = float(int_time)
-                nf_val = float(n_readout if n_readout is not None else num_frm)
-            except (TypeError, ValueError):
-                it_val, nf_val = np.nan, np.nan
-            if np.isfinite(it_val) and np.isfinite(nf_val) and it_val > 0.0 and nf_val > 0.0:
-                return it_val * nf_val
-
-    return max(float(dt_days) * 86400.0, 1.0)
 
 
 def _compute_weighted_centroids(
@@ -562,7 +523,7 @@ def extract_halo_lightcurve(
     lambda_phot: float | None = None,
     lambda_z: float | None = None,
     solver: str = "lbfgs",
-    maxiter: int = 151,
+    maxiter: int = 500,
     sigclip: bool = False,
     window_days: float = 1.0,
     sigma_lower: float = 10.0,
@@ -612,7 +573,12 @@ def extract_halo_lightcurve(
         stored in ``lc.meta['WEIGHTMAP_ERR']``.
     normalize : bool, default True
         When ``True``, returns unit-mean dimensionless relative ``flux`` and
-        ``flux_err`` (Eq. 6.4.1). When ``False``, preserves ``tpf.flux.unit``.
+        ``flux_err`` (Eq. 6.4.1). When ``False``, preserves physical rate units
+        (converting integrated ``electron``/``count`` columns to ``e-/s`` or
+        ``count/s``); for multi-segment ``split_times``, segments are anchored
+        to a common full-sector unsaturated reference flux with per-segment
+        scale factors recorded in ``lc.meta['SEGMENT_SCALES']`` while
+        ``lc.meta['WEIGHTMAP']`` remains unit-sum simplex weights.
     cache_dir : path-like, optional
         Explicit cache directory for live catalogue queries, validated via
         :func:`halophot.resolve_cache_dir`.
@@ -726,33 +692,99 @@ def extract_halo_lightcurve(
         # Anchor normalize=False segments to a common full-sector physical aperture flux scale
         # so shifting simplex weights between bright/faint wings cannot create artificial steps
         # while preserving real astrophysical brightness variations across splits.
+        seg_scales = [1.0] * len(seg_lcs)
         if not normalize and len(seg_lcs) > 1:
-            flux_full = _strip_quantity(tpf_obj.flux)
+            flux_full = _strip_quantity(tpf_obj.flux).copy()
             full_flux_unit = _resolve_tpf_column_unit(
                 tpf_obj, "FLUX", getattr(tpf_obj.flux, "unit", None)
             )
-            if _is_integrated_count_unit(full_flux_unit):
+            convert_full = _is_integrated_count_unit(full_flux_unit)
+            if convert_full:
                 diffs_full = np.diff(fin_t)
                 pos_full = diffs_full[diffs_full > 0.0]
                 dt_full = float(np.median(pos_full)) if pos_full.size > 0 else (1.0 / 48.0)
-                flux_full = flux_full / _resolve_cadence_exposure_sec(tpf_obj, dt_full)
-            any_fin_full = np.any(np.isfinite(flux_full), axis=0)
+                exp_full = _resolve_cadence_exposure_sec(tpf_obj, dt_full)
+                flux_full = flux_full / exp_full
+            else:
+                exp_full = 1.0
+
+            # Exclude non-finite timestamps and pointing excursions (>= 5 px) from reference profile.
+            clean_cad = np.isfinite(t_all)
+            pc1_full = (
+                _strip_quantity(tpf_obj.pos_corr1)
+                if getattr(tpf_obj, "pos_corr1", None) is not None
+                else None
+            )
+            pc2_full = (
+                _strip_quantity(tpf_obj.pos_corr2)
+                if getattr(tpf_obj, "pos_corr2", None) is not None
+                else None
+            )
+            if pc1_full is not None and pc1_full.shape == (t_all.size,):
+                clean_cad &= np.isfinite(pc1_full) & (np.abs(pc1_full) < 5.0)
+            if pc2_full is not None and pc2_full.shape == (t_all.size,):
+                clean_cad &= np.isfinite(pc2_full) & (np.abs(pc2_full) < 5.0)
+            if not np.any(clean_cad):
+                clean_cad = np.isfinite(t_all)
+
+            flux_clean = flux_full[clean_cad].copy()
+
+            # Mask saturated pixel-cadences so partial-sector bleed in one segment cannot
+            # bias the reference flux of a pixel used unsaturated in another segment.
+            unsub_clean = flux_clean.copy()
+            bkgsub_full = read_bkgsub_state(tpf_obj, warn_legacy_mundey=False)
+            if (
+                bkgsub_full
+                and hasattr(tpf_obj, "flux_bkg")
+                and tpf_obj.flux_bkg is not None
+            ):
+                fb_full = _strip_quantity(tpf_obj.flux_bkg)
+                fb_unit_full = _resolve_tpf_column_unit(
+                    tpf_obj, "FLUX_BKG", getattr(tpf_obj.flux_bkg, "unit", full_flux_unit)
+                )
+                if convert_full and _is_integrated_count_unit(fb_unit_full):
+                    fb_full = fb_full / exp_full
+                fb_clean = fb_full[clean_cad]
+                unsub_clean = np.where(np.isfinite(fb_clean), flux_clean + fb_clean, flux_clean)
+
+            if auto_sat_level is not None:
+                sat_cut = float(auto_sat_level)
+            elif thresh < 0.0:
+                m_up = str(getattr(tpf_obj, "mission", "") or "").upper()
+                sat_cut = (
+                    KEPLER_SAT_RATE_E_PER_S
+                    if m_up in ("KEPLER", "K2")
+                    else TESS_SAT_RATE_E_PER_S
+                )
+            else:
+                fin_u = unsub_clean[np.isfinite(unsub_clean)]
+                sat_cut = float(thresh) * float(np.max(fin_u)) if fin_u.size > 0 else np.inf
+            if np.isfinite(sat_cut):
+                flux_clean = np.where(unsub_clean >= sat_cut, np.nan, flux_clean)
+
+            any_fin_full = np.any(np.isfinite(flux_clean), axis=0)
             mean_p_full = np.zeros(flux_full.shape[1:], dtype=np.float64)
             if np.any(any_fin_full):
-                mean_p_full[any_fin_full] = np.nanmean(flux_full[:, any_fin_full], axis=0)
+                # Median over clean unsaturated cadences rejects unclipped cosmic-ray spikes.
+                mean_p_full[any_fin_full] = np.nanmedian(flux_clean[:, any_fin_full], axis=0)
             seg_ref_fluxes = [float(np.sum(wm * mean_p_full)) for wm in seg_wmaps]
-            valid_refs = [rf for rf in seg_ref_fluxes if np.isfinite(rf) and abs(rf) > 1e-30]
+            valid_refs = [rf for rf in seg_ref_fluxes if np.isfinite(rf) and rf > 1e-30]
             if valid_refs:
                 f_ref_common = float(np.mean(valid_refs))
-                anchored_lcs: list[lk.LightCurve] = []
-                for lc_s, rf_s in zip(seg_lcs, seg_ref_fluxes, strict=True):
-                    lc_copy = lc_s.copy()
-                    if np.isfinite(rf_s) and abs(rf_s) > 1e-30:
-                        scale_s = f_ref_common / rf_s
-                        lc_copy.flux = lc_copy.flux * scale_s
-                        lc_copy.flux_err = lc_copy.flux_err * abs(scale_s)
-                    anchored_lcs.append(lc_copy)
-                seg_lcs = anchored_lcs
+                if np.isfinite(f_ref_common) and f_ref_common > 1e-30:
+                    anchored_lcs: list[lk.LightCurve] = []
+                    seg_scales = []
+                    for lc_s, rf_s in zip(seg_lcs, seg_ref_fluxes, strict=True):
+                        lc_copy = lc_s.copy()
+                        if np.isfinite(rf_s) and rf_s > 1e-30:
+                            scale_s = f_ref_common / rf_s
+                            lc_copy.flux = lc_copy.flux * scale_s
+                            lc_copy.flux_err = lc_copy.flux_err * scale_s
+                            seg_scales.append(float(scale_s))
+                        else:
+                            seg_scales.append(1.0)
+                        anchored_lcs.append(lc_copy)
+                    seg_lcs = anchored_lcs
 
         stitched = lk.LightCurveCollection([seg.copy() for seg in seg_lcs]).stitch(
             corrector_func=None
@@ -760,6 +792,8 @@ def extract_halo_lightcurve(
         stitched.meta = dict(stitched.meta)
         stitched.meta["WEIGHTMAP"] = np.stack(seg_wmaps, axis=0)
         stitched.meta["SPLIT_TIMES"] = split_arr.tolist()
+        if not normalize and len(seg_lcs) > 1:
+            stitched.meta["SEGMENT_SCALES"] = seg_scales
         if compute_uncertainty and seg_werrs:
             stitched.meta["WEIGHTMAP_ERR"] = np.stack(seg_werrs, axis=0)
         return stitched
@@ -775,7 +809,7 @@ def extract_halo_lightcurve(
     flux_unit_raw = _resolve_tpf_column_unit(tpf_obj, "FLUX", flux_unit_attr)
     convert_counts = _is_integrated_count_unit(flux_unit_raw)
     exp_sec = _resolve_cadence_exposure_sec(tpf_obj, dt_days) if convert_counts else 1.0
-    eff_flux_unit = (u.electron / u.s) if convert_counts else flux_unit_attr
+    eff_flux_unit = _integrated_to_rate_unit(flux_unit_raw) if convert_counts else flux_unit_attr
 
     flux_3d = _strip_quantity(tpf_obj.flux).copy()
     if convert_counts:
@@ -827,7 +861,31 @@ def extract_halo_lightcurve(
     bkgsub = read_bkgsub_state(tpf_obj, warn_legacy_mundey=True)
     bkg_order = infer_bkg_poly_order(tpf_obj)
     smear_err_2d = read_smear_err(tpf_obj, apply_quality_mask=True)
+    if convert_counts and smear_err_2d is not None:
+        se_unit_raw = _resolve_tpf_column_unit(tpf_obj, "SMEAR_ERR", flux_unit_raw)
+        if _is_integrated_count_unit(se_unit_raw):
+            smear_err_2d = smear_err_2d / exp_sec
     bkg_cov = read_bkg_covariance(tpf_obj, apply_quality_mask=True)
+    if convert_counts and bkg_cov is not None:
+        chol_unit_raw = _resolve_tpf_column_unit(
+            tpf_obj, "BKG_CHOL", _resolve_hdu_unit(tpf_obj, "BKG_CHOL", flux_unit_raw)
+        )
+        if _is_integrated_count_unit(chol_unit_raw):
+            bkg_cov = BkgCovariance(chol=bkg_cov.chol / exp_sec, basis=bkg_cov.basis)
+
+    # When BKGSUB=True and FLUX_BKG_ERR is absent/all-zero on HALOCVER=1 TPFs, derive exact
+    # per-pixel RMS background-fit uncertainty sigma_{B,i} = sqrt(phi_i^T mean(L_t L_t^T) phi_i)
+    # from BKG_CHOL + BKG_BASIS so build_halo_masks guards against background-fit uncertainty.
+    mask_bkg_err: np.ndarray | None = flux_bkg_err_3d
+    if bkgsub and mask_bkg_err is None and bkg_cov is not None:
+        chol_all = np.asarray(bkg_cov.chol, dtype=np.float64)
+        basis_all = np.asarray(bkg_cov.basis, dtype=np.float64)
+        fin_chol = np.isfinite(times_all) & ~np.any(~np.isfinite(chol_all), axis=(1, 2))
+        if np.any(fin_chol):
+            c_fin = chol_all[fin_chol]
+            mean_cov_beta = np.einsum("tpk,tqk->pq", c_fin, c_fin) / float(c_fin.shape[0])
+            bkg_var_2d = np.einsum("prc,pq,qrc->rc", basis_all, mean_cov_beta, basis_all)
+            mask_bkg_err = np.sqrt(np.maximum(bkg_var_2d, 0.0))
 
     pc1 = _strip_quantity(tpf_obj.pos_corr1) if getattr(tpf_obj, "pos_corr1", None) is not None else None
     pc2 = _strip_quantity(tpf_obj.pos_corr2) if getattr(tpf_obj, "pos_corr2", None) is not None else None
@@ -850,7 +908,7 @@ def extract_halo_lightcurve(
         flux_3d,
         flux_err=flux_err_3d,
         flux_bkg=flux_bkg_3d,
-        flux_bkg_err=flux_bkg_err_3d,
+        flux_bkg_err=mask_bkg_err,
         bkgsub=bkgsub,
         pixel_quality=pq_2d,
         aperture_mask=parsed_ap,
