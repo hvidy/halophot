@@ -318,7 +318,16 @@ def _coerce_obs_time(obs_time: Time | str | float | None, wcs: WCS) -> Time | No
     """Resolve observation epoch from ``obs_time`` or ``wcs`` header keywords."""
     if obs_time is not None:
         if isinstance(obs_time, Time):
-            return Time(float(obs_time.jd), format="jd", scale="tdb")
+            jd_arr = np.asarray(np.ma.filled(obs_time.tdb.jd, np.nan), dtype=np.float64)
+            if jd_arr.ndim > 0:
+                fin_jd = jd_arr[np.isfinite(jd_arr)]
+                if fin_jd.size == 0:
+                    raise ValueError("obs_time Time array contains no finite timestamps.")
+                return Time(float(np.median(fin_jd)), format="jd", scale="tdb")
+            val_jd = float(jd_arr)
+            if not np.isfinite(val_jd):
+                raise ValueError("obs_time Time scalar is not finite.")
+            return Time(val_jd, format="jd", scale="tdb")
         if isinstance(obs_time, int | float | np.floating):
             val = float(obs_time)
             if np.isfinite(val):

@@ -105,6 +105,7 @@ def compute_coherent_flux_err(
     bkg_cov: BkgCovariance | None = None,
     flux_bkg_err: np.ndarray | None = None,
     bg_mask: np.ndarray | None = None,
+    shot_var: np.ndarray | None = None,
     bkgsub: bool = True,
     bkg_order: int | None = None,
     norm_factor: float = 1.0,
@@ -189,6 +190,15 @@ def compute_coherent_flux_err(
                 f"bg_mask shape {bg_bool.shape} does not match expected {(ny, nx)}."
             )
 
+    sv_arr: np.ndarray | None = None
+    if shot_var is not None:
+        sv_arr = np.asarray(shot_var, dtype=np.float64)
+        if sv_arr.shape not in ((ny, nx), (n_cad, ny, nx)):
+            raise ValueError(
+                f"shot_var shape {sv_arr.shape} does not match expected "
+                f"{(ny, nx)} or {(n_cad, ny, nx)}."
+            )
+
     chol_arr: np.ndarray | None = None
     basis_arr: np.ndarray | None = None
     phi_halo: np.ndarray | None = None
@@ -243,7 +253,21 @@ def compute_coherent_flux_err(
                 0.5 * _F32_EPS * fe_sq,
                 0.0,
             )
-            sigma_pix_sq = np.maximum(sigma_sub_sq - smear_pix_sq, ulp_floor)
+            raw_pix_sq = sigma_sub_sq - smear_pix_sq
+            sigma_pix_sq = np.maximum(raw_pix_sq, ulp_floor)
+            if sv_arr is not None:
+                sv_sub = (
+                    sv_arr[rows_h, cols_h][None, :]
+                    if sv_arr.ndim == 2
+                    else sv_arr[start:stop, rows_h, cols_h]
+                )
+                sv_clean = np.where(np.isfinite(sv_sub) & (sv_sub > 0.0), sv_sub, 0.0)
+                cancelled_pix = has_subtracted & (raw_pix_sq <= 4.0 * ulp_floor)
+                sigma_pix_sq = np.where(
+                    cancelled_pix,
+                    np.maximum(ulp_floor, sv_clean),
+                    sigma_pix_sq,
+                )
             # Propagate NaN if any active halo pixel has NaN FLUX_ERR or NaN BKG_CHOL on cadence t.
             bad_cad = np.any(~np.isfinite(fe_sub), axis=1)
             if isinstance(bkg_pix_sq, np.ndarray):
@@ -378,6 +402,26 @@ def _strip_quantity(val: Any) -> np.ndarray:
     if hasattr(val, "value"):
         return np.asarray(val.value, dtype=np.float64)
     return np.asarray(val, dtype=np.float64)
+
+
+def _is_photon_rate_unit(unit_obj: Any) -> bool:
+    """Return True if ``unit_obj`` is ``e-/s``, ``count/s``, or dimensionless/None rate."""
+    if unit_obj is None or unit_obj == u.dimensionless_unscaled:
+        return True
+    if unit_obj in (u.electron / u.s, u.count / u.s):
+        return True
+    text = str(unit_obj).strip().lower().replace(" ", "")
+    return text in (
+        "electron/s",
+        "electrons/s",
+        "e-/s",
+        "count/s",
+        "counts/s",
+        "ct/s",
+        "adu/s",
+        "electron*s**-1",
+        "count*s**-1",
+    )
 
 
 def _compute_weighted_centroids(
@@ -950,6 +994,26 @@ def extract_halo_lightcurve(
     pixels_active = flux_3d[active_cad][:, rows_h, cols_h].T  # (M, N_good)
     times_active = times_all[active_cad]
 
+    # Physical Poisson shot-noise fallback variance for pixels whose float32 FLUX_ERR^2 - BKG_VAR - SMEAR_ERR^2
+    # cancels into numerical roundoff (e.g. bright-column SMEAR_ERR >> sigma_pix).
+    shot_var_act: np.ndarray | None = None
+    shot_var_2d: np.ndarray | None = None
+    if _is_photon_rate_unit(eff_flux_unit):
+        exp_sec_shot = _resolve_cadence_exposure_sec(tpf_obj, dt_days)
+        mean_p_act = np.mean(pixels_active, axis=1)
+        mean_bkg_act = np.zeros(rows_h.size, dtype=np.float64)
+        if bkgsub and flux_bkg_3d is not None:
+            bkg_act = flux_bkg_3d[active_cad][:, rows_h, cols_h].T
+            fin_b = np.isfinite(bkg_act)
+            b_cnt = np.sum(fin_b, axis=1)
+            b_sum = np.sum(np.where(fin_b, bkg_act, 0.0), axis=1)
+            mean_bkg_act = np.where(b_cnt > 0, b_sum / np.maximum(b_cnt, 1), 0.0)
+        shot_var_act = (
+            np.maximum(mean_p_act, 0.0) + np.maximum(mean_bkg_act, 0.0)
+        ) / max(exp_sec_shot, 1.0)
+        shot_var_2d = np.zeros((ny, nx), dtype=np.float64)
+        shot_var_2d[rows_h, cols_h] = shot_var_act
+
     # Independent per-pixel variance for photon-noise regularization lambda_phot:
     # average over finite cadences only and subtract both background and coherent smear variance.
     pvar_reg: np.ndarray | None = None
@@ -990,7 +1054,15 @@ def extract_halo_lightcurve(
             0.5 * _F32_EPS * fe_sq_mean,
             0.0,
         )
-        pvar_reg = np.maximum(fe_sub_sq - se_sq_mean, ulp_floor_reg)
+        raw_pix_var_reg = fe_sub_sq - se_sq_mean
+        pvar_reg = np.maximum(raw_pix_var_reg, ulp_floor_reg)
+        if shot_var_act is not None:
+            cancelled_reg = has_sub_reg & (raw_pix_var_reg <= 4.0 * ulp_floor_reg)
+            pvar_reg = np.where(
+                cancelled_reg,
+                np.maximum(ulp_floor_reg, shot_var_act),
+                pvar_reg,
+            )
 
     w_init_vec: np.ndarray | None = None
     if w_init is not None:
@@ -1072,6 +1144,7 @@ def extract_halo_lightcurve(
             bkg_cov=bkg_cov,
             flux_bkg_err=flux_bkg_err_3d,
             bg_mask=bg_mask_2d if np.any(bg_mask_2d) else None,
+            shot_var=shot_var_2d,
             bkgsub=bkgsub,
             bkg_order=bkg_order,
             norm_factor=norm_scale,

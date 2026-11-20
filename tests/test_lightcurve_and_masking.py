@@ -1693,3 +1693,95 @@ def test_bkgsub_false_earthshine_saturation_units_and_split_centroids(tmp_path: 
     assert 0.0 <= float(lc_neg.centroid_row.value[5]) <= 3.0
     assert 0.0 <= float(lc_neg.centroid_col.value[5]) <= 3.0
 
+
+def test_cancelled_pixel_shot_var_fallback_and_time_array_obs_time(tmp_path: Path) -> None:
+    """Verify E2E fixes: shot_var fallback on cancelled float32 pixels and 1D Time obs_time."""
+    from halophot.masking import _coerce_obs_time
+
+    # Defect A.1: compute_coherent_flux_err shot_var fallback triggers ONLY when
+    # FLUX_ERR^2 - BKG_VAR - SMEAR_ERR^2 <= 4 * ulp_floor, leaving uncancelled pixels exact!
+    sm_f32 = np.array([[50.0, 50.0]], dtype=np.float32)
+    # Pixel (0, 0): cancelled (FLUX_ERR == SMEAR_ERR == 50.0) -> uses shot_var = 640.0
+    # Pixel (0, 1): uncancelled low-noise (sigma_pix = 0.5, well above 4*ulp_floor ~ 6e-4) -> untouched!
+    fe_mix = np.array([[[50.0, np.hypot(50.0, 0.5)]]], dtype=np.float32)
+    shot_var_2d = np.array([[640.0, 640.0]], dtype=np.float64)
+    basis_const = np.ones((1, 1, 2), dtype=np.float64)
+    chol_zero = np.zeros((1, 1, 1), dtype=np.float64)
+
+    err_cancelled = compute_coherent_flux_err(
+        np.array([[1.0, 0.0]]),
+        flux_err=fe_mix,
+        smear_err=sm_f32,
+        bkg_cov=BkgCovariance(chol=chol_zero, basis=basis_const),
+        shot_var=shot_var_2d,
+        bkgsub=True,
+        bkg_order=1,
+        norm_factor=1.0,
+    )[0]
+    assert err_cancelled == pytest.approx(np.sqrt(640.0), rel=1e-4)
+
+    err_uncancelled = compute_coherent_flux_err(
+        np.array([[0.0, 1.0]]),
+        flux_err=fe_mix,
+        smear_err=sm_f32,
+        bkg_cov=BkgCovariance(chol=chol_zero, basis=basis_const),
+        shot_var=shot_var_2d,
+        bkgsub=True,
+        bkg_order=1,
+        norm_factor=1.0,
+    )[0]
+    # Uncancelled pixel keeps its exact 0.5 e-/s residual noise rather than jumping to sqrt(640)!
+    assert err_uncancelled == pytest.approx(0.5, rel=0.05)
+
+    # Defect A.2: extract_halo_lightcurve handles Sirius-like cancelled SMEAR_ERR > FLUX_ERR
+    # pixels without collapsing pvar_reg / flux_err to ULP roundoff (~1e-4).
+    n_cad, ny, nx = 40, 4, 4
+    flux_can = np.full((n_cad, ny, nx), 20000.0, dtype=np.float64)
+    # 2-min cadence (exp_sec = 120s) -> physical shot_var = (20000 + 200) / 120 = 168.33 (e-/s)^2
+    sm_can = np.full((n_cad, nx), 15.0, dtype=np.float64)
+    fe_can = np.full((n_cad, ny, nx), 15.0, dtype=np.float64)
+    fe_can[:, 0, 0] = 14.9  # Simulates pre-fix flat-field mismatch FLUX_ERR < SMEAR_ERR
+    tpf_can = _build_synthetic_halocver_tpf_file(
+        tmp_path / "cancelled_shot_var.fits",
+        flux=flux_can,
+        flux_err=fe_can,
+        flux_bkg=np.full_like(flux_can, 200.0),
+        smear_err=sm_can,
+        chol=np.zeros((n_cad, 1, 1), dtype=np.float64),
+        basis=np.ones((1, ny, nx), dtype=np.float64),
+        bkgsub=True,
+    )
+    lc_can = extract_halo_lightcurve(tpf_can, normalize=False, maxiter=151)
+    # Weight must NOT collapse onto the single corrupted (0, 0) pixel, and flux_err must reflect
+    # physical Poisson shot noise (~sqrt(168.33 / 16) ~ 3.24 e-/s), not ULP roundoff (~0.01 e-/s)!
+    w_can = lc_can.meta["WEIGHTMAP"]
+    assert float(w_can[0, 0]) < 0.25
+    assert float(np.nanmedian(lc_can.flux_err.value)) == pytest.approx(
+        np.sqrt((20200.0 / 120.0) / 16.0), rel=0.15
+    )
+
+    # Defect B: _coerce_obs_time and mask_background_stars accept a 1D Time array (like tpf.time)
+    wcs_t = _make_celestial_wcs(7, 7, ra0=101.287, dec0=-16.716)
+    t_arr = Time([2458470.0, 2458480.0, 2458490.0], format="jd", scale="tdb")
+    resolved_t = _coerce_obs_time(t_arr, wcs_t)
+    assert isinstance(resolved_t, Time)
+    assert float(resolved_t.jd) == pytest.approx(2458480.0, abs=1e-6)
+
+    # Also verify mask_background_stars accepts tpf_can.time directly without TypeError
+    cat_1d = Table({"ra": [101.287], "dec": [-16.716], "Tmag": [8.0], "pmra": [10.0], "pmdec": [-5.0]})
+    m_1d = mask_background_stars(
+        wcs_t, (7, 7), catalog_table=cat_1d, offline=True, obs_time=tpf_can.time
+    )
+    assert m_1d.shape == (7, 7)
+
+    # Empty or fully masked Time array raises ValueError cleanly
+    t_empty = Time(np.array([], dtype=np.float64), format="jd", scale="tdb")
+    with pytest.raises(ValueError, match="no finite timestamps"):
+        _coerce_obs_time(t_empty, wcs_t)
+    t_masked = Time(
+        np.ma.array([2458470.0, 2458480.0], mask=[True, True]), format="jd", scale="tdb"
+    )
+    with pytest.raises(ValueError, match="no finite timestamps"):
+        _coerce_obs_time(t_masked, wcs_t)
+
+
