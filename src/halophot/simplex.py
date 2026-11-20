@@ -43,15 +43,15 @@ def _validate_positive_mean_flux(p_bar: jax.Array) -> None:
             )
 
 
-def _ilr_to_simplex(z: jax.Array) -> jax.Array:
-    """Undecorated O(M) ILR -> simplex kernel for JIT / AD internal callers."""
+def _ilr_to_logits(z: jax.Array) -> jax.Array:
+    """Compute O(M) Helmert contrast ``u = V z`` (``V.T @ V = I_{M-1}``, ``V.T @ 1_M = 0``)."""
     z_arr = _ensure_floating(z)
     if z_arr.ndim < 1:
         raise ValueError(f"z must be at least 1D (..., M - 1), got shape {z_arr.shape}.")
 
     m_minus_1 = z_arr.shape[-1]
     if m_minus_1 == 0:
-        return jnp.ones((*z_arr.shape[:-1], 1), dtype=z_arr.dtype)
+        return jnp.zeros((*z_arr.shape[:-1], 1), dtype=z_arr.dtype)
 
     k = jnp.arange(1, m_minus_1 + 1, dtype=z_arr.dtype)
     s = z_arr / jnp.sqrt(k * (k + 1.0))
@@ -60,8 +60,36 @@ def _ilr_to_simplex(z: jax.Array) -> jax.Array:
     zero_pad = jnp.zeros((*z_arr.shape[:-1], 1), dtype=z_arr.dtype)
     c = jnp.concatenate([suffix, zero_pad], axis=-1)
     d = jnp.concatenate([zero_pad, k * s], axis=-1)
-    u = c - d
-    return jax.nn.softmax(u, axis=-1)
+    return c - d
+
+
+def _logits_to_ilr(u: jax.Array) -> jax.Array:
+    """Compute O(M) inverse Helmert contrast ``z = V.T @ u`` without softmax/log underflow."""
+    u_arr = _ensure_floating(u)
+    if u_arr.ndim < 1 or u_arr.shape[-1] < 1:
+        raise ValueError(
+            f"u must have shape (..., M) with M >= 1, got shape {u_arr.shape}."
+        )
+
+    m_dim = u_arr.shape[-1]
+    if m_dim == 1:
+        return jnp.zeros((*u_arr.shape[:-1], 0), dtype=u_arr.dtype)
+
+    k = jnp.arange(1, m_dim, dtype=u_arr.dtype)
+    prefix_sum = jnp.cumsum(u_arr[..., :-1], axis=-1)
+    return (prefix_sum - k * u_arr[..., 1:]) / jnp.sqrt(k * (k + 1.0))
+
+
+def _ilr_to_simplex(z: jax.Array) -> jax.Array:
+    """Undecorated O(M) ILR -> simplex kernel for JIT / AD internal callers."""
+    z_arr = _ensure_floating(z)
+    if z_arr.ndim < 1:
+        raise ValueError(f"z must be at least 1D (..., M - 1), got shape {z_arr.shape}.")
+
+    if z_arr.shape[-1] == 0:
+        return jnp.ones((*z_arr.shape[:-1], 1), dtype=z_arr.dtype)
+
+    return jax.nn.softmax(_ilr_to_logits(z_arr), axis=-1)
 
 
 @in_float64

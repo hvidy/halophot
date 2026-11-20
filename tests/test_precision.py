@@ -172,6 +172,9 @@ def test_public_math_apis_run_in_float64_without_global_x64() -> None:
         phi_tiny = halophot.charbonnier_penalty(np.array([1e-13], dtype=np.float64), epsilon=1e-5)
 
         obs = halophot.HaloObservation.from_arrays(pix, times)
+        _ = obs.effective_constraint_count()
+        _ = obs.effective_constraint_count(objective="tv_exp", tau=3.0)
+        _ = obs.with_cadence_subset(np.arange(48) >= 4)
         w_tree = halophot.HaloWeights.from_uniform(obs.mean_pixel_flux)
         fs = w_tree.flux_shares()
         pw = w_tree.physical_weights(obs.mean_pixel_flux)

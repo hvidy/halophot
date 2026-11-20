@@ -1005,6 +1005,35 @@ def test_carbon_review_subset_unit_mean_asymmetric_jk_heteroscedastic_and_fisher
     ratio_a = float(np.median(jk_a[act_a] / emp_a[act_a]))
     assert 0.55 <= ratio_a <= 1.65
 
+    # 4. Sub-Poisson float32-cancelled outlier guard & exact gain invariance (Defect A)
+    f_subp = np.full((17, 40), 20000.0, dtype=np.float64)
+    v_subp = np.full((17, 40), 20000.0 / 120.0, dtype=np.float64)
+    v_corrupt = v_subp.copy()
+    v_corrupt[0, :] = 1e-4  # 10^6x below physical shot noise
+    t_subp = np.arange(40, dtype=np.float64) * dt
+    obs_ok = HaloObservation.from_arrays(f_subp, t_subp, pixel_var=v_subp)
+    obs_bad = HaloObservation.from_arrays(f_subp, t_subp, pixel_var=v_corrupt)
+    assert float(obs_bad.lambda_phot) / float(obs_ok.lambda_phot) < 3.0
+    p_gain = f_subp + rng.normal(0.0, np.sqrt(v_subp))
+    fg1 = optimise_halo(p_gain, t_subp, pixel_var=v_corrupt)
+    fg2 = optimise_halo(1e-3 * p_gain, t_subp, pixel_var=(1e-6) * v_corrupt)
+    np.testing.assert_allclose(fg1.physical_weights, fg2.physical_weights, atol=1e-10)
+
+    # 5. Tier-1b (M = 300 > 256) diagonally scaled optax L-BFGS converges cleanly in < 150 steps
+    m_300, n_300 = 300, 120
+    t_300 = np.arange(n_300, dtype=np.float64) * dt
+    f0_300 = rng.uniform(500.0, 50000.0, size=(m_300, 1))
+    s_300 = rng.uniform(-1.0, 1.0, size=(m_300, 1))
+    pv_300 = np.broadcast_to(f0_300 / 120.0, (m_300, n_300)).copy()
+    p_300 = f0_300 * (1.0 + s_300 * 0.04 * ((-1.0) ** np.arange(n_300))) + rng.normal(
+        0.0, np.sqrt(pv_300)
+    )
+    with warnings.catch_warnings(record=True) as w_300:
+        warnings.simplefilter("always")
+        fit_300 = optimise_halo(p_300, t_300, pixel_var=pv_300)
+    assert fit_300.converged is True and fit_300.n_steps < 150
+    assert not any(issubclass(w.category, RuntimeWarning) for w in w_300)
+
     # Fold non-convergence RuntimeWarning in orbit_block_jackknife & zodiax converged=False at maxiter=2
     obs_a = HaloObservation.from_arrays(p_a, t_asym, pixel_var=pv_a)
     with pytest.warns(RuntimeWarning, match="orbit_block_jackknife"):

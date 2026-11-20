@@ -192,6 +192,33 @@ def _objective_noise_calibration(objective: str) -> tuple[float, float]:
     return noise_mult, obj_slope
 
 
+def _safe_minvar_frac_var(
+    mean_p_np: np.ndarray,
+    frac_var: np.ndarray,
+) -> np.ndarray:
+    """Apply a gain-covariant sub-Poisson floor to ``frac_var`` before harmonic aggregation.
+
+    Computes ``eta_i = frac_var_i * P_bar_i`` (proportional to ``sigma_i^2 / P_bar_i``),
+    which scales linearly with flux gain ``a`` under ``(P -> a P, var -> a^2 var)``, so
+    ``0.1 * median(eta[eta > 0]) / P_bar_i`` is strictly homogeneous of degree 0 under
+    arbitrary unit-gain rescaling while preventing a single float32-cancelled pixel from
+    collapsing the harmonic floor ``1 / sum(1 / frac_var)``.
+    """
+    if (
+        frac_var.size > 1
+        and np.all(np.isfinite(mean_p_np))
+        and np.all(mean_p_np > 0.0)
+        and np.all(np.isfinite(frac_var))
+        and np.any(frac_var > 0.0)
+    ):
+        eta = frac_var * mean_p_np
+        pos_eta = eta[eta > 0.0]
+        if pos_eta.size > 0:
+            med_eta = float(np.median(pos_eta))
+            return np.maximum(frac_var, 0.1 * med_eta / mean_p_np)
+    return frac_var
+
+
 def _minvar_aperture_floor_and_centre(
     mean_p_j: jax.Array,
     frac_var: np.ndarray,
@@ -199,19 +226,21 @@ def _minvar_aperture_floor_and_centre(
     """Compute harmonic simplex minimum-variance floor and matching ILR prior centre.
 
     When all pixels have positive finite fractional variance ``frac_var_i > 0``, the
-    exact simplex minimum of ``sum_i theta_i^2 * frac_var_i`` is attained at
-    ``theta_mv_i = (1 / frac_var_i) / sum_j (1 / frac_var_j)`` with value
-    ``ap_var_floor = 1 / sum_j (1 / frac_var_j)``. This coincides identically with
-    uniform physical weights ``w_i = 1 / M`` on Poisson-limited and homoscedastic
-    stamps, while remaining invariant to high-variance smear or wing pixels on
-    heteroscedastic stamps.
+    exact simplex minimum of ``sum_i theta_i^2 * safe_fv_i`` is attained at
+    ``theta_mv_i = (1 / safe_fv_i) / sum_j (1 / safe_fv_j)`` with value
+    ``ap_var_floor = 1 / sum_j (1 / safe_fv_j)`` (with ``safe_fv`` guarded by
+    :func:`_safe_minvar_frac_var`). This coincides identically with uniform physical
+    weights ``w_i = 1 / M`` on Poisson-limited and homoscedastic stamps, while remaining
+    invariant to both high-variance smear pixels and sub-Poisson cancelled outliers.
     """
-    if frac_var.size >= 1 and np.all(np.isfinite(frac_var)) and np.all(frac_var > 0.0):
-        inv_fv = 1.0 / frac_var
+    mean_p_np = np.asarray(mean_p_j, dtype=np.float64)
+    safe_fv = _safe_minvar_frac_var(mean_p_np, frac_var)
+    if safe_fv.size >= 1 and np.all(np.isfinite(safe_fv)) and np.all(safe_fv > 0.0):
+        inv_fv = 1.0 / safe_fv
         inv_sum = float(np.sum(inv_fv))
         ap_var_floor = 1.0 / inv_sum
         theta_mv = inv_fv / inv_sum
-        if frac_var.size == 1:
+        if safe_fv.size == 1:
             return ap_var_floor, jnp.zeros(0, dtype=jnp.float64)
         interior = np.maximum(theta_mv, 1e-15)
         interior = interior / np.sum(interior)
@@ -336,6 +365,7 @@ class HaloObservation(zdx.Base):
     user_lambda_phot: float | None = eqx.field(static=True, default=None)
     user_lambda_z: float | None = eqx.field(static=True, default=None)
 
+    @in_float64
     def effective_constraint_count(
         self,
         *,

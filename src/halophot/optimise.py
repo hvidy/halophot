@@ -1,17 +1,19 @@
-"""Zodiax / Optimistix halo weight solvers, narrow local spike clipping, and block jackknife.
+"""Zodiax / Optax halo weight solvers, narrow local spike clipping, and block jackknife.
 
 Provides:
 * Cached ``eqx.filter_jit(eqx.filter_value_and_grad(loss_fn))`` evaluation on
   :class:`~halophot.models.HaloWeights` PyTrees (scoped under ``@in_float64``).
-* Tier-1 ``optx.BestSoFarMinimiser(optx.LBFGS(...))`` quasi-Newton solver and
-  Tier-2 ``zodiax.optimisation`` (``optax.adam`` + ``safe_eigen_projection``)
-  first-order preconditioned solver, normalized internally by ``max(n_eff, 1.0)``
-  so loss and gradients remain O(1) independent of cadence count.
+* Tier-1 two-tier preconditioned ``optax.lbfgs`` + zoom line search solver
+  (Fisher-preconditioned for ``M - 1 <= 256``, O(M) diagonal log-simplex
+  curvature scaled for ``M - 1 > 256`` or ``precondition=False``) and Tier-2
+  ``zodiax.optimisation`` (``optax.adam`` + ``safe_eigen_projection``), both
+  normalized internally by ``max(n_eff, 1.0)`` so loss and gradients remain O(1).
 * Gap-aware narrow local-median / Theil-Sen cosmic-ray and thruster spike
   detector that excludes outlier cadences strictly during weight optimization
   without overwriting finite astrophysical cadences in returned light curves.
 * Warm-started orbit-gap-aware ``K``-block jackknife uncertainty estimation
-  with delete-``m_k`` constraint weighting and static ``N_pad`` XLA reuse.
+  with Busing-Meijer-van der Leeden delete-``m_k`` weighting and static ``N_pad``
+  XLA reuse.
 """
 
 from __future__ import annotations
@@ -26,12 +28,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import optimistix as optx
 import zodiax as zdx
 from astropy.stats import mad_std, sigma_clip
 
 from ._precision import in_float64
-from .models import HaloObservation, HaloWeights
+from .models import HaloObservation, HaloWeights, _safe_minvar_frac_var
 from .objectives import (
     AVAILABLE_OBJECTIVES,
     _halo_objective,
@@ -43,7 +44,7 @@ from .objectives import (
     _tv_charbonnier_o2,
     _tv_exp_scan,
 )
-from .simplex import _ilr_to_simplex
+from .simplex import _ilr_to_logits, _ilr_to_simplex, _logits_to_ilr
 
 __all__ = [
     "HaloFitResult",
@@ -60,10 +61,10 @@ __all__ = [
 class HaloFitResult:
     """Result of ``optimise_halo`` on active halo pixels ``Omega_halo``.
 
-    ``converged`` indicates L-BFGS termination at ``optx.RESULTS.successful`` for
-    ``solver='lbfgs'``, or finite objective with preconditioned max-norm gradient
-    within ``atol + rtol * max(|loss / n_eff|, 1.0)`` for fixed-schedule first-order
-    solvers (``'zodiax'`` / ``'adam'``).
+    ``converged`` indicates stationarity or 2-step stabilized weights and objective
+    within ``(rtol, atol)`` for ``solver='lbfgs'``, or finite objective with
+    preconditioned max-norm gradient within ``atol + rtol * max(|loss / n_eff|, 1.0)``
+    for fixed-schedule first-order solvers (``'zodiax'`` / ``'adam'``).
     """
 
     weights_tree: HaloWeights
@@ -136,9 +137,6 @@ def safe_eigen_projection(
     pos_mask = jnp.isfinite(diag) & (diag > tiny)
     has_pos = jnp.any(pos_mask)
     if fmat is not None:
-        # Preserve all strictly positive Fisher diagonals regardless of magnitude; clamp
-        # only non-positive diagonals to the largest positive curvature scale so flat
-        # directions are damped rather than amplified by 1 / sqrt(eps).
         max_pos = jnp.max(jnp.where(pos_mask, diag, 0.0))
         fallback_diag = jnp.where(has_pos, max_pos, 1.0)
         safe_diag = jnp.where(pos_mask, diag, fallback_diag)
@@ -199,11 +197,15 @@ def _get_fisher_fn(
                 mask_c = obs.valid_cadence_mask.astype(z0.dtype)
                 cnt_c = jnp.maximum(jnp.sum(mask_c), 1.0)
                 mu_c = jnp.sum(mask_c * f0) / cnt_c
-                var_c = jnp.sum(jnp.where(obs.valid_cadence_mask, jnp.square(f0 - mu_c), 0.0)) / cnt_c
+                var_c = (
+                    jnp.sum(jnp.where(obs.valid_cadence_mask, jnp.square(f0 - mu_c), 0.0)) / cnt_c
+                )
                 scale0 = jnp.sqrt(jnp.maximum(var_c, 0.0))
             elif objective == "tv_o2" and 2 * lag < obs.N_pad:
                 m2 = obs.valid_diff_mask[: -2 * lag] & obs.valid_diff_mask[lag:-lag]
-                d2 = jnp.where(m2, jnp.abs(2.0 * f0[lag:-lag] - f0[2 * lag :] - f0[: -2 * lag]), 0.0)
+                d2 = jnp.where(
+                    m2, jnp.abs(2.0 * f0[lag:-lag] - f0[2 * lag :] - f0[: -2 * lag]), 0.0
+                )
                 scale0 = jnp.sum(d2) / jnp.maximum(jnp.sum(m2.astype(z0.dtype)), 1.0)
             elif lag < obs.N_pad:
                 m1 = obs.valid_diff_mask[:-lag]
@@ -269,27 +271,263 @@ def _get_fisher_fn(
     return _fisher
 
 
+def _compute_diag_logit_scale(
+    w0: HaloWeights,
+    obs: HaloObservation,
+    objective: str,
+) -> jax.Array:
+    """Compute O(M) diagonal log-simplex curvature scaling ``d in [1e-3, 1e3]^M``."""
+    theta0 = _ilr_to_simplex(w0.z_ilr)
+    dtype = theta0.dtype
+    n_scale = jnp.maximum(obs.n_eff, 1.0)
+    f0 = w0._evaluate_lightcurve_raw(obs)
+
+    if not w0.legacy_tv:
+        mean_ratio0 = jnp.dot(theta0, obs.norm_mean_ratio)
+        safe_ratio0 = jnp.where(jnp.abs(mean_ratio0) > 1e-30, mean_ratio0, 1.0)
+        p_eff = obs.norm_pixels / safe_ratio0
+    else:
+        safe_scale = jnp.where(jnp.abs(obs.mean_pixel_flux) > 1e-30, obs.mean_pixel_flux, 1.0)
+        mean_f0 = jnp.dot(theta0, obs.mean_pixel_flux)
+        safe_denom0 = jnp.where(jnp.abs(mean_f0) > 1e-30, mean_f0, 1.0)
+        p_eff = (safe_scale[:, None] * obs.norm_pixels) / safe_denom0
+
+    lag = obs.lag
+    if objective == "owl":
+        mask = obs.valid_cadence_mask
+        cnt = jnp.maximum(jnp.sum(mask.astype(dtype)), 1.0)
+        mu_f0 = jnp.sum(jnp.where(mask, f0, 0.0)) / cnt
+        df0 = jnp.where(mask, f0 - mu_f0, 0.0)
+        mu_p = jnp.sum(jnp.where(mask[None, :], p_eff, 0.0), axis=1, keepdims=True) / cnt
+        dp_c = jnp.where(mask[None, :], (p_eff - mu_p) - df0[None, :], 0.0)
+    elif objective == "tv_o2" and 2 * lag < obs.N_pad:
+        mask = obs.valid_diff_mask[: -2 * lag] & obs.valid_diff_mask[lag:-lag]
+        cnt = jnp.maximum(jnp.sum(mask.astype(dtype)), 1.0)
+        df0 = jnp.where(mask, 2.0 * f0[lag:-lag] - f0[2 * lag :] - f0[: -2 * lag], 0.0)
+        dp_raw = 2.0 * p_eff[:, lag:-lag] - p_eff[:, 2 * lag :] - p_eff[:, : -2 * lag]
+        dp_c = jnp.where(mask[None, :], dp_raw - df0[None, :], 0.0)
+    else:
+        if lag < obs.N_pad:
+            mask_lag = obs.valid_diff_mask[:-lag]
+            has_lag = jnp.any(mask_lag)
+        else:
+            mask_lag = jnp.zeros(0, dtype=jnp.bool_)
+            has_lag = jnp.asarray(False)
+
+        # Fallback to lag-1 active cadence pairs when obs.lag exceeds segment lengths (e.g. tv_exp).
+        mask_1 = obs.valid_cadence_mask[:-1] & obs.valid_cadence_mask[1:]
+        cnt_1 = jnp.maximum(jnp.sum(mask_1.astype(dtype)), 1.0)
+        df0_1 = jnp.where(mask_1, f0[1:] - f0[:-1], 0.0)
+        dp_c_1 = jnp.where(mask_1[None, :], (p_eff[:, 1:] - p_eff[:, :-1]) - df0_1[None, :], 0.0)
+        mean_dp_sq_1 = jnp.sum(jnp.square(dp_c_1), axis=1) / cnt_1
+        rms_df0_1 = jnp.sqrt(jnp.sum(jnp.square(df0_1)) / cnt_1)
+
+        if lag < obs.N_pad:
+            cnt_l = jnp.maximum(jnp.sum(mask_lag.astype(dtype)), 1.0)
+            df0_l = jnp.where(mask_lag, f0[lag:] - f0[:-lag], 0.0)
+            dp_c_l = jnp.where(
+                mask_lag[None, :], (p_eff[:, lag:] - p_eff[:, :-lag]) - df0_l[None, :], 0.0
+            )
+            mean_dp_sq_l = jnp.sum(jnp.square(dp_c_l), axis=1) / cnt_l
+            rms_df0_l = jnp.sqrt(jnp.sum(jnp.square(df0_l)) / cnt_l)
+            mean_dp_sq = jnp.where(has_lag, mean_dp_sq_l, mean_dp_sq_1)
+            rms_df0 = jnp.where(has_lag, rms_df0_l, rms_df0_1)
+        else:
+            mean_dp_sq = mean_dp_sq_1
+            rms_df0 = rms_df0_1
+
+    if objective in ("owl", "tv_o2"):
+        mean_dp_sq = jnp.sum(jnp.square(dp_c), axis=1) / cnt
+        rms_df0 = jnp.sqrt(jnp.sum(jnp.square(df0)) / cnt)
+
+    rms_safe = jnp.maximum(rms_df0, 1e-12)
+    if w0.legacy_tv:
+        if objective == "l2v":
+            curv_data = jnp.square(theta0) * mean_dp_sq
+        elif objective == "l3v":
+            curv_data = jnp.square(theta0) * mean_dp_sq * rms_safe
+        else:
+            curv_data = jnp.square(theta0) * mean_dp_sq / rms_safe
+        curv_phot = jnp.zeros_like(theta0)
+        curv_z = jnp.asarray(1e-6, dtype=dtype)
+    else:
+        b_scale = jnp.maximum(obs.b_hat, 1e-12)
+        if objective == "l2v":
+            curv_data = jnp.square(theta0) * mean_dp_sq / jnp.square(b_scale)
+        elif objective == "l3v":
+            curv_data = jnp.square(theta0) * mean_dp_sq * rms_safe / (b_scale * jnp.square(b_scale))
+        else:
+            curv_data = jnp.square(theta0) * mean_dp_sq / (b_scale * rms_safe)
+        curv_phot = (obs.lambda_phot / n_scale) * jnp.square(theta0) * obs.mean_frac_var
+        curv_z = jnp.maximum(obs.lambda_z / n_scale, 1e-6)
+
+    d_raw = 1.0 / jnp.sqrt(jnp.maximum(curv_data + curv_phot + curv_z, 1e-30))
+    d_med = jnp.maximum(jnp.median(d_raw), 1e-30)
+    return jnp.clip(d_raw / d_med, 1e-3, 1e3)
+
+
+def _run_optax_lbfgs_loop(
+    val_fn,
+    weights_from_xi,
+    xi0: jax.Array,
+    max_steps: int,
+    rtol: float,
+    atol: float,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Run JIT-compatible ``optax.lbfgs`` + zoom linesearch in ``jax.lax.while_loop``."""
+    opt = optax.lbfgs(
+        memory_size=20,
+        linesearch=optax.scale_by_zoom_linesearch(max_linesearch_steps=20, verbose=False),
+    )
+    vg_fn = jax.value_and_grad(val_fn)
+    v0, g0 = vg_fn(xi0)
+    opt_state0 = opt.init(xi0)
+    w0_phys = weights_from_xi(xi0)
+
+    f_scale0 = jnp.maximum(jnp.abs(v0), 1.0)
+    finite0 = jnp.isfinite(v0) & jnp.all(jnp.isfinite(g0))
+    conv0 = finite0 & (jnp.max(jnp.abs(g0)) <= atol + rtol * f_scale0)
+    failed0 = ~finite0
+
+    init_carry = (
+        xi0,
+        opt_state0,
+        v0,
+        g0,
+        w0_phys,
+        xi0,
+        v0,
+        jnp.asarray(0, dtype=jnp.int32),
+        jnp.asarray(0, dtype=jnp.int32),
+        conv0,
+        failed0,
+    )
+
+    def _cond(carry):
+        _, _, _, _, _, _, _, _, step, conv, failed = carry
+        return (~conv) & (~failed) & (step < max_steps)
+
+    def _body(carry):
+        xi, opt_state, v_curr, g_curr, w_curr, best_xi, best_v, consec, step, _, _ = carry
+        updates, next_state = opt.update(
+            g_curr,
+            opt_state,
+            xi,
+            value=v_curr,
+            grad=g_curr,
+            value_fn=val_fn,
+        )
+        xi_cand = optax.apply_updates(xi, updates)
+        v_cand, g_cand = vg_fn(xi_cand)
+        finite_step = (
+            jnp.all(jnp.isfinite(xi_cand))
+            & jnp.isfinite(v_cand)
+            & jnp.all(jnp.isfinite(g_cand))
+        )
+
+        xi_next = jnp.where(finite_step, xi_cand, xi)
+        v_next = jnp.where(finite_step, v_cand, v_curr)
+        g_next = jnp.where(finite_step, g_cand, g_curr)
+        state_next = jax.tree.map(
+            lambda a, b: jnp.where(finite_step, a, b),
+            next_state,
+            opt_state,
+        )
+
+        improved = finite_step & (v_next < best_v)
+        next_best_xi = jnp.where(improved, xi_next, best_xi)
+        next_best_v = jnp.where(improved, v_next, best_v)
+
+        w_next = weights_from_xi(xi_next)
+        f_scale = jnp.maximum(jnp.abs(v_next), 1.0)
+        grad_ok = finite_step & (jnp.max(jnp.abs(g_next)) <= atol + rtol * f_scale)
+        dw_max = jnp.max(jnp.abs(w_next - w_curr))
+        dv_rel = jnp.abs(v_curr - v_next) / f_scale
+        step_small = (
+            finite_step
+            & (v_next <= v_curr + 1e-12 * f_scale)
+            & (dw_max <= atol + rtol)
+            & (dv_rel <= rtol)
+        )
+        consec_next = jnp.where(step_small, consec + 1, jnp.zeros_like(consec))
+        conv_next = grad_ok | (consec_next >= 2)
+        failed_next = ~finite_step
+        return (
+            xi_next,
+            state_next,
+            v_next,
+            g_next,
+            w_next,
+            next_best_xi,
+            next_best_v,
+            consec_next,
+            step + 1,
+            conv_next,
+            failed_next,
+        )
+
+    final_carry = jax.lax.while_loop(_cond, _body, init_carry)
+    _, _, _, _, _, best_xi, best_v, _, n_steps, converged, _ = final_carry
+    use_best = jnp.isfinite(best_v) & (best_v <= v0)
+    final_xi = jnp.where(use_best, best_xi, xi0)
+    final_v = jnp.where(use_best, best_v, v0)
+    return final_xi, v0, final_v, converged & jnp.isfinite(final_v), n_steps
+
+
 @functools.lru_cache(maxsize=32)
-def _get_lbfgs_runner(
+def _get_lbfgs_proj_runner(
     objective: str,
     epsilon: float,
     tau: float | None,
     rtol: float,
     atol: float,
 ):
-    """Build and cache a JIT-compiled Optimistix BestSoFar L-BFGS solver.
+    """Build and cache a Tier-1a Fisher-preconditioned ``optax.lbfgs`` zoom-LS runner."""
 
-    Normalizes the internal optimization objective by ``max(obs.n_eff, 1.0)`` so
-    loss values, gradients, and Optimistix tolerances remain O(1) independent of
-    sector cadence count.
-    """
-    solver = optx.BestSoFarMinimiser(
-        optx.LBFGS(rtol=rtol, atol=atol, history_length=20)
-    )
-
-    def _loss_norm(weights: HaloWeights, obs: HaloObservation) -> jax.Array:
+    @eqx.filter_jit
+    def _run(
+        w0: HaloWeights,
+        obs: HaloObservation,
+        proj: jax.Array,
+        max_steps: int,
+    ) -> tuple[HaloWeights, jax.Array, jax.Array, jax.Array, jax.Array]:
+        z0 = w0.z_ilr
+        legacy_tv = w0.legacy_tv
         n_scale = jnp.maximum(obs.n_eff, 1.0)
-        return _halo_objective(weights, obs, objective=objective, epsilon=epsilon, tau=tau) / n_scale
+
+        def _val_fn(xi: jax.Array) -> jax.Array:
+            w = HaloWeights(z_ilr=z0 + jnp.dot(proj, xi), legacy_tv=legacy_tv)
+            return _halo_objective(w, obs, objective=objective, epsilon=epsilon, tau=tau) / n_scale
+
+        def _w_phys(xi: jax.Array) -> jax.Array:
+            w = HaloWeights(z_ilr=z0 + jnp.dot(proj, xi), legacy_tv=legacy_tv)
+            return w._physical_weights_raw(obs.mean_pixel_flux)
+
+        xi0 = jnp.zeros_like(z0)
+        best_xi, v0, best_v, conv, n_steps = _run_optax_lbfgs_loop(
+            _val_fn, _w_phys, xi0, max_steps, rtol, atol
+        )
+        z_best = z0 + jnp.dot(proj, best_xi)
+        return (
+            HaloWeights(z_ilr=z_best, legacy_tv=legacy_tv),
+            v0 * n_scale,
+            best_v * n_scale,
+            conv,
+            n_steps,
+        )
+
+    return _run
+
+
+@functools.lru_cache(maxsize=32)
+def _get_lbfgs_diag_runner(
+    objective: str,
+    epsilon: float,
+    tau: float | None,
+    rtol: float,
+    atol: float,
+):
+    """Build and cache a Tier-1b O(M) diagonally scaled ``optax.lbfgs`` zoom-LS runner."""
 
     @eqx.filter_jit
     def _run(
@@ -297,27 +535,36 @@ def _get_lbfgs_runner(
         obs: HaloObservation,
         max_steps: int,
     ) -> tuple[HaloWeights, jax.Array, jax.Array, jax.Array, jax.Array]:
+        z0 = w0.z_ilr
+        legacy_tv = w0.legacy_tv
         n_scale = jnp.maximum(obs.n_eff, 1.0)
-        loss0_norm = _loss_norm(w0, obs)
-        sol = optx.minimise(
-            _loss_norm,
-            solver,
-            w0,
-            args=obs,
-            max_steps=max_steps,
-            throw=False,
+        u0 = _ilr_to_logits(z0)
+        d_scale = _compute_diag_logit_scale(w0, obs, objective)
+
+        def _z_from_xi(xi: jax.Array) -> jax.Array:
+            u = u0 + d_scale * _ilr_to_logits(xi)
+            return _logits_to_ilr(u)
+
+        def _val_fn(xi: jax.Array) -> jax.Array:
+            w = HaloWeights(z_ilr=_z_from_xi(xi), legacy_tv=legacy_tv)
+            return _halo_objective(w, obs, objective=objective, epsilon=epsilon, tau=tau) / n_scale
+
+        def _w_phys(xi: jax.Array) -> jax.Array:
+            w = HaloWeights(z_ilr=_z_from_xi(xi), legacy_tv=legacy_tv)
+            return w._physical_weights_raw(obs.mean_pixel_flux)
+
+        xi0 = jnp.zeros_like(z0)
+        best_xi, v0, best_v, conv, n_steps = _run_optax_lbfgs_loop(
+            _val_fn, _w_phys, xi0, max_steps, rtol, atol
         )
-        loss_final_norm = _loss_norm(sol.value, obs)
-        use_final = jnp.isfinite(loss_final_norm) & (loss_final_norm <= loss0_norm)
-        best_weights = jax.tree.map(
-            lambda a, b: jnp.where(use_final, a, b),
-            sol.value,
-            w0,
+        z_best = _z_from_xi(best_xi)
+        return (
+            HaloWeights(z_ilr=z_best, legacy_tv=legacy_tv),
+            v0 * n_scale,
+            best_v * n_scale,
+            conv,
+            n_steps,
         )
-        best_loss_norm = jnp.where(use_final, loss_final_norm, loss0_norm)
-        converged = (sol.result == optx.RESULTS.successful) & jnp.isfinite(loss_final_norm)
-        n_steps = sol.stats["num_steps"]
-        return best_weights, loss0_norm * n_scale, best_loss_norm * n_scale, converged, n_steps
 
     return _run
 
@@ -329,8 +576,8 @@ def _get_zodiax_runner(
     tau: float | None,
     learning_rate: float,
     max_steps: int,
-    rtol: float = 1e-9,
-    atol: float = 1e-9,
+    rtol: float = 5e-5,
+    atol: float = 5e-5,
 ):
     """Build and cache a Tier-2 ``zodiax.optimisation`` + ``optax.adam`` runner."""
 
@@ -391,7 +638,9 @@ def _get_zodiax_runner(
         grad_norm = jnp.max(jnp.abs(final_grad["xi"]))
         tol_thresh = atol + rtol * jnp.maximum(jnp.abs(final_val_norm), 1.0)
         z_best = z0 + jnp.dot(proj, final_xi)
-        converged = jnp.isfinite(final_val_norm) & jnp.isfinite(grad_norm) & (grad_norm <= tol_thresh)
+        converged = (
+            jnp.isfinite(final_val_norm) & jnp.isfinite(grad_norm) & (grad_norm <= tol_thresh)
+        )
         n_steps = jnp.asarray(max_steps, dtype=jnp.int64)
         return (
             HaloWeights(z_ilr=z_best, legacy_tv=legacy_tv),
@@ -464,11 +713,8 @@ def cadence_scaled_sigclip_mask(
     else:
         dt_val = float(dt_days)
 
-    # Validate dt_val and window_days consistently with cadence_scaled_savgol_window.
     cadence_scaled_savgol_window(dt_val, window_days=window_days)
 
-    # Segment strictly on finite cadences so NaN downlink blocks and NaN timestamps
-    # always break smoothing across spacecraft interruptions.
     if t_arr is not None:
         breaks = np.flatnonzero(np.diff(t_arr[fin_idx]) > gap_factor * dt_val) + 1
     else:
@@ -500,8 +746,6 @@ def cadence_scaled_sigclip_mask(
         nbr_vals = ys[centres[:, None] + nbr_offsets[None, :]]
         b_seg[centres] = np.median(nbr_vals, axis=1)
 
-        # Robust 6-neighbour Theil-Sen linear prediction on segment endpoints (15 pairwise
-        # slopes -> 1 outlier contaminates only 5/15 = 33% < 50% breakdown point).
         ts = t_arr[seg] if t_arr is not None else np.arange(seg_len, dtype=np.float64)
         edge_win = min(seg_len, 7)
         for j in (0, 1, seg_len - 2, seg_len - 1):
@@ -556,8 +800,16 @@ def _solve_single_pass(
         return w0, loss_val, loss_val, True, 0
 
     if solver == "lbfgs":
-        runner = _get_lbfgs_runner(objective, epsilon, tau, rtol, atol)
-        w_best, loss0, loss_end, conv, n_steps = runner(w0, obs, maxiter)
+        if precondition and m_minus_1 <= 256:
+            fisher_fn = _get_fisher_fn(objective, tau, epsilon)
+            f_mat = fisher_fn(w0, obs)
+            proj = safe_eigen_projection(fmat=f_mat, rcond=1e-8)
+            runner_proj = _get_lbfgs_proj_runner(objective, epsilon, tau, rtol, atol)
+            w_best, loss0, loss_end, conv, n_steps = runner_proj(w0, obs, proj, maxiter)
+            return w_best, float(loss0), float(loss_end), bool(conv), int(n_steps)
+
+        runner_diag = _get_lbfgs_diag_runner(objective, epsilon, tau, rtol, atol)
+        w_best, loss0, loss_end, conv, n_steps = runner_diag(w0, obs, maxiter)
         return w_best, float(loss0), float(loss_end), bool(conv), int(n_steps)
 
     if solver in ("zodiax", "adam"):
@@ -565,8 +817,6 @@ def _solve_single_pass(
             fisher_fn = _get_fisher_fn(objective, tau, epsilon)
             f_mat = fisher_fn(w0, obs)
             proj = safe_eigen_projection(fmat=f_mat, rcond=1e-4)
-            # In Fisher-whitened coordinates Adam takes steps of Euclidean norm
-            # lr * sqrt(M - 1); scale by 1 / sqrt(M - 1) so initial step length is O(lr).
             eff_lr = float(learning_rate) / math.sqrt(max(m_minus_1, 1))
         else:
             proj = jnp.eye(m_minus_1, dtype=jnp.float64)
@@ -594,8 +844,6 @@ def _partition_orbit_blocks(
 
     segs = [s for s in np.split(np.arange(n_valid), breaks) if s.size > 0]
     if len(segs) <= k_eff:
-        # Allocate at least 1 block to each orbit segment, distributing remaining blocks
-        # proportionally to segment length.
         counts = np.ones(len(segs), dtype=int)
         rem = k_eff - len(segs)
         if rem > 0:
@@ -631,8 +879,8 @@ def orbit_block_jackknife(
     tau: float | None = None,
     solver: str = "lbfgs",
     maxiter: int = 500,
-    rtol: float = 1e-10,
-    atol: float = 1e-10,
+    rtol: float = 1e-7,
+    atol: float = 1e-7,
     learning_rate: float = 0.2,
     precondition: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -640,10 +888,10 @@ def orbit_block_jackknife(
 
     Splits active cadences along major orbit/downlink gaps when present, leaves out
     each block ``B_k`` in turn while retaining ``obs.N_pad`` unchanged for zero XLA
-    recompilation, and combines leave-out folds using delete-``m_k`` constraint
-    weighting. Returns ``(weight_std, jackknife_weights)`` where ``jackknife_weights``
-    has shape ``(k_eff, M)`` whenever ``k_eff >= 2`` folds succeed (or ``(n_blocks, M)``
-    of ``NaN`` when fewer than 2 valid folds exist).
+    recompilation, and combines leave-out folds using Busing-Meijer-van der Leeden
+    delete-``m_k`` constraint weighting. Returns ``(weight_std, jackknife_weights)``
+    where ``jackknife_weights`` has shape ``(k_eff, M)`` whenever ``k_eff >= 2`` folds
+    succeed (or ``(n_blocks, M)`` of ``NaN`` when fewer than 2 valid folds exist).
     """
     if isinstance(n_blocks, bool) or int(n_blocks) < 2:
         raise ValueError(f"n_blocks must be an integer >= 2, got {n_blocks!r}.")
@@ -726,10 +974,6 @@ def orbit_block_jackknife(
     k_used = w_jk.shape[0]
     m_k = np.asarray(dropped_counts, dtype=np.float64)
     m_tot = float(np.sum(m_k))
-    # Busing, Meijer & van der Leeden (1999) unequal-block delete-m_k jackknife:
-    # centre around the complement-weighted mean (m_tot - m_k) and weight squared
-    # deviations by h_k - 1 = (m_tot - m_k) / m_k; reduces identically to
-    # ((K - 1) / K) * sum_k (w_(-k) - mean(w_jk))^2 when all m_k are equal.
     comp_weights = np.maximum(m_tot - m_k, 0.0)
     comp_sum = float(np.sum(comp_weights))
     h_k = np.maximum(m_tot / m_k, 1.0)
@@ -743,20 +987,14 @@ def orbit_block_jackknife(
 
 
 def _default_initial_weights(obs: HaloObservation, *, legacy_tv: bool) -> HaloWeights:
-    """Build default starting weights (inverse-variance minimum-noise start when heteroscedastic).
-
-    For Poisson-limited pixels (``mean_frac_var_i propto 1 / P_bar_i``), inverse-variance
-    flux shares ``theta_i propto 1 / mean_frac_var_i`` coincide identically with uniform
-    physical weights ``w_i = 1 / M``; on heteroscedastic stamps with noisy smear/wing
-    pixels (e.g. Sirius S06), starting at the analytical minimum of ``photon_noise_penalty``
-    avoids large initial steps and speeds up L-BFGS convergence substantially.
-    """
+    """Build default starting weights (gain-covariant inverse-variance start when heteroscedastic)."""
     if legacy_tv:
         return HaloWeights.from_uniform(obs.mean_pixel_flux, legacy_tv=True)
     fv = np.asarray(obs.mean_frac_var, dtype=np.float64)
     p_bar = np.asarray(obs.mean_pixel_flux, dtype=np.float64)
-    if fv.size > 1 and np.all(np.isfinite(fv)) and np.all(fv > 0.0) and np.all(p_bar > 0.0):
-        inv_fv = 1.0 / fv
+    safe_fv = _safe_minvar_frac_var(p_bar, fv)
+    if safe_fv.size > 1 and np.all(np.isfinite(safe_fv)) and np.all(safe_fv > 0.0) and np.all(p_bar > 0.0):
+        inv_fv = 1.0 / safe_fv
         th_mv = inv_fv / np.sum(inv_fv)
         w_mv = th_mv / p_bar
         w_mv_sum = float(np.sum(w_mv))
@@ -785,8 +1023,8 @@ def optimise_halo(
     lambda_z: float | None = None,
     solver: str = "lbfgs",
     maxiter: int = 500,
-    rtol: float = 1e-9,
-    atol: float = 1e-9,
+    rtol: float = 5e-5,
+    atol: float = 5e-5,
     learning_rate: float = 0.2,
     precondition: bool = True,
     sigclip: bool = False,
@@ -951,7 +1189,6 @@ def optimise_halo(
                 w_tree._physical_weights_raw(obs_sub.mean_pixel_flux),
                 dtype=np.float64,
             )
-            # Evaluate full-cadence light curve at outlier-guarded optimal weights (never NaN-clip).
             raw_lc = w_phys @ pix_np
             active_obs = obs_sub
         elif np.any(~inliers):
@@ -973,8 +1210,8 @@ def optimise_halo(
     weight_std: np.ndarray | None = None
     jk_weights: np.ndarray | None = None
     if compute_uncertainty:
-        jk_rtol = min(float(rtol), 1e-10)
-        jk_atol = min(float(atol), 1e-10)
+        jk_rtol = min(float(rtol), 1e-7)
+        jk_atol = min(float(atol), 1e-7)
         weight_std, jk_weights = orbit_block_jackknife(
             active_obs,
             w_phys,
