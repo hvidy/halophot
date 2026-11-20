@@ -10,10 +10,12 @@
 #SBATCH --output=/aphid/scratch-3month/%u/logs/%x-%A_%a.out
 #SBATCH --error=/aphid/scratch-3month/%u/logs/%x-%A_%a.err
 #
-# Swinburne Ngarrgu Tindebeek (tooarrana) EPYC Milan CPU array template for halophot v2.0.
+# Swinburne Ngarrgu Tindebeek (tooarrana) EPYC Milan CPU array template for halophot v2.0.1.
 # For 20-second TESS sectors, override at submission with: --cpus-per-task=8 --mem=24G.
-# Set PIPELINE_MODE=full_e2e (after Stage-1 `mundey prefetch`) to run mundey -> tessbkgd -> halophot
-# in a single pass on raw MAST _tp.fits files; defaults to PIPELINE_MODE=halophot_only.
+# For manifests > 100 lines, override --array=0-$(( $(wc -l < "$MANIFEST") - 1 ))%25 at submission.
+# Set PIPELINE_MODE=full_e2e ONLY after running Stage-1 `mundey prefetch` so concurrent array tasks
+# share prebuilt sector -blf.fits caches in $CACHE_DIR instead of rebuilding them redundantly;
+# defaults to PIPELINE_MODE=halophot_only.
 # Submit after creating log directory: mkdir -p "$SCRATCH/logs" && sbatch hpc/halophot_survey_cpu.sbatch
 
 set -eo pipefail  # omit -u: Lmod reads unset variables (PS1) inside `module load`
@@ -45,14 +47,24 @@ mkdir -p "$ARCHIVE_DIR" "$SCRATCH/jax_cache" "$CACHE_DIR" \
     "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR"
 
 # Stage all per-task FITS/Parquet products onto node-local SSD ($JOBFS) or $SCRATCH,
-# and bundle into a single .tar file on EXIT so /fred/oz440 consumes 1 inode per task.
-STAGE_OUT="${JOBFS:-$SCRATCH/stage/${SLURM_JOB_NAME}-${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}}/out"
+# and bundle atomically via .part -> mv into a single .tar file on EXIT so /fred/oz440
+# consumes 1 inode per task and never leaves a truncated .tar on SIGKILL.
+STAGE_BASE="${JOBFS:-$SCRATCH/stage/${SLURM_JOB_NAME}-${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}}"
+STAGE_OUT="${STAGE_BASE}/out"
 mkdir -p "$STAGE_OUT"
 
 archive_outputs() {
+    local tar_name="${SLURM_JOB_NAME}-${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}.tar"
+    local tar_part="${ARCHIVE_DIR}/.${tar_name}.part.$$"
     if [ -d "$STAGE_OUT" ] && [ -n "$(ls -A "$STAGE_OUT" 2>/dev/null || true)" ]; then
-        tar -cf "${ARCHIVE_DIR}/${SLURM_JOB_NAME}-${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}.tar" \
-            -C "$STAGE_OUT" .
+        if tar -cf "$tar_part" -C "$STAGE_OUT" .; then
+            mv -f "$tar_part" "${ARCHIVE_DIR}/${tar_name}"
+        else
+            rm -f "$tar_part"
+        fi
+    fi
+    if [ -z "${JOBFS:-}" ] && [ -n "${STAGE_BASE:-}" ]; then
+        rm -rf "$STAGE_BASE"
     fi
 }
 trap archive_outputs EXIT
@@ -75,6 +87,13 @@ export LIGHTKURVE_CACHE_DIR="$SCRATCH/.cache/lightkurve"
 export ASTROPY_CACHE_DIR="$SCRATCH/.cache/astropy"
 export MPLBACKEND=Agg
 
+if [ "${SLURM_ARRAY_TASK_ID:-0}" -eq 0 ] && [ -n "${SLURM_ARRAY_TASK_MAX:-}" ]; then
+    MANIFEST_LINES="$(wc -l < "$MANIFEST")"
+    if [ "$MANIFEST_LINES" -gt $((SLURM_ARRAY_TASK_MAX + 1)) ]; then
+        echo "WARNING: Manifest $MANIFEST has $MANIFEST_LINES lines, exceeding --array max ($((SLURM_ARRAY_TASK_MAX + 1))); resubmit with --array=0-$((MANIFEST_LINES - 1))%25 to cover all targets." >&2
+    fi
+fi
+
 LINE_NUM=$((SLURM_ARRAY_TASK_ID + 1))
 TPF_PATH="$(sed -n "${LINE_NUM}p" "$MANIFEST")"
 TPF_PATH="${TPF_PATH%$'\r'}"
@@ -89,6 +108,12 @@ TARGET_STEM="$(basename "$TPF_PATH")"
 TARGET_STEM="${TARGET_STEM%.gz}"
 TARGET_STEM="${TARGET_STEM%.fits}"
 CAT_FILE="${CATALOG_DIR}/${TARGET_STEM}_cat.parquet"
+if [ ! -f "$CAT_FILE" ] && [[ "$TARGET_STEM" == *-sub ]]; then
+    ALT_CAT_FILE="${CATALOG_DIR}/${TARGET_STEM%-sub}_cat.parquet"
+    if [ -f "$ALT_CAT_FILE" ]; then
+        CAT_FILE="$ALT_CAT_FILE"
+    fi
+fi
 
 module -q load apptainer
 

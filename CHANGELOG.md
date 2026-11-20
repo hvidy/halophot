@@ -2,6 +2,33 @@
 
 All notable changes to `halophot` are documented in this file.
 
+## [2.0.1] - 2026-11-20
+
+### Fixed
+- **Detector Error Propagation & Coherent `flux_err` (`lightcurve.py`, `halo_tools.py`)**:
+  - Replaced unweighted Euclidean column projection with exact per-cadence WLS oblique column-smear sensitivity ($\tilde{g}_{t,c} = g_c - \phi_w^\top s_{t,c}$) reconstructed from `BKG_BASIS`, `BKG_CHOL`, `PIXEL_QUALITY & PixelQuality.BKG_USED`, and unsubtracted pixel inverse variances (with rank-safe pseudoinverse protection and fallback to `column_orthogonal_smear_weights` only when `BKG_BASIS` or `BKG_USED` is absent).
+  - Added a `float32`-ULP-aware variance floor in `compute_coherent_flux_err` to prevent FITS rounding cancellation in `FLUX_ERR^2 - SMEAR_ERR^2` from collapsing independent pixel noise to `0.0`.
+  - Fixed `pvar_reg` in `extract_halo_lightcurve` to average over finite cadences only (`nanmean` instead of zero-filled `NaN`s) and subtract coherent `SMEAR_ERR^2` alongside background variance.
+- **Outlier Clipping, Split Continuity & Centroids (`lightcurve.py`)**:
+  - Preserved 100% of finite cadences (including deep eclipses such as Algol) in `extract_halo_lightcurve(..., sigclip=True)` so outlier clipping excludes bad cadences only during weight optimization and baseline normalization.
+  - Anchored `normalize=False` multi-segment `split_times` light curves to a common full-sector reference aperture flux so shifting simplex weights between bright and faint halo wings never creates artificial step discontinuities.
+  - Replaced unweighted `estimate_centroids` calls with positive-flux, weightmap-weighted centroids (with safe fallback to unweighted weight-centroids when `denom <= 0`) so negative background-subtracted pixels cannot cause centroid blow-ups.
+- **`HALOCVER = 1` FITS Contract (`_contract.py`)**:
+  - Preserved `POS_CORR1` and `POS_CORR2` columns in HDU 1 of `write_lightcurve_fits` so `lk.read` round-trips pointing corrections cleanly.
+  - Sliced axis `0` of 3D `WEIGHTMAP` and `WEIGHTMAP_ERR` to the surviving contiguous segment range (squeezing to 2D when 1 segment survives) when re-saving time-sliced split light curves so `NSPLITS + 1` always matches the `WEIGHTMAP` segment count.
+- **Spatial Masking & WCS Contaminant Exclusion (`masking.py`, `lightcurve.py`, `cli.py`)**:
+  - Added fallback `target_mag` estimation from TPF headers (`TESSMAG`/`TMAG`/`KEPMAG`) or integrated stamp flux so missing $G < 3$ primaries in Gaia never mistake a faint neighbour for the primary, and prevented blended visual-binary companions ($\alpha$ Cen A/B, Castor A/B) from masking the target core.
+  - Exposed `catalog` in `build_halo_masks` and `extract_halo_lightcurve`, inferred Gaia J2016.0 epoch automatically on Gaia+`Tmag`/`Gmag` tables unless TIC columns indicate J2000, suppressed `ErfaWarning` in `apply_space_motion`, and passed `obs_time` in `halo --deathstar`.
+  - Enabled sky-dominance filtering ($\bar{U}_i - \bar{B}_i \ge \kappa \bar{B}_i$) when `BKGSUB=False`, and switched `BKGSUB=True` sky filtering to dark-orbit 10th-percentile background plus `FLUX_BKG_ERR` uncertainty guards so high-SNR wings under subtracted Earthshine are preserved.
+  - Upgraded saturation detection to 99th-percentile unsubtracted flux (catching partial-sector bleed), always honoured explicit `auto_sat_level` alongside `SAT_BLEED`, converted integrated `electron`/`count` TPFs to `e-/s`, and defaulted `dt_days` for `min_snr` when `flux_err=None`.
+- **Math & Optimization Core (`models.py`, `objectives.py`, `optimise.py`, `simplex.py`)**:
+  - Fixed `lambda_phot` jitter/pulsator `ref_var` calibration, `tv_o2`/`owl` matched `b_hat`, gap-tolerant multi-lag `tv_exp_scan` pair counts, fixed-cadence `gap_tol` for `lag >= 4`, `n_eff`-normalized L-BFGS/jackknife convergence tolerances, leave-one-out negative-mean jackknife stability, and `@in_float64` coverage on public helpers.
+- **CLI, Legacy Tools, Docs & HPC Templates (`cli.py`, `halo_tools.py`, `mkdocs.yml`, `hpc/`)**:
+  - Resolved integer `--split-cadences` and K2 `-c 4` presets on raw unfiltered HDU 1 cadence indices before `quality_bitmask` filtering, warned on mode-mismatched CLI flags, and replaced degree-15 monomial trend fitting with gap-aware Savitzky–Golay detrending.
+  - Fixed inclusive `final_cadence = high - 1` and `(0, len(ts))` boundary handling in `do_lc`.
+  - Hardened Swinburne NT HPC survey scripts with sector-disambiguated GPU output stems, `-sub` catalogue fallback, configurable `MAX_FAIL_FRAC` non-zero exit codes, atomic `.tar.part` -> `mv` Lustre archiving with `$SCRATCH/stage` cleanup, array-size manifest warnings, and `v2.0.1` default Apptainer build refs.
+  - Modernized `mkdocs.yml`, added `[project.optional-dependencies] docs`, and refreshed `docs/notebooks/aldebaran.ipynb` onto the v2.0.1 API.
+
 ## [2.0.0] - 2026-11-14
 
 ### Added

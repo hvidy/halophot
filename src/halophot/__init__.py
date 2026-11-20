@@ -76,7 +76,7 @@ from .simplex import (
 )
 
 name = "halophot"
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 write_fits = write_lightcurve_fits
 

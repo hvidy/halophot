@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from argparse import ArgumentParser, BooleanOptionalAction
 from collections.abc import Sequence
 from os.path import exists, join
@@ -12,8 +13,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 from astropy.io import fits
 from astropy.table import Table
+from astropy.time import Time
 from astropy.wcs import WCS
 from lightkurve.targetpixelfile import TargetPixelFile
+from scipy.signal import savgol_filter
 
 from ._contract import resolve_cache_dir, write_lightcurve_fits
 from .halo_tools import (
@@ -28,6 +31,7 @@ from .halo_tools import (
     translate_greek,
 )
 from .lightcurve import extract_halo_lightcurve
+from .optimise import cadence_scaled_savgol_window
 
 
 def _parse_float_array(text: str) -> np.ndarray:
@@ -265,27 +269,84 @@ def _read_tpf_wcs_and_target(fname: str) -> tuple[WCS | None, tuple[float, float
         return wcs_obj, tgt
 
 
+def _read_tpf_obs_time(fname: str, ts: Table | None = None) -> Time | None:
+    """Resolve mid-observation ``astropy.time.Time`` from TPF timestamps + BJDREF or DATE-OBS."""
+    with fits.open(fname) as hdul:
+        if ts is not None and "time" in ts.colnames:
+            t_arr = np.asarray(ts["time"], dtype=np.float64)
+            t_fin = t_arr[np.isfinite(t_arr)]
+            if t_fin.size > 0:
+                bjdrefi = None
+                bjdreff = 0.0
+                for hdu_idx in (1, 0):
+                    if len(hdul) > hdu_idx and "BJDREFI" in hdul[hdu_idx].header:
+                        bjdrefi = hdul[hdu_idx].header["BJDREFI"]
+                        bjdreff = hdul[hdu_idx].header.get("BJDREFF", 0.0)
+                        break
+                if bjdrefi is not None:
+                    jd_med = float(bjdrefi) + float(bjdreff or 0.0) + float(np.median(t_fin))
+                    if np.isfinite(jd_med):
+                        return Time(jd_med, format="jd", scale="tdb")
+        for hdu_idx in (0, 1):
+            if len(hdul) > hdu_idx:
+                date_obs = hdul[hdu_idx].header.get("DATE-OBS")
+                if isinstance(date_obs, str) and date_obs.strip():
+                    try:
+                        return Time(date_obs.strip(), scale="utc")
+                    except ValueError:
+                        continue
+    return None
+
+
+def _read_raw_tpf_times(fname: str) -> np.ndarray:
+    """Read raw unfiltered ``TIME`` column from HDU 1 of ``fname``."""
+    with fits.open(fname) as hdul:
+        if len(hdul) <= 1 or hdul[1].data is None or "TIME" not in (hdul[1].data.names or ()):
+            raise ValueError(f"TPF {fname!r} lacks a HDU 1 TIME column.")
+        return np.asarray(hdul[1].data["TIME"], dtype=np.float64)
+
+
 def _attach_trend_and_whitened(ts: Table) -> None:
-    """Populate polynomial ``trend`` and ``whitened`` columns on ``ts`` in-place."""
-    finite = np.isfinite(ts["time"]) & np.isfinite(ts["corr_flux"])
-    if not np.any(finite):
+    """Populate gap-aware Savitzky-Golay ``trend`` and ``whitened`` columns on ``ts`` in-place."""
+    fin_idx = np.flatnonzero(np.isfinite(ts["time"]) & np.isfinite(ts["corr_flux"]))
+    if fin_idx.size == 0:
         raise ValueError("No finite timestamps and fluxes survived in detrended light curve.")
-    t_fin = np.asarray(ts["time"][finite], dtype=np.float64)
-    f_fin = np.asarray(ts["corr_flux"][finite], dtype=np.float64)
-    t_span = float(np.ptp(t_fin)) if t_fin.size > 0 else 1.0
-    t_norm = (t_fin - float(np.mean(t_fin))) / (t_span if t_span > 0.0 else 1.0)
-    poly_deg = min(15, max(0, int(np.sum(finite)) - 1))
-    poly = np.poly1d(np.polyfit(t_norm, f_fin, poly_deg))
-    scf = poly(t_norm)
+    t_fin = np.asarray(ts["time"][fin_idx], dtype=np.float64)
+    f_fin = np.asarray(ts["corr_flux"][fin_idx], dtype=np.float64)
 
-    smooth = ts["corr_flux"][finite] - scf + np.nanmedian(scf)
-    smooth /= np.nanmedian(smooth)
+    diffs = np.diff(t_fin)
+    pos_diffs = diffs[diffs > 0.0]
+    dt_nom = float(np.median(pos_diffs)) if pos_diffs.size > 0 else (1.0 / 48.0)
 
-    ts["trend"] = np.nan * np.zeros_like(ts["corr_flux"])
-    ts["trend"][finite] = scf
+    # Split at downlink / safe-mode gaps so smoothing never rings across multi-day breaks.
+    gap_breaks = np.flatnonzero(diffs > 10.0 * dt_nom) + 1
+    seg_bounds = [0, *gap_breaks.tolist(), fin_idx.size]
+    scf = np.empty_like(f_fin)
+    for lo, hi in zip(seg_bounds[:-1], seg_bounds[1:], strict=True):
+        f_seg = f_fin[lo:hi]
+        n_seg = f_seg.size
+        if n_seg >= 5:
+            win = cadence_scaled_savgol_window(dt_nom, window_days=3.0)
+            win = min(win, n_seg if (n_seg % 2 == 1) else (n_seg - 1))
+            if win >= 5:
+                scf[lo:hi] = savgol_filter(f_seg, window_length=win, polyorder=3, mode="interp")
+            else:
+                scf[lo:hi] = savgol_filter(f_seg, window_length=3, polyorder=1, mode="interp")
+        elif n_seg >= 3:
+            scf[lo:hi] = savgol_filter(f_seg, window_length=3, polyorder=1, mode="interp")
+        else:
+            scf[lo:hi] = np.full(n_seg, float(np.median(f_seg)), dtype=np.float64)
 
-    ts["whitened"] = np.nan * np.zeros_like(ts["corr_flux"])
-    ts["whitened"][finite] = smooth
+    smooth = f_fin - scf + float(np.nanmedian(scf))
+    med_smooth = float(np.nanmedian(smooth))
+    if np.isfinite(med_smooth) and abs(med_smooth) > 1e-30:
+        smooth = smooth / med_smooth
+
+    ts["trend"] = np.full(len(ts), np.nan, dtype=np.float64)
+    ts["trend"][fin_idx] = scf
+
+    ts["whitened"] = np.full(len(ts), np.nan, dtype=np.float64)
+    ts["whitened"][fin_idx] = smooth
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -300,6 +361,12 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     fname = join(args.data_dir, args.fname) if args.data_dir else args.fname
     if args.hlsp_fits:
+        if args.random_init:
+            warnings.warn(
+                "--random-init is ignored in --hlsp-fits mode.",
+                UserWarning,
+                stacklevel=2,
+            )
         eff_minflux = -100.0 if args.minflux is None else float(args.minflux)
         eff_thresh = -1.0 if args.thresh is None else float(args.thresh)
 
@@ -346,20 +413,29 @@ def main(argv: Sequence[str] | None = None) -> None:
         hlsp_splits: np.ndarray | None = None
         if args.do_split or args.splits is not None or args.split_cadences is not None:
             t_col = np.asarray(tpf_lk.time.value, dtype=np.float64)
-            ts_hlsp = Table({"time": t_col})
-            split_indices = _resolve_split_indices(
-                ts_hlsp,
-                split_times=args.splits,
-                split_cadences=args.split_cadences,
-                campaign=eff_k2_campaign,
-            )
             if args.splits is not None and args.split_cadences is None:
+                ts_hlsp = Table({"time": t_col})
+                _resolve_split_indices(
+                    ts_hlsp,
+                    split_times=args.splits,
+                    split_cadences=None,
+                    campaign=eff_k2_campaign,
+                )
                 hlsp_splits = np.sort(np.asarray(args.splits, dtype=np.float64).ravel())
             else:
+                # Resolve integer cadence splits against raw unfiltered HDU 1 TIME before
+                # quality_bitmask filtering so --split-cadences and -c 4 match legacy mode.
+                raw_t = _read_raw_tpf_times(fname)
+                split_indices = _resolve_split_indices(
+                    Table({"time": raw_t}),
+                    split_times=None,
+                    split_cadences=args.split_cadences,
+                    campaign=eff_k2_campaign,
+                )
                 split_ts: list[float] = []
                 for idx_s in split_indices:
-                    left_fin = t_col[:idx_s][np.isfinite(t_col[:idx_s])]
-                    right_fin = t_col[idx_s:][np.isfinite(t_col[idx_s:])]
+                    left_fin = raw_t[:idx_s][np.isfinite(raw_t[:idx_s])]
+                    right_fin = raw_t[idx_s:][np.isfinite(raw_t[idx_s:])]
                     if left_fin.size == 0 or right_fin.size == 0:
                         raise ValueError(
                             f"Split cadence index {idx_s} lacks finite flanking timestamps."
@@ -442,6 +518,19 @@ def main(argv: Sequence[str] | None = None) -> None:
                 print(f"Everything saved to {out_png}")
         return
 
+    if args.uncertainty:
+        warnings.warn(
+            "--uncertainty requires --hlsp-fits and is ignored in legacy mode.",
+            UserWarning,
+            stacklevel=2,
+        )
+    if args.legacy_tv:
+        warnings.warn(
+            "--legacy-tv is only used in --hlsp-fits mode and is ignored in legacy mode.",
+            UserWarning,
+            stacklevel=2,
+        )
+
     hdr_mission, hdr_sector, hdr_quarter, hdr_camp = _read_tpf_header_context(fname)
     is_legacy_k2 = (hdr_mission != "TESS") and (hdr_sector is None) and (hdr_quarter is None)
     eff_campaign = (
@@ -491,10 +580,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         if not args.quiet:
             print("Removing background stars")
         wcs_obj, tgt_coord = _read_tpf_wcs_and_target(fname)
+        obs_time_cli = _read_tpf_obs_time(fname, ts)
         tpf = remove_stars(
             tpf,
             wcs=wcs_obj,
             target_coord=tgt_coord,
+            obs_time=obs_time_cli,
             catalog_table=args.catalog_table,
             offline=args.offline,
             cache_dir=resolved_cache_dir,

@@ -24,6 +24,7 @@ import contextlib
 import copy
 import math
 import os
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,7 @@ from astropy.table import Table
 from astropy.time import Time
 from astropy.wcs import WCS
 from astropy.wcs.utils import proj_plane_pixel_scales
+from erfa import ErfaWarning
 from scipy import ndimage
 from scipy.special import erfinv
 
@@ -46,6 +48,7 @@ __all__ = [
     "HaloMaskResult",
     "KEPLER_SAT_RATE_E_PER_S",
     "TESS_SAT_RATE_E_PER_S",
+    "_estimate_target_mag",
     "_resolve_tpf_obs_time",
     "_resolve_tpf_wcs",
     "build_halo_masks",
@@ -265,11 +268,19 @@ def _propagate_catalogue_coords(
 
     ep_col = _find_column_case_insensitive(table_valid, ("ref_epoch", "epoch"))
     lower_names = {c.lower() for c in table_valid.colnames}
-    default_ep = (
-        2016.0
-        if ("gaia" in catalog.lower() or ("phot_g_mean_mag" in lower_names and "tmag" not in lower_names))
-        else 2000.0
+    has_gaia_cols = bool(
+        lower_names
+        & {"source_id", "phot_g_mean_mag", "gmag", "dr3_source_id", "dr2_source_id"}
     )
+    has_tic_cols = bool(lower_names & {"ticid", "posflag"}) or (
+        "id" in lower_names and "tmag" in lower_names and "source_id" not in lower_names
+    )
+    if "gaia" in catalog.lower():
+        default_ep = 2016.0
+    elif has_gaia_cols and not has_tic_cols:
+        default_ep = 2016.0
+    else:
+        default_ep = 2000.0
     if ep_col is not None:
         ep_raw = np.asarray(table_valid[ep_col], dtype=np.float64)
         ref_ep = np.where(np.isfinite(ep_raw) & (ep_raw > 1900.0), ep_raw, default_ep)
@@ -287,16 +298,64 @@ def _propagate_catalogue_coords(
         frame="icrs",
     )
 
-    sc_j2000_pm = sc_motion.apply_space_motion(new_obstime=Time(2000.0, format="jyear", scale="tdb"))
-    coords_j2000 = SkyCoord(ra=sc_j2000_pm.ra, dec=sc_j2000_pm.dec, frame="icrs")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ErfaWarning)
+        sc_j2000_pm = sc_motion.apply_space_motion(
+            new_obstime=Time(2000.0, format="jyear", scale="tdb")
+        )
+        coords_j2000 = SkyCoord(ra=sc_j2000_pm.ra, dec=sc_j2000_pm.dec, frame="icrs")
 
-    if obs_time is not None:
-        sc_obs_pm = sc_motion.apply_space_motion(new_obstime=obs_time)
-        coords_obs = SkyCoord(ra=sc_obs_pm.ra, dec=sc_obs_pm.dec, frame="icrs")
-    else:
-        coords_obs = coords_raw
+        if obs_time is not None:
+            sc_obs_pm = sc_motion.apply_space_motion(new_obstime=obs_time)
+            coords_obs = SkyCoord(ra=sc_obs_pm.ra, dec=sc_obs_pm.dec, frame="icrs")
+        else:
+            coords_obs = coords_raw
 
     return coords_raw, coords_j2000, coords_obs
+
+
+def _estimate_target_mag(
+    *,
+    tpf: Any | None = None,
+    flux: np.ndarray | None = None,
+    mission: str | None = None,
+) -> float | None:
+    """Infer fallback primary target magnitude from TPF header cards or integrated flux."""
+    if tpf is not None:
+        header_sources: list[Any] = []
+        hdul = getattr(tpf, "hdu", None)
+        if hdul is not None and len(hdul) > 0:
+            header_sources.append(hdul[0].header)
+        meta = getattr(tpf, "meta", None)
+        if meta is not None:
+            header_sources.append(meta)
+        for hdr in header_sources:
+            for key in ("TESSMAG", "TMAG", "KEPMAG", "GMAG", "VMAG"):
+                val = hdr.get(key) if hasattr(hdr, "get") else None
+                if val is not None and not isinstance(val, bool):
+                    try:
+                        fval = float(val)
+                    except (TypeError, ValueError):
+                        continue
+                    if np.isfinite(fval):
+                        return fval
+
+    if flux is not None:
+        flux_arr = np.asarray(flux, dtype=np.float64)
+        if flux_arr.ndim == 3 and flux_arr.size > 0:
+            any_fin = np.any(np.isfinite(flux_arr), axis=0)
+            if np.any(any_fin):
+                med_img = np.zeros(flux_arr.shape[1:], dtype=np.float64)
+                med_img[any_fin] = np.nanmedian(flux_arr[:, any_fin], axis=0)
+                sum_pos = float(np.sum(np.maximum(med_img, 0.0)))
+                if np.isfinite(sum_pos) and sum_pos > 0.0:
+                    eff_mission = mission
+                    if eff_mission is None and tpf is not None:
+                        eff_mission = getattr(tpf, "mission", None)
+                    mission_upper = str(eff_mission or "").upper()
+                    zp = 25.3 if mission_upper in ("KEPLER", "K2") else 20.44
+                    return float(zp - 2.5 * math.log10(sum_pos))
+    return None
 
 
 def mask_background_stars(
@@ -407,24 +466,31 @@ def mask_background_stars(
         obs_time=resolved_obs_time,
     )
 
-    inferred_tgt_mag: float | None = float(target_mag) if target_mag is not None else None
+    inferred_tgt_mag: float | None = (
+        float(target_mag)
+        if target_mag is not None and np.isfinite(float(target_mag))
+        else None
+    )
+    tgt_sky: SkyCoord | None = None
+    primary_sky_obs: SkyCoord | None = None
     if target_coord is not None:
+        if isinstance(target_coord, SkyCoord):
+            tgt_sky = target_coord.icrs
+        else:
+            t_ra, t_dec = float(target_coord[0]), float(target_coord[1])
+            tgt_sky = (
+                SkyCoord(ra=t_ra * u.deg, dec=t_dec * u.deg, frame="icrs")
+                if np.isfinite(t_ra) and np.isfinite(t_dec)
+                else None
+            )
         eff_excl_arcsec = (
             max(1.5 * pix_scale_arcsec, 6.0)
             if target_exclusion_arcsec is None
             else float(target_exclusion_arcsec)
         )
-        if eff_excl_arcsec > 0.0:
-            if isinstance(target_coord, SkyCoord):
-                tgt_sky: SkyCoord | None = target_coord.icrs
-            else:
-                t_ra, t_dec = float(target_coord[0]), float(target_coord[1])
-                tgt_sky = (
-                    SkyCoord(ra=t_ra * u.deg, dec=t_dec * u.deg, frame="icrs")
-                    if np.isfinite(t_ra) and np.isfinite(t_dec)
-                    else None
-                )
-            if tgt_sky is not None:
+        if tgt_sky is not None:
+            primary_sky_obs = tgt_sky
+            if eff_excl_arcsec > 0.0:
                 min_sep_arcsec = np.minimum(
                     coords_raw.separation(tgt_sky).arcsec,
                     np.minimum(
@@ -437,22 +503,28 @@ def mask_background_stars(
                     if mag_vals is not None:
                         cand_idx = np.flatnonzero(in_excl)
                         best_idx = cand_idx[int(np.argmin(mag_vals[cand_idx]))]
-                        if inferred_tgt_mag is None:
-                            inferred_tgt_mag = float(mag_vals[best_idx])
-                        if target_exclusion_arcsec is None:
-                            # Exclude only the primary star (and duplicate entries within 2")
-                            # so resolved fainter neighbours inside 1.5 TESS pixels remain masked.
-                            is_primary = (
-                                coords_obs.separation(coords_obs[best_idx]).arcsec <= 2.0
-                            ) & (mag_vals <= mag_vals[best_idx] + 0.5)
-                            keep = ~is_primary
-                        else:
-                            keep = ~in_excl
+                        valid_primary = (
+                            inferred_tgt_mag is None
+                            or float(mag_vals[best_idx]) <= inferred_tgt_mag + 3.0
+                        )
+                        if valid_primary:
+                            primary_sky_obs = coords_obs[best_idx]
+                            if inferred_tgt_mag is None:
+                                inferred_tgt_mag = float(mag_vals[best_idx])
+                            if target_exclusion_arcsec is None:
+                                # Exclude only the primary star (and duplicate entries within 2")
+                                # so resolved fainter neighbours inside 1.5 TESS pixels remain masked.
+                                is_primary = (
+                                    coords_obs.separation(coords_obs[best_idx]).arcsec <= 2.0
+                                ) & (mag_vals <= mag_vals[best_idx] + 0.5)
+                                keep = ~is_primary
+                            else:
+                                keep = ~in_excl
+                            coords_obs = coords_obs[keep]
+                            mag_vals = mag_vals[keep]
                     else:
                         keep = ~in_excl
-                    coords_obs = coords_obs[keep]
-                    if mag_vals is not None:
-                        mag_vals = mag_vals[keep]
+                        coords_obs = coords_obs[keep]
 
     if len(coords_obs) == 0:
         return out_mask
@@ -490,6 +562,22 @@ def mask_background_stars(
         )
     else:
         radii = np.full(col_pix.shape, max(2.0 * sigma_prf_pix, 1.0), dtype=np.float64)
+
+    # Do not mask blended visual-binary companions (e.g. alpha Cen A/B, Castor A/B) inside
+    # the target core radius whose contaminant disc would engulf the target coordinate itself.
+    if target_exclusion_arcsec is None and primary_sky_obs is not None:
+        blend_sep_arcsec = max(1.5 * pix_scale_arcsec, 2.0 * sigma_prf_pix * pix_scale_arcsec)
+        sep_from_primary = coords_obs.separation(primary_sky_obs).arcsec
+        tgt_col_p, tgt_row_p = wcs.celestial.world_to_pixel(primary_sky_obs)
+        dist_to_target_pix = np.hypot(col_pix - float(tgt_col_p), row_pix - float(tgt_row_p))
+        engulfs_target = (sep_from_primary < blend_sep_arcsec) & (dist_to_target_pix <= radii)
+        if np.any(engulfs_target):
+            keep_non_blend = ~engulfs_target
+            if not np.any(keep_non_blend):
+                return out_mask
+            col_pix = col_pix[keep_non_blend]
+            row_pix = row_pix[keep_non_blend]
+            radii = radii[keep_non_blend]
 
     max_r = float(np.max(radii))
     in_box = (
@@ -579,6 +667,16 @@ def remove_stars(
             if ra_t is not None and dec_t is not None:
                 resolved_target = (float(ra_t), float(dec_t))
         resolved_obs_time = obs_time if obs_time is not None else _resolve_tpf_obs_time(tpf)
+        flux_vals_tpf = tpf.flux.value if hasattr(tpf.flux, "value") else np.asarray(tpf.flux)
+        resolved_target_mag = (
+            target_mag
+            if target_mag is not None
+            else _estimate_target_mag(
+                tpf=tpf,
+                flux=flux_vals_tpf,
+                mission=getattr(tpf, "mission", None),
+            )
+        )
 
         ny, nx = int(tpf.flux.shape[1]), int(tpf.flux.shape[2])
         star_mask = mask_background_stars(
@@ -589,7 +687,7 @@ def remove_stars(
             cache_dir=cache_dir,
             strict_hpc=strict_hpc,
             target_coord=resolved_target,
-            target_mag=target_mag,
+            target_mag=resolved_target_mag,
             target_exclusion_arcsec=target_exclusion_arcsec,
             mag_limit=mag_limit,
             radius_pix=radius_pix,
@@ -639,6 +737,9 @@ def remove_stars(
             "remove_stars on a raw 3D flux array requires a celestial astropy.wcs.WCS via wcs=..."
         )
 
+    resolved_arr_mag = (
+        target_mag if target_mag is not None else _estimate_target_mag(flux=arr)
+    )
     star_mask = mask_background_stars(
         wcs,
         (arr.shape[1], arr.shape[2]),
@@ -647,7 +748,7 @@ def remove_stars(
         cache_dir=cache_dir,
         strict_hpc=strict_hpc,
         target_coord=target_coord,
-        target_mag=target_mag,
+        target_mag=resolved_arr_mag,
         target_exclusion_arcsec=target_exclusion_arcsec,
         mag_limit=mag_limit,
         radius_pix=radius_pix,
@@ -664,6 +765,8 @@ def build_halo_masks(
     *,
     flux_err: np.ndarray | None = None,
     flux_bkg: np.ndarray | None = None,
+    flux_bkg_err: np.ndarray | None = None,
+    bkgsub: bool = True,
     pixel_quality: np.ndarray | None = None,
     aperture_mask: np.ndarray | None = None,
     cadence_quality_mask: np.ndarray | None = None,
@@ -675,6 +778,7 @@ def build_halo_masks(
     obs_time: Time | str | float | None = None,
     remove_contaminants: bool = False,
     catalog_table: Table | str | os.PathLike[str] | None = None,
+    catalog: str = "TIC",
     offline: bool = False,
     cache_dir: str | os.PathLike[str] | None = None,
     strict_hpc: bool = True,
@@ -746,11 +850,21 @@ def build_halo_masks(
     else:
         qual_excl = np.zeros((ny, nx), dtype=bool)
 
+    flux_cad = flux_arr[cad_mask]
+    any_finite_pix = np.any(np.isfinite(flux_cad), axis=0)
+    if not np.any(any_finite_pix & base_mask):
+        raise ValueError("No finite pixels exist inside aperture_mask on valid cadences.")
+
     if remove_contaminants or catalog_table is not None:
         if wcs is None or not wcs.has_celestial:
             raise ValueError(
                 "Contaminant star masking requested, but no valid celestial WCS was provided."
             )
+        resolved_tmag = (
+            target_mag
+            if target_mag is not None
+            else _estimate_target_mag(flux=flux_cad, mission=mission)
+        )
         source_excl = mask_background_stars(
             wcs,
             (ny, nx),
@@ -759,20 +873,24 @@ def build_halo_masks(
             cache_dir=cache_dir,
             strict_hpc=strict_hpc,
             target_coord=target_coord,
-            target_mag=target_mag,
+            target_mag=resolved_tmag,
             target_exclusion_arcsec=target_exclusion_arcsec,
             mag_limit=mag_limit,
             radius_pix=star_radius_pix,
             obs_time=obs_time,
+            catalog=catalog,
         )
     else:
         resolve_cache_dir(cache_dir, strict_hpc=strict_hpc, create=False)
         source_excl = np.zeros((ny, nx), dtype=bool)
 
-    flux_cad = flux_arr[cad_mask]
-    any_finite_pix = np.any(np.isfinite(flux_cad), axis=0)
-    if not np.any(any_finite_pix & base_mask):
-        raise ValueError("No finite pixels exist inside aperture_mask on valid cadences.")
+    bkg_arr: np.ndarray | None = None
+    if flux_bkg is not None:
+        bkg_arr = np.asarray(flux_bkg, dtype=np.float64)
+        if bkg_arr.shape != (n_cad, ny, nx):
+            raise ValueError(
+                f"flux_bkg shape {bkg_arr.shape} does not match {(n_cad, ny, nx)}."
+            )
 
     # 2D saturation + vertical bleed + horizontal LDE undershoot dilation.
     structure_2d = np.ones(bleed_dilation, dtype=bool)
@@ -787,24 +905,38 @@ def build_halo_masks(
         else:
             sat_mask = sat_raw
     else:
-        # Automatic physical full-well saturation guard when PIXEL_QUALITY lacks SAT_BLEED.
+        # Automatic physical full-well saturation guard using 99th-percentile unsubtracted flux
+        # to catch partial-sector bleed; always honoured when auto_sat_level is explicitly passed.
         already_flagged = pixel_quality is not None and np.any(
             (np.asarray(pixel_quality, dtype=np.uint16) & np.uint16(PixelQuality.SAT_BLEED)) != 0
         )
-        if auto_sat_level is None:
+        if auto_sat_level is not None:
+            resolved_sat = float(auto_sat_level)
+            apply_auto_sat = resolved_sat > 0.0
+        else:
             mission_upper = str(mission or "").upper()
             resolved_sat = (
                 KEPLER_SAT_RATE_E_PER_S
                 if mission_upper in ("KEPLER", "K2")
                 else TESS_SAT_RATE_E_PER_S
             )
-        else:
-            resolved_sat = float(auto_sat_level)
+            apply_auto_sat = (not already_flagged) and (resolved_sat > 0.0)
 
-        if not already_flagged and resolved_sat > 0.0:
-            med_img = np.full((ny, nx), np.nan, dtype=np.float64)
-            med_img[any_finite_pix] = np.nanmedian(flux_cad[:, any_finite_pix], axis=0)
-            sat_raw = np.isfinite(med_img) & (med_img > resolved_sat)
+        if apply_auto_sat:
+            if bkgsub and bkg_arr is not None:
+                bkg_cad = bkg_arr[cad_mask]
+                flux_for_sat = np.where(
+                    np.isfinite(bkg_cad),
+                    flux_cad + np.maximum(bkg_cad, 0.0),
+                    flux_cad,
+                )
+            else:
+                flux_for_sat = flux_cad
+            p99_img = np.full((ny, nx), np.nan, dtype=np.float64)
+            p99_img[any_finite_pix] = np.nanpercentile(
+                flux_for_sat[:, any_finite_pix], 99.0, axis=0
+            )
+            sat_raw = np.isfinite(p99_img) & (p99_img >= resolved_sat)
             sat_mask = ndimage.binary_dilation(sat_raw, structure=structure_2d)
         else:
             sat_mask = np.zeros((ny, nx), dtype=bool)
@@ -844,22 +976,62 @@ def build_halo_masks(
         # Charnes-Cooper coordinates require strictly positive mean pixel flux.
         sky_excl |= cand_pix & (mean_p <= 0.0)
 
-        if flux_bkg is not None and sky_kappa > 0.0:
-            bkg_arr = np.asarray(flux_bkg, dtype=np.float64)
-            if bkg_arr.shape != (n_cad, ny, nx):
-                raise ValueError(
-                    f"flux_bkg shape {bkg_arr.shape} does not match {(n_cad, ny, nx)}."
-                )
+        if bkg_arr is not None and sky_kappa > 0.0:
             bkg_sub = bkg_arr[cad_mask]
             fin_bkg = bkg_sub[np.isfinite(bkg_sub)]
             if fin_bkg.size > 0 and np.any(fin_bkg != 0.0):
-                med_bkg = np.zeros((ny, nx), dtype=np.float64)
-                for r_idx, c_idx in zip(*np.where(cand_pix), strict=True):
-                    col_b = bkg_sub[:, r_idx, c_idx]
-                    fin_col = col_b[np.isfinite(col_b)]
-                    if fin_col.size > 0:
-                        med_bkg[r_idx, c_idx] = max(float(np.median(fin_col)), 0.0)
-                sky_excl |= cand_pix & (mean_p < float(sky_kappa) * med_bkg)
+                if not bkgsub:
+                    # Unsubtracted FLUX = P + B: enforce P_bar = U_bar - B_bar >= kappa * B_bar.
+                    mean_bkg = np.zeros((ny, nx), dtype=np.float64)
+                    for r_idx, c_idx in zip(*np.where(cand_pix), strict=True):
+                        col_b = bkg_sub[:, r_idx, c_idx]
+                        fin_col = col_b[np.isfinite(col_b)]
+                        if fin_col.size > 0:
+                            mean_bkg[r_idx, c_idx] = max(float(np.mean(fin_col)), 0.0)
+                    sky_excl |= cand_pix & ((mean_p - mean_bkg) < float(sky_kappa) * mean_bkg)
+                else:
+                    # Background-subtracted FLUX = P: guard against background fit uncertainty
+                    # (when flux_bkg_err is provided) and 10th-percentile dark-orbit sky level,
+                    # relaxing the dark-orbit floor if constant Earthshine would wipe out all
+                    # positive-flux wings.
+                    err_excl = np.zeros((ny, nx), dtype=bool)
+                    if flux_bkg_err is not None:
+                        fbe_arr = np.asarray(flux_bkg_err, dtype=np.float64)
+                        if fbe_arr.shape != (n_cad, ny, nx):
+                            raise ValueError(
+                                f"flux_bkg_err shape {fbe_arr.shape} does not match {(n_cad, ny, nx)}."
+                            )
+                        fbe_sub = fbe_arr[cad_mask]
+                        fin_fbe = fbe_sub[np.isfinite(fbe_sub) & (fbe_sub > 0.0)]
+                        if fin_fbe.size > 0:
+                            med_fbe = np.zeros((ny, nx), dtype=np.float64)
+                            for r_idx, c_idx in zip(*np.where(cand_pix), strict=True):
+                                fbe_col = fbe_sub[:, r_idx, c_idx]
+                                pos_fbe = fbe_col[np.isfinite(fbe_col) & (fbe_col > 0.0)]
+                                if pos_fbe.size > 0:
+                                    med_fbe[r_idx, c_idx] = float(np.median(pos_fbe))
+                            err_excl = cand_pix & (mean_p < float(sky_kappa) * med_fbe)
+                            sky_excl |= err_excl
+
+                    dark_bkg = np.zeros((ny, nx), dtype=np.float64)
+                    for r_idx, c_idx in zip(*np.where(cand_pix), strict=True):
+                        col_b = bkg_sub[:, r_idx, c_idx]
+                        fin_col = col_b[np.isfinite(col_b)]
+                        if fin_col.size > 0:
+                            dark_bkg[r_idx, c_idx] = max(
+                                float(np.percentile(fin_col, 10.0)), 0.0
+                            )
+                    dark_excl = cand_pix & (mean_p < float(sky_kappa) * dark_bkg)
+                    if np.any(cand_pix & ~sky_excl & ~dark_excl):
+                        sky_excl |= dark_excl
+                    elif np.any(cand_pix & ~sky_excl):
+                        warnings.warn(
+                            "All positive background-subtracted halo pixels lie below "
+                            "sky_kappa * P10(FLUX_BKG) (elevated subtracted background); "
+                            "falling back to background-uncertainty and SNR filtering.",
+                            UserWarning,
+                            stacklevel=2,
+                        )
 
         if min_snr > 0.0:
             active_for_snr = cand_pix & ~sky_excl
@@ -878,8 +1050,13 @@ def build_halo_masks(
                             med_err = float(np.median(pos_e))
                             if mean_p[r_idx, c_idx] / med_err < float(min_snr):
                                 snr_excl[r_idx, c_idx] = True
-                elif dt_days is not None and dt_days > 0.0:
-                    dt_sec = float(dt_days) * 86400.0
+                else:
+                    eff_dt_days = (
+                        float(dt_days)
+                        if (dt_days is not None and float(dt_days) > 0.0)
+                        else (1.0 / 48.0)
+                    )
+                    dt_sec = eff_dt_days * 86400.0
                     shot_err = np.sqrt(np.maximum(mean_p, 0.0) / max(dt_sec, 1.0))
                     snr_val = np.where(shot_err > 0.0, mean_p / shot_err, 0.0)
                     snr_excl |= active_for_snr & (snr_val < float(min_snr))

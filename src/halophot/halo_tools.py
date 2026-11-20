@@ -29,9 +29,11 @@ from tqdm import tqdm
 from . import halo_objectives as objectives
 from ._contract import (
     BkgCovariance,
+    PixelQuality,
     infer_bkg_poly_order,
     read_bkg_covariance,
     read_bkgsub_state,
+    read_pixel_quality,
     read_smear_err,
 )
 from ._precision import in_float64
@@ -722,7 +724,7 @@ def do_lc(
             if high is None:
                 cad2.append(ts["cadence"][-1])
             else:
-                cad2.append(ts["cadence"][high])
+                cad2.append(ts["cadence"][high - 1])
             sat.append(pmap["sat_pixels"])
             weightmap.append(pmap["weightmap"])
         wmap = {
@@ -736,18 +738,13 @@ def do_lc(
         ts = stitch(tss)
 
     else:
-        if splits[0] is None and splits[1] is not None:
-            c1 = ts["cadence"][0]
-            c2 = ts["cadence"][splits[1]]
-        elif splits[0] is not None and splits[1] is None:
-            c1 = ts["cadence"][splits[0]]
-            c2 = ts["cadence"][-1]
-        elif splits[0] is None and splits[1] is None:
-            c1 = ts["cadence"][0]
-            c2 = ts["cadence"][-1]
-        else:
-            c1 = ts["cadence"][splits[0]]
-            c2 = ts["cadence"][splits[1]]
+        start_idx, stop_idx, _ = slice(splits[0], splits[1]).indices(len(ts))
+        if stop_idx <= start_idx:
+            raise ValueError(
+                f"Empty cadence slice splits={splits!r} for table of length {len(ts)}."
+            )
+        c1 = ts["cadence"][start_idx]
+        c2 = ts["cadence"][stop_idx - 1]
 
         if verbose:
             if splits[0] is None and splits[1] is not None:
@@ -1088,6 +1085,9 @@ def _compute_legacy_tpf_flux_err(
 
     bkgsub = read_bkgsub_state(tpf_obj, warn_legacy_mundey=False)
     bkg_order = infer_bkg_poly_order(tpf_obj)
+    pq_2d = read_pixel_quality(tpf_obj)
+    bg_mask_2d = (pq_2d & np.uint16(PixelQuality.BKG_USED)) != 0
+    bg_mask_arg = bg_mask_2d if np.any(bg_mask_2d) else None
 
     if "weightmaps" in weightmap_dict:
         wmaps_3d = np.asarray(weightmap_dict["weightmaps"], dtype=np.float64)
@@ -1131,6 +1131,7 @@ def _compute_legacy_tpf_flux_err(
                 smear_err=None if se_arr is None else se_arr[sl],
                 bkg_cov=bkg_cov_seg,
                 flux_bkg_err=None if fbe_arr is None else fbe_arr[sl],
+                bg_mask=bg_mask_arg,
                 bkgsub=bkgsub,
                 bkg_order=bkg_order,
                 norm_factor=med_raw,
@@ -1159,6 +1160,7 @@ def _compute_legacy_tpf_flux_err(
         smear_err=se_arr,
         bkg_cov=bkg_cov,
         flux_bkg_err=fbe_arr,
+        bg_mask=bg_mask_arg,
         bkgsub=bkgsub,
         bkg_order=bkg_order,
         norm_factor=med_raw,
@@ -1243,9 +1245,8 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
             that the pixel will be masked out.
             If the string 'all' is passed, all pixels will be used.
             The default behaviour is to use the Kepler pipeline mask.
-         splits : tuple, (None, None) or (2152,2175) etc.
-            A tuple including two times at which to split the light curve and run halo
-            separately outside these splits.
+         split_times : sequence of float, optional
+            Timestamps at which to split the light curve and run halo separately on each segment.
          sub : int
             Do you want to subsample every nth pixel in your light curve? Not advised,
             but can come in handy for very large TPFs.
@@ -1407,9 +1408,8 @@ class halo_tpf_tess(lightkurve.TessTargetPixelFile):
             that the pixel will be masked out.
             If the string 'all' is passed, all pixels will be used.
             The default behaviour is to use the Kepler pipeline mask.
-         splits : tuple, (None, None) or (2152,2175) etc.
-            A tuple including two times at which to split the light curve and run halo
-            separately outside these splits.
+         split_times : sequence of float, optional
+            Timestamps at which to split the light curve and run halo separately on each segment.
          sub : int
             Do you want to subsample every nth pixel in your light curve? Not advised,
             but can come in handy for very large TPFs.
