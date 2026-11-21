@@ -15,8 +15,6 @@ plugins:
       default_handler: python
       handlers:
         python:
-          selection:
+          options:
             docstring_style: "numpy"
-          rendering:
             show_source: false
-      custom_templates: templates

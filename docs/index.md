@@ -48,8 +48,8 @@ wmap = halophot.read_weightmap(lc_reloaded)
 
 `extract_halo_lightcurve` returns a standard `lightkurve.LightCurve` (`KeplerLightCurve` or `TessLightCurve`) with:
 
-- `flux` and unified coherent `flux_err` propagated in `float64` across uncorrelated pixel noise, degree-$\le d$ column-projected `SMEAR_ERR`, and `BKG_CHOL` / `BKG_BASIS` background covariance;
-- flux-weighted aperture centroids in `centroid_col` / `centroid_row` (keeping `pos_corr1` / `pos_corr2` separate);
+- `flux` and unified coherent `flux_err` propagated in `float64` across uncorrelated pixel noise (with a `float32`-ULP cancellation floor), exact WLS oblique column-projected `SMEAR_ERR`, and `BKG_CHOL` / `BKG_BASIS` background covariance;
+- positive-flux, weightmap-weighted aperture centroids in `centroid_col` / `centroid_row` (keeping `pos_corr1` / `pos_corr2` separate and preserved in HDU 1 across `halophot.write_fits` / `lk.read` round-trips);
 - non-transposed `(ny, nx)` `lc.meta['WEIGHTMAP']` (or `(n_splits, ny, nx)` when `split_times` is supplied), preserved losslessly on disk via `halophot.write_fits(lc, path)` and read back via `halophot.read_weightmap(...)`.
 
 Legacy `halo_tpf` / `halo_tpf_tess` subclass shims are **deprecated in v2.0.0** (emitting `DeprecationWarning` in favour of `extract_halo_lightcurve`), while `do_lc` and `legacy_tv=True` remain available for *K2* and `halo-tess` DR1 compatibility. Root-mapped Apptainer (`hpc/virgil_halophot.def`, `hpc/build_halo_sif.sbatch` -> `halo.sif`) and Slurm CPU/A100 survey templates (`hpc/halophot_survey_cpu.sbatch`, `hpc/halophot_survey_gpu.sbatch`) are provided in `hpc/`.

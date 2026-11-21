@@ -7,11 +7,11 @@ Bootstrap: docker
 From: python:3.12.7-bookworm
 
 %arguments
-  # Default to immutable v2.0.0 release tags; for branch/commit builds override via:
+  # Default to immutable v2.0.1 release tags; for branch/commit builds override via:
   #   --build-arg mundey_ref=<sha_or_ref> --build-arg tessbkgd_ref=<sha_or_ref> --build-arg halophot_ref=<sha_or_ref>
-  mundey_ref=v2.0.0
-  tessbkgd_ref=v2.0.0
-  halophot_ref=v2.0.0
+  mundey_ref=v2.0.1
+  tessbkgd_ref=v2.0.1
+  halophot_ref=v2.0.1
 
 %post
   set -eu

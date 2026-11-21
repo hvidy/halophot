@@ -149,3 +149,46 @@ def test_iterators_pass_through_and_invalid_dtype_raises() -> None:
 
     with pytest.raises(ValueError, match="dtype must be"):
         cast_tree(jnp.ones(1), "bfloat16")
+
+
+def test_public_math_apis_run_in_float64_without_global_x64() -> None:
+    """Public simplex, model, objective, and gradient APIs must stay float64 with zero warnings."""
+    assert jax.config.jax_enable_x64 is False
+
+    rng = np.random.default_rng(123)
+    z_np64 = np.linspace(-1.5, 1.5, 7, dtype=np.float64)
+    p_bar = np.geomspace(10.0, 1e5, 8, dtype=np.float64)
+    pix = 1000.0 + rng.normal(0.0, 2.0, size=(6, 48))
+    times = np.arange(48, dtype=np.float64) * (2.0 / 1440.0)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        theta = halophot.ilr_to_simplex(z_np64)
+        z_rt = halophot.simplex_to_ilr(theta)
+        w_phys = halophot.flux_share_to_weights(theta, p_bar)
+        th_rt = halophot.weights_to_flux_share(w_phys, p_bar)
+        z_unif = halophot.uniform_weights_ilr(p_bar)
+        z_from_w = halophot.weights_to_ilr(w_phys, p_bar)
+        phi_tiny = halophot.charbonnier_penalty(np.array([1e-13], dtype=np.float64), epsilon=1e-5)
+
+        obs = halophot.HaloObservation.from_arrays(pix, times)
+        _ = obs.effective_constraint_count()
+        _ = obs.effective_constraint_count(objective="tv_exp", tau=3.0)
+        _ = obs.with_cadence_subset(np.arange(48) >= 4)
+        w_tree = halophot.HaloWeights.from_uniform(obs.mean_pixel_flux)
+        fs = w_tree.flux_shares()
+        pw = w_tree.physical_weights(obs.mean_pixel_flux)
+        lc = w_tree.evaluate_lightcurve(obs)
+        obj_val = halophot.halo_objective(w_tree, obs, objective="tv", epsilon=1e-5)
+        vg_fn = halophot.build_value_and_grad("tv", epsilon=1e-5)
+        loss_val, grad_tree = vg_fn(w_tree, obs)
+
+    assert jax.config.jax_enable_x64 is False
+    assert len(caught) == 0, [str(w.message) for w in caught]
+    for arr in (theta, z_rt, w_phys, th_rt, z_unif, z_from_w, phi_tiny, fs, pw, lc, obj_val, loss_val, grad_tree.z_ilr):
+        assert arr.dtype == jnp.float64
+    np.testing.assert_allclose(np.asarray(z_rt), z_np64, atol=1e-13)
+    np.testing.assert_allclose(np.asarray(th_rt), np.asarray(theta), atol=1e-13)
+    np.testing.assert_allclose(float(phi_tiny[0]), 0.5e-21, rtol=1e-10)
+    assert float(loss_val) == pytest.approx(float(obj_val), rel=1e-13)
+
