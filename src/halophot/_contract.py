@@ -559,6 +559,38 @@ def write_lightcurve_fits(
 
     hdul = lc_export.to_fits()
 
+    # Preserve POS_CORR1 / POS_CORR2 columns in HDU 1 whenever present on lc so downstream
+    # detrenders (e.g. k2sc) retain pointing corrections across FITS round-trips.
+    if len(hdul) > 1 and isinstance(hdul[1], fits.BinTableHDU):
+        existing_col_names = {c.name.upper() for c in hdul[1].columns}
+        lc_colnames = list(getattr(lc, "colnames", ()) or ())
+        lc_col_map = {str(c).lower(): str(c) for c in lc_colnames}
+        extra_cols: list[fits.Column] = []
+        for lc_key, fits_name in (("pos_corr1", "POS_CORR1"), ("pos_corr2", "POS_CORR2")):
+            if fits_name in existing_col_names or lc_key not in lc_col_map:
+                continue
+            raw_col = lc[lc_col_map[lc_key]]
+            col_unit = getattr(raw_col, "unit", None)
+            raw_vals = getattr(raw_col, "value", raw_col)
+            if isinstance(raw_vals, np.ma.MaskedArray):
+                raw_vals = raw_vals.filled(np.nan)
+            col_arr = np.asarray(raw_vals, dtype=np.float32).reshape(-1)
+            if col_arr.shape[0] != len(hdul[1].data):
+                continue
+            if col_unit is not None and col_unit != u.dimensionless_unscaled:
+                col_unit_str = "pixel" if col_unit == u.pixel else col_unit.to_string("fits")
+            else:
+                col_unit_str = "pixel"
+            extra_cols.append(
+                fits.Column(name=fits_name, format="E", unit=col_unit_str, array=col_arr)
+            )
+        if extra_cols:
+            hdul[1] = fits.BinTableHDU.from_columns(
+                hdul[1].columns + fits.ColDefs(extra_cols),
+                header=hdul[1].header,
+                name=hdul[1].name,
+            )
+
     if str(hdul[0].header.get("OBJECT", "")).strip() == "None":
         hdul[0].header["OBJECT"] = ""
     if str(hdul[0].header.get("INSTRUME", "")).strip() == "None":
@@ -623,30 +655,48 @@ def write_lightcurve_fits(
                 hdul[1].header[f"TUNIT{idx_col}"] = unit_str
 
     splits_arr: np.ndarray | None = None
+    seg_slice_range: tuple[int, int, int] | None = None  # (orig_n_segments, s0, s1)
     if resolved_splits is not None:
         cand_splits = np.asarray(resolved_splits, dtype=np.float64).ravel()
-        if splits_from_disk_fallback and hasattr(lc, "time") and getattr(lc, "time", None) is not None:
+        if cand_splits.size > 0 and not np.all(np.isfinite(cand_splits)):
+            raise ValueError("SPLIT_TIMES must contain only finite timestamps.")
+        orig_splits = np.sort(cand_splits)
+        if (
+            orig_splits.size > 0
+            and hasattr(lc, "time")
+            and getattr(lc, "time", None) is not None
+        ):
             t_raw = getattr(lc.time, "value", lc.time)
             t_fin = np.asarray(t_raw, dtype=np.float64)
             t_fin = t_fin[np.isfinite(t_fin)]
-            if t_fin.size >= 2:
+            if t_fin.size >= 1:
                 t_min, t_max = float(np.min(t_fin)), float(np.max(t_fin))
-                cand_splits = cand_splits[(cand_splits > t_min) & (cand_splits < t_max)]
-            else:
+                s0 = int(np.searchsorted(orig_splits, t_min, side="left"))
+                s1 = int(np.searchsorted(orig_splits, t_max, side="left"))
+                seg_slice_range = (int(orig_splits.size) + 1, s0, s1)
+                cand_splits = orig_splits[s0:s1]
+            elif splits_from_disk_fallback:
                 cand_splits = np.empty(0, dtype=np.float64)
         if cand_splits.size > 0:
-            if not np.all(np.isfinite(cand_splits)):
-                raise ValueError("SPLIT_TIMES must contain only finite timestamps.")
             splits_arr = cand_splits
             hdul[0].header["NSPLITS"] = (
                 int(splits_arr.size),
                 "Number of segment split timestamps",
             )
 
+    def _slice_segmented_array(arr: np.ndarray) -> np.ndarray:
+        if seg_slice_range is None or arr.ndim != 3:
+            return arr
+        orig_n_seg, s0, s1 = seg_slice_range
+        if arr.shape[0] != orig_n_seg:
+            return arr
+        sliced = arr[s0 : s1 + 1]
+        return sliced[0] if sliced.shape[0] == 1 else sliced
+
     if resolved_wmap is not None:
         if isinstance(resolved_wmap, np.ma.MaskedArray):
             resolved_wmap = resolved_wmap.filled(np.nan)
-        w_arr = np.asarray(resolved_wmap, dtype=np.float64)
+        w_arr = _slice_segmented_array(np.asarray(resolved_wmap, dtype=np.float64))
         if w_arr.ndim < 2:
             raise ValueError(
                 f"WEIGHTMAP must have at least 2 dimensions (ny, nx), got shape {w_arr.shape}."
@@ -670,7 +720,7 @@ def write_lightcurve_fits(
     if resolved_werr is not None:
         if isinstance(resolved_werr, np.ma.MaskedArray):
             resolved_werr = resolved_werr.filled(np.nan)
-        werr_arr = np.asarray(resolved_werr, dtype=np.float64)
+        werr_arr = _slice_segmented_array(np.asarray(resolved_werr, dtype=np.float64))
         if werr_arr.ndim < 2:
             raise ValueError(
                 f"WEIGHTMAP_ERR must have at least 2 dimensions (ny, nx), got shape {werr_arr.shape}."

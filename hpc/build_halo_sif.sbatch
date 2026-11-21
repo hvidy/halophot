@@ -18,11 +18,11 @@ set -eo pipefail  # omit -u: Lmod reads unset variables (PS1) inside `module loa
 : "${MYFRED:=/fred/${OZ_PROJECT:-oz440}/$USER}"
 : "${SCRATCH:=/aphid/scratch-3month/$USER}"
 
-# Default to immutable v2.0.0 release tags; for pre-tag branch/commit builds override via:
+# Default to immutable v2.0.1 release tags; for pre-tag branch/commit builds override via:
 #   MUNDEY_REF=dev TESSBKGD_REF=dev HALOPHOT_REF=dev sbatch hpc/build_halo_sif.sbatch
-MUNDEY_REF="${MUNDEY_REF:-v2.0.0}"
-TESSBKGD_REF="${TESSBKGD_REF:-v2.0.0}"
-HALOPHOT_REF="${HALOPHOT_REF:-v2.0.0}"
+MUNDEY_REF="${MUNDEY_REF:-v2.0.1}"
+TESSBKGD_REF="${TESSBKGD_REF:-v2.0.1}"
+HALOPHOT_REF="${HALOPHOT_REF:-v2.0.1}"
 
 SUBMIT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
 if [ -n "${DEF_FILE:-}" ]; then

@@ -526,3 +526,160 @@ def test_read_epic_mast_fits_and_cli_smoke(
         assert len(out_hdul) == 2
         assert "corr_flux" in out_hdul[1].data.names
         assert len(out_hdul[1].data) == 80
+
+
+def test_do_lc_inclusive_final_cadence_and_cli_v201_fixes(tmp_path: Path) -> None:
+    """Verify [HALO-IO-10], [HALO-IO-11], and [HALO-IO-04] obs_time + SavGol trend."""
+    # 1. do_lc inclusive final_cadence = high - 1 and (0, len(ts)) without IndexError
+    tpf_arr, ts_tab, _ = _make_synthetic_jitter_tpf(n_cad=60, ny=4, nx=4)
+    _, _, _, wmap_full, _ = do_lc(
+        tpf_arr, ts_tab, (0, len(ts_tab)), sub=1, thresh=0.8, maxiter=5, verbose=False
+    )
+    assert int(wmap_full["initial_cadence"]) == int(ts_tab["cadence"][0])
+    assert int(wmap_full["final_cadence"]) == int(ts_tab["cadence"][-1])
+
+    t_mid = float(np.median(ts_tab["time"]))
+    _, _, _, wmap_sp, _ = do_lc(
+        tpf_arr,
+        ts_tab,
+        (None, None),
+        sub=1,
+        split_times=[t_mid],
+        thresh=0.8,
+        maxiter=5,
+        verbose=False,
+    )
+    assert int(wmap_sp["final_cadence"][0]) < int(wmap_sp["initial_cadence"][1])
+    assert int(wmap_sp["final_cadence"][0]) + 1 == int(wmap_sp["initial_cadence"][1])
+
+    # 2. CLI _read_tpf_obs_time returns valid Time on real K2 C03 fixture
+    assert K2_TPF_FITS.exists()
+    _, ts_k2_full = read_tpf(K2_TPF_FITS)
+    obs_t_k2 = cli._read_tpf_obs_time(str(K2_TPF_FITS), ts_k2_full)
+    assert isinstance(obs_t_k2, Time)
+    assert 2014.0 < float(obs_t_k2.jyear) < 2016.0
+
+    # 3. CLI --split-cadences resolves on raw HDU 1 cadence indices identically across bitmasks
+    mini_k2 = tmp_path / "mini_k2_split_align.fits"
+    with fits.open(K2_TPF_FITS) as hdul:
+        hdul[1].data = hdul[1].data[:80].copy()
+        hdul.writeto(mini_k2, overwrite=True)
+
+    split_times_by_mask: dict[str, float] = {}
+    for bmask in ("default", "hard"):
+        out_dir = tmp_path / f"cli_split_{bmask}"
+        out_dir.mkdir()
+        cli.main(
+            [
+                str(mini_k2),
+                "--hlsp-fits",
+                "--bitmask",
+                bmask,
+                "--do-split",
+                "--split-cadences",
+                "[40]",
+                "--rr",
+                "[1.0,4.5]",
+                "--thresh",
+                "0.8",
+                "--minflux",
+                "50.0",
+                "-maxiter",
+                "15",
+                "--name",
+                f"align_{bmask}",
+                "--quiet",
+                "--save-dir",
+                str(out_dir),
+            ]
+        )
+        from halophot import read_split_times
+
+        st = read_split_times(out_dir / f"align_{bmask}_halo_lc_tv.fits")
+        assert st is not None and len(st) == 1
+        split_times_by_mask[bmask] = float(st[0])
+    assert split_times_by_mask["default"] == pytest.approx(
+        split_times_by_mask["hard"], rel=0.0, abs=1e-12
+    )
+
+    # Passing both --splits and --split-cadences in --hlsp-fits mode MUST raise ValueError
+    with pytest.raises(ValueError, match="Cannot specify both"):
+        cli.main(
+            [
+                str(mini_k2),
+                "--hlsp-fits",
+                "--do-split",
+                "--splits",
+                "[2145.0]",
+                "--split-cadences",
+                "[40]",
+                "--name",
+                "conflict_hlsp",
+                "--quiet",
+                "--save-dir",
+                str(tmp_path),
+            ]
+        )
+
+    # K2 Campaign 7/10/12/13 time cuts apply to raw_t before --split-cadences indexing
+    t_c7 = np.linspace(2460.0, 2540.0, 80)
+    m_c7 = cli._k2_campaign_time_mask(t_c7, 7)
+    assert np.all(t_c7[m_c7] > 2470.0) and int(np.sum(m_c7)) < 80
+
+    # 4. Mode-mismatched CLI flags emit UserWarning
+    warn_dir = tmp_path / "cli_warn"
+    warn_dir.mkdir()
+    with pytest.warns(UserWarning, match="--random-init"):
+        cli.main(
+            [
+                str(mini_k2),
+                "--hlsp-fits",
+                "--random-init",
+                "--rr",
+                "[1.0,4.5]",
+                "--thresh",
+                "0.8",
+                "--minflux",
+                "50.0",
+                "-maxiter",
+                "5",
+                "--name",
+                "warn_hlsp",
+                "--quiet",
+                "--save-dir",
+                str(warn_dir),
+            ]
+        )
+    with pytest.warns(UserWarning, match="--uncertainty"):
+        cli.main(
+            [
+                str(mini_k2),
+                "--uncertainty",
+                "--rr",
+                "[1.0,4.5]",
+                "--thresh",
+                "0.8",
+                "--minflux",
+                "50.0",
+                "-maxiter",
+                "5",
+                "--no-sigclip",
+                "--name",
+                "warn_leg",
+                "--quiet",
+                "--save-dir",
+                str(warn_dir),
+            ]
+        )
+
+    # 5. _attach_trend_and_whitened uses gap-aware SavGol without polynomial ringing across gaps
+    t_part1 = np.linspace(0.0, 12.0, 400)
+    t_part2 = np.linspace(15.5, 27.5, 400)
+    t_gap = np.concatenate([t_part1, t_part2])
+    f_gap = 1.0 + 0.002 * np.sin(2.0 * np.pi * t_gap / 1.5)
+    f_gap[380:400] += np.linspace(0.0, 0.01, 20)
+    ts_gap = Table({"time": t_gap, "corr_flux": f_gap})
+    cli._attach_trend_and_whitened(ts_gap)
+    assert np.all(np.isfinite(ts_gap["trend"]))
+    assert np.all(np.isfinite(ts_gap["whitened"]))
+    assert float(np.ptp(ts_gap["trend"])) < 0.015
