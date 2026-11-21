@@ -13,7 +13,10 @@ def softmax(x):
 
 def make_flux(weights, pixelvector):
     flux = np.dot(softmax(weights).T, pixelvector)
-    return flux / np.mean(flux)
+    mean_f = np.mean(flux)
+    has_signal = np.any(np.abs(pixelvector) > 1e-30)
+    safe_mean = np.where((np.abs(mean_f) > 1e-30) | (~has_signal), mean_f, 1.0)
+    return flux / safe_mean
 
 
 def tv(weights, lag, pixelvector):
@@ -50,7 +53,7 @@ def tv_exp(weights, lag, pixelvector):
 def tv_o2(weights, lag, pixelvector):
     flux = make_flux(weights, pixelvector)
     diff = np.sum(np.abs(2.0 * flux[lag:(-lag)] - flux[(2 * lag) :] - flux[: (-2 * lag)]))
-    return diff / np.mean(flux)
+    return diff
 
 
 def l2v(weights, lag, pixelvector):
@@ -70,8 +73,7 @@ def owl(weights, pixelvector):
     flux = make_flux(weights, pixelvector)
     var = np.var(flux)
     safe_var = np.where(var > 0.0, var, 1.0)
-    diff = np.where(var > 0.0, np.sqrt(safe_var), 0.0)
-    return diff / np.mean(flux)
+    return np.where(var > 0.0, np.sqrt(safe_var), 0.0)
 
 
 available = [tv, tv_o2, l2v, l3v, owl, tv_exp]
