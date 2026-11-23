@@ -1,277 +1,332 @@
-"""Gap-aware Charbonnier total-variation objectives and O(N) scan ``tv_exp``.
+"""Built-in and custom JAX objective functions for halo photometry.
 
-Implements the convex flux-share objective family from Sections 6.3 and 6.4:
+All built-in objectives operate directly on the unit-mean 1D light curve
+``flux = (w @ pixels) / mean(w @ pixels)`` over valid cadences, with gap-safe
+finite-difference masks so spacecraft downlink and safe-mode gaps are never
+bridged.
 
-* Cancellation-free Charbonnier total variation
-  ``phi_eps(r) = r^2 / (sqrt(r^2 + eps^2) + eps)`` strictly over gap-masked
-  lag-``ell`` index sets ``V_ell`` so spacecraft downlink / safe-mode gaps are
-  never bridged by finite differences.
-* O(N) memory ``jax.lax.scan`` multi-lag ``tv_exp`` (``< 10 MB`` RAM at 20-s
-  TESS cadence vs 115.2 GB for an ``N x N`` pairwise difference matrix).
-* Photon-noise regularization ``(lambda_phot / 2) * sum_i theta_i^2 * sigma_tilde_i^2``
-  and ILR logit damping ``(lambda_z / 2) * ||z - z_init||_2^2``.
+Writing a custom objective
+--------------------------
+Pass any JAX function directly as ``objective=my_fn`` to
+:func:`~halophot.optimise_halo` or :func:`~halophot.extract_halo_lightcurve`,
+or register it globally with ``@halophot.register_objective("my_tv")``.
+Supported signatures are inspected automatically before JIT compilation:
+
+* ``def my_fn(flux): ...`` — 1D unit-mean light curve on valid cadences.
+* ``def my_fn(flux, step_mask): ...`` — light curve plus boolean gap-safe
+  difference mask of shape ``(N - lag,)``.
+* Keyword-aware functions accepting any subset of
+  ``(flux, *, step_mask, weights, pixels, times, dt_nom, lag)``.
 """
 
 from __future__ import annotations
 
+import inspect
 import math
+from collections.abc import Callable
+from typing import Any
 
 import jax
 import jax.numpy as jnp
-
-from .models import HaloObservation, HaloWeights
+import numpy as np
 
 __all__ = [
-    "AVAILABLE_OBJECTIVES",
-    "charbonnier_penalty",
-    "halo_objective",
-    "l2v_gap_masked",
-    "l3v_gap_masked",
-    "logit_damping_penalty",
-    "owl_masked",
-    "photon_noise_penalty",
-    "tv_charbonnier_o1",
-    "tv_charbonnier_o2",
-    "tv_exp_scan",
+    "OBJECTIVES",
+    "charbonnier_abs",
+    "compute_step_mask",
+    "l2v",
+    "l3v",
+    "normalized_flux",
+    "owl",
+    "register_objective",
+    "resolve_objective",
+    "tv_exp",
+    "tv_o1",
+    "tv_o2",
 ]
 
-AVAILABLE_OBJECTIVES: tuple[str, ...] = ("tv", "tv_o2", "tv_exp", "l2v", "l3v", "owl")
+OBJECTIVES: dict[str, Callable[..., jax.Array]] = {}
+
+_CONTEXT_KEYS: tuple[str, ...] = (
+    "flux",
+    "step_mask",
+    "weights",
+    "pixels",
+    "times",
+    "dt_nom",
+    "lag",
+    "eps",
+    "tau",
+    "gap_tol",
+)
 
 
-def charbonnier_penalty(r: jax.Array, epsilon: float = 1e-5) -> jax.Array:
-    """Evaluate ``phi_eps(r) = r^2 / (sqrt(r^2 + eps^2) + eps)`` without cancellation.
+def register_objective(
+    name: str,
+) -> Callable[[Callable[..., jax.Array]], Callable[..., jax.Array]]:
+    """Register a JAX objective callable under ``name`` in :data:`OBJECTIVES`."""
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(f"Objective name must be a non-empty string, got {name!r}.")
 
-    Algebraically identical to ``sqrt(r^2 + eps^2) - eps`` in exact arithmetic,
-    this rationalized form avoids catastrophic floating-point cancellation when
-    ``|r| << eps`` and has finite derivatives of all orders at ``r = 0``.
+    def _decorator(fn: Callable[..., jax.Array]) -> Callable[..., jax.Array]:
+        if not callable(fn):
+            raise TypeError(f"Registered objective {name!r} must be callable.")
+        OBJECTIVES[name] = fn
+        return fn
+
+    return _decorator
+
+
+def normalized_flux(weights: jax.Array, pixels: jax.Array) -> jax.Array:
+    """Compute the unit-mean weighted light curve ``(w @ pixels) / mean(w @ pixels)``."""
+    raw_flux = jnp.dot(weights, pixels)
+    mean_f = jnp.mean(raw_flux)
+    safe_mean = jnp.where(jnp.abs(mean_f) > 1e-30, mean_f, 1.0)
+    return raw_flux / safe_mean
+
+
+def charbonnier_abs(x: jax.Array, eps: float | jax.Array) -> jax.Array:
+    """Cancellation-free smooth L1 penalty ``x^2 / (sqrt(x^2 + eps^2) + eps)``.
+
+    Algebraically equal to ``sqrt(x^2 + eps^2) - eps`` in exact arithmetic, but
+    avoids floating-point cancellation for ``|x| << eps`` and has finite
+    derivatives of all orders at ``x = 0``.
     """
-    r_arr = jnp.asarray(r)
-    eps = jnp.maximum(jnp.asarray(epsilon, dtype=r_arr.dtype), jnp.finfo(r_arr.dtype).tiny)
-    r2 = jnp.square(r_arr)
-    return r2 / (jnp.sqrt(r2 + eps * eps) + eps)
+    x_arr = jnp.asarray(x)
+    eps_safe = jnp.maximum(jnp.asarray(eps, dtype=x_arr.dtype), jnp.finfo(x_arr.dtype).tiny)
+    x2 = jnp.square(x_arr)
+    return x2 / (jnp.sqrt(x2 + eps_safe * eps_safe) + eps_safe)
 
 
-def tv_charbonnier_o1(
-    f_tilde: jax.Array,
-    obs: HaloObservation,
+def compute_step_mask(
+    times: np.ndarray,
+    lag: int = 1,
+    dt_nom: float | None = None,
+    gap_tol: float = 0.25,
+) -> np.ndarray:
+    """Return boolean gap-safe mask of shape ``(N - lag,)`` for lag-``lag`` differences."""
+    t_arr = np.asarray(times, dtype=np.float64)
+    n_cad = t_arr.shape[0]
+    if lag < 1 or lag >= n_cad:
+        return np.zeros(0, dtype=bool)
+    if math.isinf(float(gap_tol)):
+        return np.ones(n_cad - lag, dtype=bool)
+    if dt_nom is None:
+        diffs = np.diff(t_arr)
+        pos = diffs[diffs > 0.0]
+        dt_val = float(np.median(pos)) if pos.size > 0 else (1.0 / 48.0)
+    else:
+        dt_val = float(dt_nom)
+    dt_pair = t_arr[lag:] - t_arr[:-lag]
+    return np.abs(dt_pair - float(lag) * dt_val) <= float(gap_tol) * dt_val
+
+
+def _masked_mean(values: jax.Array, mask: jax.Array | None) -> jax.Array:
+    if mask is None:
+        return jnp.mean(values) if values.shape[0] > 0 else jnp.zeros((), dtype=values.dtype)
+    count = jnp.sum(mask.astype(values.dtype))
+    total = jnp.sum(jnp.where(mask, values, 0.0))
+    return jnp.where(count > 0.0, total / jnp.maximum(count, 1.0), 0.0)
+
+
+@register_objective("tv")
+def tv_o1(
+    flux: jax.Array,
+    step_mask: jax.Array | None = None,
     *,
-    epsilon: float = 1e-5,
-) -> tuple[jax.Array, jax.Array]:
-    """Return ``(mean_tv_o1, n_valid_pairs)`` for 1st-order gap-masked Charbonnier TV."""
-    lag = obs.lag
-    if lag >= obs.N_pad:
-        zero = jnp.zeros((), dtype=f_tilde.dtype)
-        return zero, zero
-
-    mask = obs.valid_diff_mask[:-lag]
-    diffs = jnp.where(mask, f_tilde[lag:] - f_tilde[:-lag], 0.0)
-    penalties = jnp.where(mask, charbonnier_penalty(diffs, epsilon=epsilon), 0.0)
-    count = jnp.sum(mask.astype(f_tilde.dtype))
-    mean_tv = jnp.where(count > 0.0, jnp.sum(penalties) / jnp.maximum(count, 1.0), 0.0)
-    return mean_tv, count
+    lag: int = 1,
+    eps: float | jax.Array = 1e-5,
+) -> jax.Array:
+    """1st-order gap-safe Charbonnier total variation."""
+    if lag >= flux.shape[0]:
+        return jnp.zeros((), dtype=flux.dtype)
+    diffs = flux[lag:] - flux[:-lag]
+    return _masked_mean(charbonnier_abs(diffs, eps), step_mask)
 
 
-def tv_charbonnier_o2(
-    f_tilde: jax.Array,
-    obs: HaloObservation,
+@register_objective("tv_o2")
+def tv_o2(
+    flux: jax.Array,
+    step_mask: jax.Array | None = None,
     *,
-    epsilon: float = 1e-5,
-) -> tuple[jax.Array, jax.Array]:
-    """Return ``(mean_tv_o2, n_valid_triples)`` for 2nd-order gap-masked Charbonnier TV."""
-    lag = obs.lag
-    if 2 * lag >= obs.N_pad:
-        zero = jnp.zeros((), dtype=f_tilde.dtype)
-        return zero, zero
-
-    mask = obs.valid_diff_mask[: -2 * lag] & obs.valid_diff_mask[lag:-lag]
-    diffs2 = jnp.where(
-        mask,
-        2.0 * f_tilde[lag:-lag] - f_tilde[2 * lag :] - f_tilde[: -2 * lag],
-        0.0,
-    )
-    penalties = jnp.where(mask, charbonnier_penalty(diffs2, epsilon=epsilon), 0.0)
-    count = jnp.sum(mask.astype(f_tilde.dtype))
-    mean_tv = jnp.where(count > 0.0, jnp.sum(penalties) / jnp.maximum(count, 1.0), 0.0)
-    return mean_tv, count
+    lag: int = 1,
+    eps: float | jax.Array = 1e-5,
+) -> jax.Array:
+    """2nd-order gap-safe Charbonnier total variation."""
+    if 2 * lag >= flux.shape[0]:
+        return jnp.zeros((), dtype=flux.dtype)
+    diffs2 = 2.0 * flux[lag:-lag] - flux[2 * lag :] - flux[: -2 * lag]
+    mask2 = None if step_mask is None else (step_mask[:-lag] & step_mask[lag:])
+    return _masked_mean(charbonnier_abs(diffs2, eps), mask2)
 
 
-def tv_exp_scan(
-    f_tilde: jax.Array,
-    obs: HaloObservation,
+@register_objective("tv_exp")
+def tv_exp(
+    flux: jax.Array,
     *,
+    times: jax.Array | None = None,
+    dt_nom: float | jax.Array | None = None,
+    lag: int = 1,
     tau: float | None = None,
-    epsilon: float = 1e-5,
-) -> tuple[jax.Array, jax.Array]:
-    """Evaluate multi-lag exponential TV via ``jax.lax.scan`` in O(N) memory.
-
-    Accumulates ``sum_{ell=1}^{L_max} exp(-ell / tau) * L_TV^(1)(ell)`` normalized
-    by ``sum_{ell=1}^{L_max} exp(-ell / tau)`` over ``L_max = min(ceil(4 * tau), N - 1)``
-    with per-step gradient checkpointing so reverse-mode AD never materializes an
-    ``(L_max, N)`` or ``(N, N)`` tensor.
-    """
-    tau_val = float(obs.lag) if tau is None else float(tau)
+    eps: float | jax.Array = 1e-5,
+    gap_tol: float = 0.25,
+) -> jax.Array:
+    """Multi-lag exponentially weighted TV evaluated in O(N) memory via ``jax.lax.scan``."""
+    tau_val = float(lag) if tau is None else float(tau)
     if tau_val <= 0.0:
         raise ValueError(f"tau must be > 0, got {tau_val!r}.")
-
-    n_pad = obs.N_pad
-    scan_len = min(max(int(math.ceil(4.0 * tau_val)), 1), n_pad - 1)
+    n_cad = flux.shape[0]
+    scan_len = min(max(int(math.ceil(4.0 * tau_val)), 1), n_cad - 1)
     if scan_len < 1:
-        zero = jnp.zeros((), dtype=f_tilde.dtype)
-        return zero, zero
+        return jnp.zeros((), dtype=flux.dtype)
 
-    idx = jnp.arange(n_pad, dtype=jnp.int32)
-    tau_arr = jnp.asarray(tau_val, dtype=f_tilde.dtype)
-    gap_tol = obs.gap_tol
+    idx = jnp.arange(n_cad, dtype=jnp.int32)
+    tau_arr = jnp.asarray(tau_val, dtype=flux.dtype)
+    check_gaps = times is not None and dt_nom is not None and not math.isinf(float(gap_tol))
 
     @jax.checkpoint
-    def _scan_step(
-        carry: tuple[jax.Array, jax.Array],
-        ell: jax.Array,
-    ) -> tuple[tuple[jax.Array, jax.Array], None]:
+    def _scan_step(carry: tuple[jax.Array, jax.Array], ell: jax.Array):
         num_acc, den_acc = carry
-        in_bounds = idx < (n_pad - ell)
-        both_active = in_bounds & obs.valid_cadence_mask & jnp.roll(obs.valid_cadence_mask, -ell)
+        in_bounds = idx < (n_cad - ell)
+        if check_gaps:
+            assert times is not None and dt_nom is not None
+            dt_pair = jnp.roll(times, -ell) - times
+            expected_dt = ell.astype(times.dtype) * dt_nom
+            mask = in_bounds & (jnp.abs(dt_pair - expected_dt) <= float(gap_tol) * dt_nom)
+        else:
+            mask = in_bounds
+        diffs = jnp.where(mask, jnp.roll(flux, -ell) - flux, 0.0)
+        phi = jnp.where(mask, charbonnier_abs(diffs, eps), 0.0)
+        count = jnp.sum(mask.astype(flux.dtype))
+        mean_ell = jnp.where(count > 0.0, jnp.sum(phi) / jnp.maximum(count, 1.0), 0.0)
+        w_ell = jnp.where(count > 0.0, jnp.exp(-ell.astype(flux.dtype) / tau_arr), 0.0)
+        return (num_acc + w_ell * mean_ell, den_acc + w_ell), None
 
-        dt_pair = jnp.roll(obs.times_padded, -ell) - obs.times_padded
-        expected_dt = ell.astype(obs.times_padded.dtype) * obs.dt_nom
-        tol_ok = (
-            jnp.ones_like(dt_pair, dtype=jnp.bool_)
-            if math.isinf(float(gap_tol))
-            else (jnp.abs(dt_pair - expected_dt) <= gap_tol * expected_dt)
-        )
-        mask_ell = both_active & tol_ok
-
-        diffs = jnp.where(mask_ell, jnp.roll(f_tilde, -ell) - f_tilde, 0.0)
-        phi = jnp.where(mask_ell, charbonnier_penalty(diffs, epsilon=epsilon), 0.0)
-        count = jnp.sum(mask_ell.astype(f_tilde.dtype))
-        l_tv_ell = jnp.where(count > 0.0, jnp.sum(phi) / jnp.maximum(count, 1.0), 0.0)
-
-        active_lag = (ell < obs.n_valid) & (count > 0.0)
-        w_ell = jnp.where(active_lag, jnp.exp(-ell.astype(f_tilde.dtype) / tau_arr), 0.0)
-        return (num_acc + w_ell * l_tv_ell, den_acc + w_ell), None
-
-    lags = jnp.arange(1, scan_len + 1, dtype=jnp.int32)
-    zero = jnp.zeros((), dtype=f_tilde.dtype)
-    (num_sum, den_sum), _ = jax.lax.scan(_scan_step, (zero, zero), lags)
-    l_tv_exp = jnp.where(den_sum > 0.0, num_sum / jnp.maximum(den_sum, 1e-30), 0.0)
-
-    n_eff = jnp.sum(obs.valid_diff_mask.astype(f_tilde.dtype))
-    return l_tv_exp, n_eff
-
-
-def l2v_gap_masked(
-    f_tilde: jax.Array,
-    obs: HaloObservation,
-) -> tuple[jax.Array, jax.Array]:
-    """Return ``(mean_l2v, n_valid_pairs)`` for gap-masked squared 1st differences."""
-    lag = obs.lag
-    if lag >= obs.N_pad:
-        zero = jnp.zeros((), dtype=f_tilde.dtype)
-        return zero, zero
-
-    mask = obs.valid_diff_mask[:-lag]
-    diffs = jnp.where(mask, f_tilde[lag:] - f_tilde[:-lag], 0.0)
-    sq = jnp.where(mask, jnp.square(diffs), 0.0)
-    count = jnp.sum(mask.astype(f_tilde.dtype))
-    mean_l2 = jnp.where(count > 0.0, jnp.sum(sq) / jnp.maximum(count, 1.0), 0.0)
-    return mean_l2, count
-
-
-def l3v_gap_masked(
-    f_tilde: jax.Array,
-    obs: HaloObservation,
-    *,
-    epsilon: float = 1e-5,
-) -> tuple[jax.Array, jax.Array]:
-    """Return ``(mean_l3v, n_valid_pairs)`` using strictly convex smooth ``r^2 * phi_eps(r)``."""
-    lag = obs.lag
-    if lag >= obs.N_pad:
-        zero = jnp.zeros((), dtype=f_tilde.dtype)
-        return zero, zero
-
-    mask = obs.valid_diff_mask[:-lag]
-    diffs = jnp.where(mask, f_tilde[lag:] - f_tilde[:-lag], 0.0)
-    cubic_smooth = jnp.square(diffs) * charbonnier_penalty(diffs, epsilon=epsilon)
-    vals = jnp.where(mask, cubic_smooth, 0.0)
-    count = jnp.sum(mask.astype(f_tilde.dtype))
-    mean_l3 = jnp.where(count > 0.0, jnp.sum(vals) / jnp.maximum(count, 1.0), 0.0)
-    return mean_l3, count
-
-
-def owl_masked(
-    f_tilde: jax.Array,
-    obs: HaloObservation,
-    *,
-    epsilon: float = 1e-5,
-) -> tuple[jax.Array, jax.Array]:
-    """Return ``(smooth_std, n_active_cadences)`` over active cadences."""
-    mask = obs.valid_cadence_mask.astype(f_tilde.dtype)
-    count = jnp.sum(mask)
-    safe_count = jnp.maximum(count, 1.0)
-    mean_f = jnp.sum(mask * f_tilde) / safe_count
-    centered = jnp.where(obs.valid_cadence_mask, f_tilde - mean_f, 0.0)
-    var_f = jnp.sum(jnp.square(centered)) / safe_count
-    eps = jnp.maximum(jnp.asarray(epsilon, dtype=f_tilde.dtype), jnp.finfo(f_tilde.dtype).tiny)
-    smooth_std = var_f / (jnp.sqrt(var_f + eps * eps) + eps)
-    return smooth_std, count
-
-
-def photon_noise_penalty(theta: jax.Array, obs: HaloObservation) -> jax.Array:
-    """Evaluate ``(lambda_phot / 2) * sum_i theta_i^2 * mean_frac_var_i``."""
-    return 0.5 * obs.lambda_phot * jnp.sum(jnp.square(theta) * obs.mean_frac_var)
-
-
-def logit_damping_penalty(z_ilr: jax.Array, obs: HaloObservation) -> jax.Array:
-    """Evaluate ``(lambda_z / 2) * ||z_ilr - z_prior_centre||_2^2``."""
-    if z_ilr.shape[0] == 0:
-        return jnp.zeros((), dtype=z_ilr.dtype)
-    diff = z_ilr - obs.z_prior_centre
-    return 0.5 * obs.lambda_z * jnp.sum(jnp.square(diff))
-
-
-def halo_objective(
-    weights: HaloWeights,
-    obs: HaloObservation,
-    *,
-    objective: str = "tv",
-    epsilon: float = 1e-5,
-    tau: float | None = None,
-) -> jax.Array:
-    """Evaluate the regularized v2.0 halo photometry objective ``J(z)`` (Eq. 6.4)."""
-    if objective not in AVAILABLE_OBJECTIVES:
-        valid = ", ".join(AVAILABLE_OBJECTIVES)
-        raise ValueError(f"Unknown objective {objective!r}; expected one of: {valid}.")
-    if epsilon <= 0.0:
-        raise ValueError(f"epsilon must be > 0, got {epsilon!r}.")
-
-    f_tilde = weights.evaluate_lightcurve(obs)
-    b_scale = jnp.maximum(obs.b_hat, jnp.finfo(f_tilde.dtype).tiny)
-
-    if objective == "tv":
-        mean_val, count = tv_charbonnier_o1(f_tilde, obs, epsilon=epsilon)
-        data_term = (count / b_scale) * mean_val
-    elif objective == "tv_o2":
-        mean_val, count = tv_charbonnier_o2(f_tilde, obs, epsilon=epsilon)
-        data_term = (count / b_scale) * mean_val
-    elif objective == "tv_exp":
-        mean_val, count = tv_exp_scan(f_tilde, obs, tau=tau, epsilon=epsilon)
-        data_term = (count / b_scale) * mean_val
-    elif objective == "l2v":
-        mean_val, count = l2v_gap_masked(f_tilde, obs)
-        data_term = (count / jnp.square(b_scale)) * mean_val
-    elif objective == "l3v":
-        mean_val, count = l3v_gap_masked(f_tilde, obs, epsilon=epsilon)
-        data_term = (count / (b_scale * jnp.square(b_scale))) * mean_val
-    else:  # objective == "owl"
-        std_val, count = owl_masked(f_tilde, obs, epsilon=epsilon)
-        data_term = std_val if weights.legacy_tv else (count / b_scale) * std_val
-
-    if weights.legacy_tv:
-        return data_term
-
-    theta = weights.flux_shares()
-    return (
-        data_term
-        + photon_noise_penalty(theta, obs)
-        + logit_damping_penalty(weights.z_ilr, obs)
+    zero = jnp.zeros((), dtype=flux.dtype)
+    (num_sum, den_sum), _ = jax.lax.scan(
+        _scan_step, (zero, zero), jnp.arange(1, scan_len + 1, dtype=jnp.int32)
     )
+    return jnp.where(den_sum > 0.0, num_sum / jnp.maximum(den_sum, 1e-30), 0.0)
+
+
+@register_objective("l2v")
+def l2v(
+    flux: jax.Array,
+    step_mask: jax.Array | None = None,
+    *,
+    lag: int = 1,
+) -> jax.Array:
+    """Gap-safe mean squared 1st difference."""
+    if lag >= flux.shape[0]:
+        return jnp.zeros((), dtype=flux.dtype)
+    diffs = flux[lag:] - flux[:-lag]
+    return _masked_mean(jnp.square(diffs), step_mask)
+
+
+@register_objective("l3v")
+def l3v(
+    flux: jax.Array,
+    step_mask: jax.Array | None = None,
+    *,
+    lag: int = 1,
+    eps: float | jax.Array = 1e-5,
+) -> jax.Array:
+    """Gap-safe smooth cubic 1st difference ``r^2 * charbonnier_abs(r, eps)``."""
+    if lag >= flux.shape[0]:
+        return jnp.zeros((), dtype=flux.dtype)
+    diffs = flux[lag:] - flux[:-lag]
+    return _masked_mean(jnp.square(diffs) * charbonnier_abs(diffs, eps), step_mask)
+
+
+@register_objective("owl")
+def owl(
+    flux: jax.Array,
+    *,
+    eps: float | jax.Array = 1e-5,
+) -> jax.Array:
+    """Smooth standard deviation of the light curve."""
+    centered = flux - jnp.mean(flux)
+    var_f = jnp.mean(jnp.square(centered))
+    eps_safe = jnp.maximum(jnp.asarray(eps, dtype=flux.dtype), jnp.finfo(flux.dtype).tiny)
+    return var_f / (jnp.sqrt(var_f + eps_safe * eps_safe) + eps_safe)
+
+
+def resolve_objective(
+    objective: str | Callable[..., Any],
+) -> tuple[str, Callable[..., jax.Array]]:
+    """Resolve an objective name or custom JAX callable into a uniform evaluator.
+
+    Inspects ``inspect.signature`` once before JIT so custom student objectives
+    with signatures ``(flux)``, ``(flux, step_mask)``, or any keyword subset of
+    ``(flux, *, step_mask, weights, pixels, times, dt_nom, lag)`` all work
+    without editing ``halophot`` internals.
+    """
+    if isinstance(objective, str):
+        if objective not in OBJECTIVES:
+            valid = ", ".join(sorted(OBJECTIVES))
+            raise ValueError(f"Unknown objective {objective!r}; expected one of: {valid}.")
+        name = objective
+        fn = OBJECTIVES[objective]
+    elif callable(objective):
+        name = getattr(objective, "__name__", "custom")
+        fn = objective
+    else:
+        raise TypeError(
+            f"objective must be a registered objective name or callable, got {type(objective).__name__}."
+        )
+
+    sig = inspect.signature(fn)
+    params = list(sig.parameters.values())
+    pos_params = [
+        p
+        for p in params
+        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    kw_only_params = [p for p in params if p.kind == inspect.Parameter.KEYWORD_ONLY]
+    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+
+    all_pos_named = all(
+        p.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD and p.name in _CONTEXT_KEYS
+        for p in pos_params
+    )
+
+    pos_keys: list[str] = []
+    kw_keys: list[str] = []
+    if all_pos_named:
+        kw_keys.extend(p.name for p in pos_params)
+    else:
+        fallbacks = ["flux", "step_mask"]
+        for p in pos_params:
+            if p.name in _CONTEXT_KEYS:
+                pos_keys.append(p.name)
+                if p.name in fallbacks:
+                    fallbacks.remove(p.name)
+            elif fallbacks:
+                pos_keys.append(fallbacks.pop(0))
+            elif p.default is inspect.Parameter.empty:
+                raise TypeError(
+                    f"Custom objective {name!r} has unsupported required positional parameter "
+                    f"{p.name!r}; supported names: {_CONTEXT_KEYS[:7]}."
+                )
+
+    for p in kw_only_params:
+        if p.name in _CONTEXT_KEYS:
+            kw_keys.append(p.name)
+        elif p.default is inspect.Parameter.empty:
+            raise TypeError(
+                f"Custom objective {name!r} has unsupported required keyword parameter "
+                f"{p.name!r}; supported names: {_CONTEXT_KEYS[:7]}."
+            )
+
+    bound = set(pos_keys) | set(kw_keys)
+
+    def _wrapped(**ctx: Any) -> jax.Array:
+        args = [ctx[k] for k in pos_keys]
+        kwargs = {k: ctx[k] for k in kw_keys}
+        if has_var_kw:
+            for k in _CONTEXT_KEYS:
+                if k not in bound:
+                    kwargs[k] = ctx[k]
+        return fn(*args, **kwargs)
+
+    return name, _wrapped

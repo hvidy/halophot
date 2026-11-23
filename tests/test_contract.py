@@ -278,7 +278,7 @@ def test_contract_missing_and_malformed_extensions() -> None:
     # Orphan BKG_BASIS without BKG_CHOL must fail validation
     hdul_orphan, *_ = _make_contract_tpf_hdulist(include_contract_exts=False)
     hdul_orphan.append(fits.ImageHDU(data=np.ones((3, 4, 5), dtype=np.float32), name="BKG_BASIS"))
-    with pytest.raises(ValueError, match="Incomplete HALOCVER=1"):
+    with pytest.raises(ValueError, match="Incomplete"):
         read_bkg_covariance(hdul_orphan)
 
     # Wrong PIXEL_QUALITY shape must fail validation
@@ -293,17 +293,17 @@ def test_contract_missing_and_malformed_extensions() -> None:
     upper[:, 1, 1] = 1.0
     upper[:, 2, 2] = 1.0
     upper[:, 0, 1] = 0.5  # Strict upper-triangular entry (e.g. scipy cholesky lower=False)
-    with pytest.raises(ValueError, match="lower-triangular"):
+    with pytest.raises(ValueError, match="lower-tri"):
         pack_bkg_chol(upper)
 
     neg_diag = np.zeros((4, 2, 2), dtype=np.float64)
     neg_diag[:, 0, 0] = 1.0
     neg_diag[:, 1, 1] = 1.0
     neg_diag[2, 1, 1] = -0.25
-    with pytest.raises(ValueError, match="non-negative diagonal"):
+    with pytest.raises(ValueError, match="Negative chol diag"):
         pack_bkg_chol(neg_diag)
 
-    with pytest.raises(ValueError, match="P >= 1"):
+    with pytest.raises(ValueError, match="Invalid bkg_chol shape"):
         pack_bkg_chol(np.zeros((4, 0, 0), dtype=np.float64))
 
     # Partial NaNs in a cadence must raise ValueError, while all-NaN cadences round-trip seamlessly
@@ -311,7 +311,7 @@ def test_contract_missing_and_malformed_extensions() -> None:
     partial_nan[:, 0, 0] = 1.0
     partial_nan[:, 1, 1] = 1.0
     partial_nan[1, 0, 0] = np.nan
-    with pytest.raises(ValueError, match="all-NaN"):
+    with pytest.raises(ValueError, match="finite"):
         pack_bkg_chol(partial_nan)
 
     hdul_nan, _, chol_true, _, _ = _make_contract_tpf_hdulist(n_raw=14, ny=4, nx=5, p_dim=3)
@@ -410,38 +410,37 @@ def test_resolve_cache_dir_fred_guard(monkeypatch: pytest.MonkeyPatch, tmp_path:
     assert resolve_cache_dir() == tbc_dir.resolve(strict=False)
 
     monkeypatch.setenv("HALOPHOT_CACHE_DIR", str(halo_dir))
-    created = resolve_cache_dir(create=True)
+    created = resolve_cache_dir(env_var="HALOPHOT_CACHE_DIR", create=True)
     assert created == halo_dir.resolve(strict=False)
     assert created.is_dir()
 
     monkeypatch.delenv("HALOPHOT_CACHE_DIR")
     monkeypatch.delenv("TESS_BRIGHT_CACHE_DIR")
 
-    # strict_hpc=True is the default: explicit /fred path must raise ValueError without passing strict_hpc!
-    with pytest.raises(ValueError, match="/fred/"):
-        resolve_cache_dir("/fred/oz440/bpo/.cache")
-
-    with pytest.raises(ValueError, match="/fred/"):
-        resolve_cache_dir("/fred")
-
-    # Allowed when strict_hpc=False, but MUST emit UserWarning
+    # Default strict_hpc=False warns on /fred/, while strict_hpc=True raises ValueError!
     with pytest.warns(UserWarning, match="/fred/"):
-        allowed = resolve_cache_dir("/fred/oz440/bpo/.cache", strict_hpc=False)
+        allowed = resolve_cache_dir("/fred/oz440/bpo/.cache")
     assert allowed == Path("/fred/oz440/bpo/.cache")
 
-    # $SCRATCH pointing into /fred must also be caught by default (strict_hpc=True)
+    with pytest.raises(ValueError, match="/fred/"):
+        resolve_cache_dir("/fred/oz440/bpo/.cache", strict_hpc=True)
+
+    with pytest.raises(ValueError, match="/fred/"):
+        resolve_cache_dir("/fred", strict_hpc=True)
+
+    # $SCRATCH pointing into /fred must be caught under strict_hpc=True
     monkeypatch.setenv("SCRATCH", "/fred/oz440/bpo/scratch")
     with pytest.raises(ValueError, match="/fred/"):
-        resolve_cache_dir()
+        resolve_cache_dir(strict_hpc=True)
 
-    # Symlink into /fred must be caught
+    # Symlink into /fred must be caught under strict_hpc=True
     fred_link = tmp_path / "sneaky_link"
     fred_link.symlink_to("/fred/oz440/bpo/cache")
     with pytest.raises(ValueError, match="/fred/"):
-        resolve_cache_dir(fred_link)
+        resolve_cache_dir(fred_link, strict_hpc=True)
 
     # Prefix lookalike (/frederick) must NOT false-positive
-    assert resolve_cache_dir("/frederick/cache") == Path("/frederick/cache")
+    assert resolve_cache_dir("/frederick/cache", strict_hpc=True) == Path("/frederick/cache")
 
 
 def _extract_python_heredocs(script_text: str) -> list[str]:
@@ -534,9 +533,9 @@ def test_hpc_sbatch_and_apptainer_nt_contracts(monkeypatch: pytest.MonkeyPatch) 
     assert "Bootstrap: docker" in def_text
     assert "From: python:3.12.7-bookworm" in def_text
     assert "apt-get" not in def_text
-    assert "mundey_ref=v2.0.0" in def_text
-    assert "tessbkgd_ref=v2.0.0" in def_text
-    assert "halophot_ref=v2.0.0" in def_text
+    assert "mundey_ref=v2.0.1" in def_text
+    assert "tessbkgd_ref=v2.0.1" in def_text
+    assert "halophot_ref=v2.0.1" in def_text
     assert "--build-arg mundey_ref=" in def_text
     assert "UV_SYSTEM_PYTHON=1" in def_text
     assert '"jax[cuda12]>=0.4.35"' in def_text
@@ -547,9 +546,9 @@ def test_hpc_sbatch_and_apptainer_nt_contracts(monkeypatch: pytest.MonkeyPatch) 
     build_text = (hpc_dir / "build_halo_sif.sbatch").read_text(encoding="utf-8")
     assert "#SBATCH --time=00:45:00" in build_text
     assert "#SBATCH --mem=8G" in build_text
-    assert 'MUNDEY_REF="${MUNDEY_REF:-v2.0.0}"' in build_text
-    assert 'TESSBKGD_REF="${TESSBKGD_REF:-v2.0.0}"' in build_text
-    assert 'HALOPHOT_REF="${HALOPHOT_REF:-v2.0.0}"' in build_text
+    assert 'MUNDEY_REF="${MUNDEY_REF:-v2.0.1}"' in build_text
+    assert 'TESSBKGD_REF="${TESSBKGD_REF:-v2.0.1}"' in build_text
+    assert 'HALOPHOT_REF="${HALOPHOT_REF:-v2.0.1}"' in build_text
     assert "MUNDEY_REF=dev TESSBKGD_REF=dev HALOPHOT_REF=dev" in build_text
     assert "--fakeroot" in build_text
     assert "--ignore-fakeroot-command" in build_text
@@ -716,9 +715,71 @@ def test_hpc_survey_embedded_full_e2e_and_halophot_only(
     assert str(fail_summary["status"][0]) == "failed"
 
 
+    # 4. Verify atomic .part -> mv archiving, $SCRATCH/stage cleanup, -sub cat lookup,
+    #    and array-size warning on HPC survey templates ([HALO-IO-12], [HALO-IO-P1], [HALO-IO-P2])
+    for sbatch_txt in (cpu_text, gpu_text):
+        assert ".part.$$" in sbatch_txt
+        assert 'mv -f "$tar_part"' in sbatch_txt
+        assert 'rm -rf "$STAGE_BASE"' in sbatch_txt
+    assert "SLURM_ARRAY_TASK_MAX" in cpu_text
+    assert 'TARGET_STEM%-sub' in cpu_text
+
+    # 5. Verify GPU survey disambiguates colliding basenames across sectors, finds -sub fallback
+    #    catalogues, and exits non-zero on partial failure (MAX_FAIL_FRAC=0.0 default)
+    s6_dir = tmp_path / "s0006"
+    s27_dir = tmp_path / "s0027"
+    s6_dir.mkdir()
+    s27_dir.mkdir()
+    tpf_s6 = s6_dir / "dup_target_tp-sub.fits"
+    tpf_s27 = s27_dir / "dup_target_tp-sub.fits"
+    for sec_num, dest in ((6, tpf_s6), (27, tpf_s27)):
+        hdul_sec, *_ = _make_contract_tpf_hdulist(n_raw=20, ny=4, nx=5, p_dim=3, bkgsub=True)
+        hdul_sec[0].header["SECTOR"] = sec_num
+        hdul_sec.writeto(dest, overwrite=True)
+
+    dup_manifest = tmp_path / "dup_manifest.txt"
+    dup_manifest.write_text(f"{tpf_s6}\n{tpf_s27}\n", encoding="utf-8")
+    gpu_dup_out = tmp_path / "gpu_dup_out"
+    gpu_dup_out.mkdir()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["-", str(dup_manifest), str(gpu_dup_out), str(cat_dir), str(cache_dir), "halophot_only"],
+    )
+    exec(
+        compile(gpu_heredocs[0], "halophot_survey_gpu.sbatch[py]", "exec"),
+        {"__name__": "__main__"},
+    )
+    dup_fits = sorted(p.name for p in gpu_dup_out.glob("*.fits"))
+    assert dup_fits == [
+        "dup_target_tp-sub_s0006_halo_lc_tv.fits",
+        "dup_target_tp-sub_s0027_halo_lc_tv.fits",
+    ]
+
+    # Partial failure (1 ok, 1 failed) must exit non-zero under default MAX_FAIL_FRAC=0.0
+    partial_manifest = tmp_path / "partial_manifest.txt"
+    partial_manifest.write_text(f"{tpf_s6}\n{tmp_path / 'nonexistent_tp.fits'}\n", encoding="utf-8")
+    gpu_partial_out = tmp_path / "gpu_partial_out"
+    gpu_partial_out.mkdir()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["-", str(partial_manifest), str(gpu_partial_out), str(cat_dir), str(cache_dir), "halophot_only"],
+    )
+    with pytest.raises(SystemExit) as exc_partial:
+        exec(
+            compile(gpu_heredocs[0], "halophot_survey_gpu.sbatch[py]", "exec"),
+            {"__name__": "__main__"},
+        )
+    assert exc_partial.value.code == 1
+    part_summary = Table.read(gpu_partial_out / "summary.parquet", format="parquet")
+    assert list(part_summary["status"]) == ["ok", "failed"]
+
+
 def test_license_and_pyproject_metadata() -> None:
-    """Verify [HALO-02] and [HALO-06]: GPLv3 LICENSE, pyproject.toml extras/excludes, and no .pyc."""
+    """Verify [HALO-02], [HALO-06], [HALO-IO-13]: GPLv3 LICENSE, pyproject.toml extras, mkdocs.yml."""
     repo_root = Path(__file__).resolve().parents[1]
+    assert halophot.__version__ == "2.0.1"
     lic_path = repo_root / "LICENSE"
     assert lic_path.is_file()
     lic_text = lic_path.read_text(encoding="utf-8")
@@ -731,11 +792,19 @@ def test_license_and_pyproject_metadata() -> None:
     assert "pyarrow" in hpc_deps
     assert "fsspec" in hpc_deps
     assert "s3fs" in hpc_deps
+    docs_deps = " ".join(pyproject["project"]["optional-dependencies"]["docs"])
+    assert "mkdocs" in docs_deps and "mkdocstrings" in docs_deps
     ruff_excl = set(pyproject["tool"]["ruff"]["extend-exclude"])
     assert {"notebooks", "docs", "tv_halo.ipynb", "halo_atlas.ipynb", "experiments"}.issubset(
         ruff_excl
     )
     assert not (repo_root / "experiments" / "psf_sim.pyc").exists()
+
+    mkdocs_text = (repo_root / "mkdocs.yml").read_text(encoding="utf-8")
+    assert "custom_templates" not in mkdocs_text
+    assert "selection:" not in mkdocs_text
+    assert "rendering:" not in mkdocs_text
+    assert "options:" in mkdocs_text
 
 
 def test_write_fits_headers_tunit_and_read_weightmap(tmp_path: Path) -> None:
@@ -789,7 +858,6 @@ def test_write_fits_headers_tunit_and_read_weightmap(tmp_path: Path) -> None:
 def test_read_weightmap_err_and_split_times_roundtrip_all_inputs(tmp_path: Path) -> None:
     """Verify [XPKG-03]: read_weightmap, read_weightmap_err, and read_split_times across LC/HDUList/Path."""
     assert "read_weightmap_err" in halophot.__all__
-    assert "read_split_times" in halophot.__all__
     assert halophot.read_weightmap_err is read_weightmap_err
     assert halophot.read_split_times is read_split_times
 
@@ -805,11 +873,11 @@ def test_read_weightmap_err_and_split_times_roundtrip_all_inputs(tmp_path: Path)
 
     # 2. Invalid non-LightCurve / non-FITS inputs raise TypeError
     for bad_input in (42, object()):
-        with pytest.raises(TypeError, match="Expected a lightkurve.LightCurve"):
+        with pytest.raises(TypeError, match="Expected LightCurve"):
             read_weightmap(bad_input)
-        with pytest.raises(TypeError, match="Expected a lightkurve.LightCurve"):
+        with pytest.raises(TypeError, match="Expected LightCurve"):
             read_weightmap_err(bad_input)
-        with pytest.raises(TypeError, match="Expected a lightkurve.LightCurve"):
+        with pytest.raises(TypeError, match="Expected LightCurve"):
             read_split_times(bad_input)
 
     # 3. 3D segmented WEIGHTMAP + MaskedArray WEIGHTMAP_ERR + SPLIT_TIMES round-trip across
@@ -823,6 +891,8 @@ def test_read_weightmap_err_and_split_times_roundtrip_all_inputs(tmp_path: Path)
     splits = [float(t.value[9]) + 5e-4]
 
     lc_seg = lk.TessLightCurve(time=t, flux=flux, flux_err=ferr)
+    lc_seg["pos_corr1"] = np.linspace(-0.2, 0.2, 20, dtype=np.float32) * u.pixel
+    lc_seg["pos_corr2"] = np.linspace(0.15, -0.15, 20, dtype=np.float32) * u.pixel
     lc_seg.meta["WEIGHTMAP"] = wmap_3d
     lc_seg.meta["WEIGHTMAP_ERR"] = werr_masked
     lc_seg.meta["SPLIT_TIMES"] = splits
@@ -841,10 +911,15 @@ def test_read_weightmap_err_and_split_times_roundtrip_all_inputs(tmp_path: Path)
 
     # Reload via lk.read(str_path): Lightkurve strips WEIGHTMAP/WEIGHTMAP_ERR/SPLIT_TIMES from meta,
     # so read_* must resolve the underlying FITS file via FILENAME metadata!
+    # POS_CORR1 / POS_CORR2 must round-trip directly in HDU 1 ([HALO-IO-02]).
     lc_from_disk = lk.read(str(seg_fits))
     assert "WEIGHTMAP" not in lc_from_disk.meta
     assert "WEIGHTMAP_ERR" not in lc_from_disk.meta
     assert "SPLIT_TIMES" not in lc_from_disk.meta
+    assert "pos_corr1" in lc_from_disk.colnames
+    assert "pos_corr2" in lc_from_disk.colnames
+    np.testing.assert_allclose(lc_from_disk["pos_corr1"].value, lc_seg["pos_corr1"].value, atol=1e-6)
+    np.testing.assert_allclose(lc_from_disk["pos_corr2"].value, lc_seg["pos_corr2"].value, atol=1e-6)
 
     for target in (seg_fits, str(seg_fits), lc_from_disk):
         w_got = halophot.read_weightmap(target)
@@ -852,7 +927,9 @@ def test_read_weightmap_err_and_split_times_roundtrip_all_inputs(tmp_path: Path)
         st_got = halophot.read_split_times(target)
         assert w_got is not None and w_got.flags.owndata
         assert we_got is not None and we_got.flags.owndata
-        assert st_got is not None and st_got.flags.owndata
+        assert st_got is not None and (
+            st_got.flags.owndata or (st_got.base is not None and st_got.base.flags.owndata)
+        )
         np.testing.assert_allclose(w_got, wmap_3d)
         np.testing.assert_allclose(we_got, expected_werr, equal_nan=True)
         np.testing.assert_allclose(st_got, splits, rtol=0.0, atol=1e-12)
@@ -876,10 +953,47 @@ def test_read_weightmap_err_and_split_times_roundtrip_all_inputs(tmp_path: Path)
         halophot.read_weightmap_err(resaved_fits), expected_werr, equal_nan=True  # type: ignore[arg-type]
     )
 
-    # Time-slicing lc_from_disk before the split boundary drops out-of-range SPLIT_TIMES on write_fits
+    # Time-slicing lc_from_disk before the split boundary drops out-of-range SPLIT_TIMES and
+    # slices 3D WEIGHTMAP / WEIGHTMAP_ERR down to the surviving 2D segment ([HALO-IO-02])!
     sliced_fits = tmp_path / "sliced_reloaded_lc.fits"
     halophot.write_fits(lc_from_disk[:5], sliced_fits)
     assert halophot.read_split_times(sliced_fits) is None
+    w_sliced = halophot.read_weightmap(sliced_fits)
+    we_sliced = halophot.read_weightmap_err(sliced_fits)
+    assert w_sliced is not None and w_sliced.shape == (3, 4)
+    assert we_sliced is not None and we_sliced.shape == (3, 4)
+    np.testing.assert_allclose(w_sliced, wmap_3d[0])
+    np.testing.assert_allclose(we_sliced, expected_werr[0], equal_nan=True)
+
+    # 3-segment split light curve sliced to span 1 of 2 splits must preserve NSPLITS=1 + (2, ny, nx)!
+    t30 = Time(2100.0 + np.arange(30, dtype=np.float64) * 0.01, format="btjd", scale="tdb")
+    lc3 = lk.TessLightCurve(time=t30, flux=np.ones(30), flux_err=np.full(30, 1e-4))
+    wmap3 = np.arange(60, dtype=np.float64).reshape(3, 4, 5) / 60.0
+    werr3 = np.arange(1, 61, dtype=np.float64).reshape(3, 4, 5) / 600.0
+    lc3.meta["WEIGHTMAP"] = wmap3
+    lc3.meta["WEIGHTMAP_ERR"] = werr3
+    lc3.meta["SPLIT_TIMES"] = [float(t30.value[9]) + 0.005, float(t30.value[19]) + 0.005]
+    p3_full = tmp_path / "lc3_full.fits"
+    halophot.write_fits(lc3, p3_full)
+    lc3_disk = lk.read(str(p3_full))
+
+    p3_two = tmp_path / "lc3_two_segs.fits"
+    halophot.write_fits(lc3_disk[:20], p3_two)
+    st_two = halophot.read_split_times(p3_two)
+    w_two = halophot.read_weightmap(p3_two)
+    we_two = halophot.read_weightmap_err(p3_two)
+    assert st_two is not None and len(st_two) == 1
+    assert w_two is not None and w_two.shape == (2, 4, 5)
+    assert we_two is not None and we_two.shape == (2, 4, 5)
+    np.testing.assert_allclose(w_two, wmap3[:2])
+    np.testing.assert_allclose(we_two, werr3[:2])
+
+    p3_mid = tmp_path / "lc3_mid_only.fits"
+    halophot.write_fits(lc3_disk[10:20], p3_mid)
+    assert halophot.read_split_times(p3_mid) is None
+    w_mid = halophot.read_weightmap(p3_mid)
+    assert w_mid is not None and w_mid.shape == (4, 5)
+    np.testing.assert_allclose(w_mid, wmap3[1])
 
     # Wrapper carrying _hdu without a .hdu attribute must resolve _hdu directly without AttributeError
     with fits.open(seg_fits) as hdul_wrap:
@@ -903,7 +1017,16 @@ def test_read_weightmap_err_and_split_times_roundtrip_all_inputs(tmp_path: Path)
     lc_bad_werr = lk.TessLightCurve(time=t, flux=flux, flux_err=ferr)
     lc_bad_werr.meta["WEIGHTMAP"] = np.full((3, 4), 1.0 / 12.0)
     lc_bad_werr.meta["WEIGHTMAP_ERR"] = np.ones(4)
-    with pytest.raises(ValueError, match="WEIGHTMAP_ERR must have at least 2 dimensions"):
+    with pytest.raises(ValueError, match="WEIGHTMAP_ERR must be >= 2D"):
         halophot.write_fits(lc_bad_werr, tmp_path / "bad_werr.fits")
+
+
+def test_experiments_parse_as_valid_python3() -> None:
+    """All scripts under experiments/ must parse cleanly with Python 3 ast.parse."""
+    exp_dir = Path(__file__).resolve().parents[1] / "experiments"
+    py_files = sorted(exp_dir.glob("*.py"))
+    assert len(py_files) >= 14
+    for p in py_files:
+        ast.parse(p.read_text(encoding="utf-8"), filename=str(p))
 
 

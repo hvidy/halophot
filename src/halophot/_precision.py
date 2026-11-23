@@ -1,9 +1,8 @@
-"""Local numerical precision helpers for JAX optimization entry points.
+"""Locally scoped 64-bit JAX precision helpers (canonical v2 contract).
 
-``halophot`` never mutates ``jax_enable_x64`` globally on import. Numerical
-entry points execute inside :func:`in_float64`, which enters a locally scoped
-``jax.enable_x64(True)`` context, casts floating-point inputs to 64-bit
-precision, and restores the caller's global JAX x64 state on exit.
+None of ``mundey``, ``tessbkgd``, or ``halophot`` mutates ``jax_enable_x64``
+globally on import. Entry points run inside :func:`run_in` / :func:`in_float64`
+and restore the caller's prior JAX precision state on exit.
 """
 
 from __future__ import annotations
@@ -11,17 +10,21 @@ from __future__ import annotations
 import contextlib
 import functools
 from collections.abc import Callable, Iterator
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-_F = TypeVar("_F", bound=Callable[..., object])
+F = TypeVar("F", bound=Callable[..., Any])
 
-_DTYPES: dict[str, tuple[jnp.dtype, jnp.dtype]] = {
-    "float32": (jnp.float32, jnp.complex64),
-    "float64": (jnp.float64, jnp.complex128),
+_enable_x64 = getattr(jax, "enable_x64", None)
+if _enable_x64 is None:  # pragma: no cover - JAX < 0.8 fallback
+    from jax.experimental import enable_x64 as _enable_x64
+
+_DTYPES: dict[str, tuple[Any, Any, Any, Any]] = {
+    "float32": (jnp.float32, jnp.complex64, np.float32, np.complex64),
+    "float64": (jnp.float64, jnp.complex128, np.float64, np.complex128),
 }
 
 
@@ -31,48 +34,49 @@ def _check_dtype(dtype: str) -> None:
 
 
 @contextlib.contextmanager
-def run_in(dtype: str) -> Iterator[None]:
-    """Run the enclosed block with JAX 64-bit precision enabled or disabled."""
+def run_in(dtype: str = "float64") -> Iterator[None]:
+    """Execute the enclosed block with JAX 64-bit mode enabled or disabled."""
     _check_dtype(dtype)
-    with jax.enable_x64(dtype == "float64"):
+    with _enable_x64(dtype == "float64"):
         yield
 
 
-def cast_tree(tree: object, dtype: str = "float64") -> object:
-    """Cast floating and complex JAX/NumPy leaves in ``tree`` to ``dtype``."""
+def cast_tree(tree: Any, dtype: str = "float64") -> Any:
+    """Cast floating/complex leaves in ``tree`` to ``dtype``, keeping Quantity units."""
     _check_dtype(dtype)
-    real_dtype, complex_dtype = _DTYPES[dtype]
+    j_real, j_cplx, np_real, np_cplx = _DTYPES[dtype]
 
-    def _cast_leaf(leaf: object) -> object:
-        if not isinstance(leaf, jax.Array | np.ndarray | np.generic):
+    def _cast(leaf: Any) -> Any:
+        if isinstance(leaf, np.ndarray) and hasattr(leaf, "unit"):
+            k = leaf.dtype.kind
+            if k in ("f", "c"):
+                return leaf.astype(np_cplx if k == "c" else np_real, copy=False)
             return leaf
-        if jnp.issubdtype(leaf.dtype, jnp.complexfloating):
-            return jnp.asarray(leaf, dtype=complex_dtype)
-        if jnp.issubdtype(leaf.dtype, jnp.floating):
-            return jnp.asarray(leaf, dtype=real_dtype)
+        if not isinstance(leaf, jax.Array | np.ndarray | np.number):
+            return leaf
+        if leaf.dtype.kind in ("f", "c"):
+            target = j_cplx if leaf.dtype.kind == "c" else j_real
+            if isinstance(leaf, jax.Array) and leaf.dtype == target:
+                return leaf
+            return jnp.asarray(leaf, dtype=target)
         return leaf
 
     with run_in(dtype):
-        return jax.tree_util.tree_map(_cast_leaf, tree)
+        return jax.tree_util.tree_map(_cast, tree)
 
 
-def in_float64(fn: _F) -> _F:
-    """Execute ``fn`` inside ``jax.enable_x64(True)`` with float64 array inputs.
+def in_float64(fn: F) -> F:
+    """Run ``fn`` inside ``run_in("float64")`` with floating/complex inputs cast."""
 
-    Floating-point JAX and NumPy arrays (and PyTrees thereof) are cast to
-    ``float64`` (and complex arrays to ``complex128``) on entry; non-array
-    arguments and iterators pass through unchanged. Global ``jax_enable_x64``
-    state is restored on exit even if ``fn`` raises.
-    """
-
-    def _cast_arg(arg: object) -> object:
+    def _cast_arg(arg: Any) -> Any:
         return arg if isinstance(arg, Iterator) else cast_tree(arg, "float64")
 
     @functools.wraps(fn)
-    def wrapped(*args: object, **kwargs: object) -> object:
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
         with run_in("float64"):
-            cast_args = [_cast_arg(a) for a in args]
-            cast_kwargs = {k: _cast_arg(v) for k, v in kwargs.items()}
-            return fn(*cast_args, **cast_kwargs)
+            return fn(
+                *(_cast_arg(a) for a in args),
+                **{k: _cast_arg(v) for k, v in kwargs.items()},
+            )
 
     return wrapped  # type: ignore[return-value]

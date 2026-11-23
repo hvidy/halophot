@@ -14,25 +14,27 @@ Tim White, Benjamin Pope, Jonatan Rudrasingam
 
 Simply run
 
-`pip install halophot`
+```bash
+pip install halophot
+```
 
-or else clone this git repository, enter the directory, and run
+or clone this repository, enter the directory, and run
 
-`pip install -e .`
+```bash
+pip install -e .
+```
 
 ## K2 and TESS Halo Photometry
 
-This is code that implements a Total Variation (TV) based regularization for *Kepler*/*K2* and *TESS* photometry of very bright stars.
+This package implements Total Variation (TV) halo photometry for *Kepler*/*K2* and *TESS* observations of very bright, saturated stars in JAX.
 
-We minimize nth order TV - i.e. the sum of the absolute values of the nth differences of a light curve - of a light curve created as the weighted sum of pixels, with weights in (0,1). This appears remarkably effective at removing pointing-based and scattered-light systematics from *K2* and *TESS* light curves where it is impractical to do photometry otherwise and apply more standard detrending methods.
-
-We believe this is of practical use for *Kepler* targets brighter than Kp ~ 6 and saturated *TESS* targets brighter than T ~ 4.
+We minimize an objective (by default 1st-order smooth Charbonnier total variation) of a normalized light curve formed as a non-negative weighted sum of unsaturated halo pixels, $w \in \Delta^{M-1}$ ($w_i \ge 0$, $\sum_i w_i = 1$), parameterized directly via symmetric zero-mean softmax logits. This removes pointing-jitter and scattered-light systematics cleanly for *Kepler* targets brighter than $K_p \sim 6$ and saturated *TESS* targets brighter than $T \sim 4$.
 
 ## Basic usage
 
-### Functional `lightkurve` API (`halophot` v2.0)
+### Extracting a halo light curve
 
-`halophot` v2.0 operates directly on standard `lightkurve.TargetPixelFile` objects (including `HALOCVER = 1` products from `mundey` and `tessbkgd`) via convex Charnes–Cooper flux-share coordinates parameterized on the simplex with singularity-free isometric log-ratio (ILR) transforms in JAX and Zodiax:
+`halophot.extract_halo_lightcurve` accepts a `lightkurve.TargetPixelFile`, a FITS path, or a raw 3D `(N_cad, ny, nx)` NumPy array, and returns a `HaloLightCurve` (`KeplerLightCurve` / `TessLightCurve` subclass) whose `.to_fits()` preserves all `HALOCVER = 1` extensions (`WEIGHTMAP`, `WEIGHTMAP_ERR`, `SPLIT_TIMES`, `SEGMENT_SCALES`, `POS_CORR1`/`POS_CORR2`):
 
 ```python
 import lightkurve as lk
@@ -44,54 +46,95 @@ lc = halophot.extract_halo_lightcurve(
     sigclip=True,
     compute_uncertainty=True,
 )
-# Save HLSP FITS with lossless WEIGHTMAP ImageHDU and coherent flux_err
-halophot.write_fits(lc, "target_halo_lc.fits")
 
-# Reload light curve and pixel weightmap (do NOT use lc.to_fits(), which drops HALOCVER=1 extensions)
+# Inspect stamp, weightmap, light curve (with sigclip outliers), and periodogram
+fig = halophot.plot_diagnostics(lc, tpf)
+
+# Lossless HALOCVER=1 FITS serialization (both lc.to_fits and halophot.write_fits work)
+lc.to_fits("target_halo_lc.fits", overwrite=True)
+
 lc_reloaded = lk.read("target_halo_lc.fits")
-wmap = halophot.read_weightmap(lc_reloaded)
+wmap = halophot.read_weightmap("target_halo_lc.fits")
 ```
 
-> **Note:** Always use `halophot.write_fits(lc, path)` and `halophot.read_weightmap(lc_or_path)` (plus `halophot.read_weightmap_err` and `halophot.read_split_times` when requested) rather than `lc.to_fits(path)`. Lightkurve's built-in `to_fits()` omits the `HALOCVER = 1` extensions (`WEIGHTMAP`, `WEIGHTMAP_ERR`, `SPLIT_TIMES`), provenance header cards, and unnormalized `e-/s` flux units.
+For array-only workflows (without `lightkurve` or `matplotlib`), call `halophot.optimise_halo(pixels, times)` directly on a 2D `(M, N)` pixel array.
 
-Key v2.0 features:
+### Writing and testing custom JAX objective functions
 
-- **Convex Charnes–Cooper + ILR Simplex Core**: `HaloWeights(zdx.Base)` isolates `z_ilr` as its sole differentiable leaf, optimized in locally scoped `float64` precision via `optimistix.LBFGS` (or `zodiax.optimisation` with rank-guarded eigen-projection) without mutating global `jax_enable_x64`.
-- **Gap-Aware Charbonnier TV & $\mathcal{O}(N)$ `tv_exp`**: Smooth Charbonnier total variation strictly masks spacecraft downlink and safe-mode gaps, while `jax.lax.scan` evaluates multi-lag `tv_exp` in `< 10 MB` RAM even on 20-second *TESS* sectors.
-- **Sky-Dilution Guard & Unified Coherent `flux_err`**: Automatically excludes `PIXEL_QUALITY` strap, bleed, unresolved-smear, background-star, and `BKG_USED` pixels ($\Omega_{\text{halo}} \cap \Omega_{\text{bg}} = \emptyset$), enforces $\bar{P}_i \ge 2\,\operatorname{median}_t(B_{i,t})$ and $\operatorname{SNR}_i \ge 5$, and propagates pixel, column-orthogonalized `SMEAR_ERR`, and `BKG_CHOL` / `BKG_BASIS` uncertainties without double-counting. Pass `legacy_tv=True` to reproduce unregularized *K2* / `halo-tess` DR1 weights.
+Every built-in objective lives in [`src/halophot/objectives.py`](src/halophot/objectives.py) (`OBJECTIVES`: `"tv"`, `"tv_o2"`, `"tv_exp"`, `"l2v"`, `"l3v"`, `"owl"`). You can pass **any JAX function** directly to `optimise_halo(..., objective=my_fn)` or `extract_halo_lightcurve(..., objective=my_fn)` with zero edits to `halophot` internals. Parameter names are inspected once before JIT so all three styles work out of the box:
+
+```python
+import jax.numpy as jnp
+import halophot
+
+# 1. Minimal 1-argument objective: unit-mean 1D light curve on valid cadences
+def huber_tv(flux):
+    diffs = jnp.diff(flux)
+    return jnp.mean(jnp.sqrt(diffs**2 + 1e-8))
+
+lc = halophot.extract_halo_lightcurve(tpf, objective=huber_tv)
+
+# 2. Gap-safe 2-argument objective: receives boolean step_mask of shape (N - lag,)
+def gap_safe_l2(flux, step_mask):
+    diffs = jnp.diff(flux)
+    return jnp.sum(jnp.where(step_mask, diffs**2, 0.0)) / jnp.sum(step_mask)
+
+fit = halophot.optimise_halo(pixels, times, objective=gap_safe_l2)
+
+# 3. Keyword-aware objective: request any subset of
+#    (flux, *, step_mask, weights, pixels, times, dt_nom, lag)
+def entropy_regularized_tv(flux, *, step_mask, weights):
+    diffs = jnp.diff(flux)
+    tv = jnp.sum(jnp.where(step_mask, jnp.sqrt(diffs**2 + 1e-10), 0.0)) / jnp.sum(step_mask)
+    entropy_pen = 1e-4 * jnp.sum(weights * jnp.log(jnp.maximum(weights, 1e-12)))
+    return tv + entropy_pen
+
+fit = halophot.optimise_halo(pixels, times, objective=entropy_regularized_tv)
+
+# 4. Register globally by name so it can be reused across scripts
+@halophot.register_objective("my_tv")
+def my_tv(flux, step_mask):
+    diffs = jnp.diff(flux)
+    return jnp.sum(jnp.where(step_mask, jnp.sqrt(diffs**2 + 1e-10), 0.0)) / jnp.sum(step_mask)
+
+lc = halophot.extract_halo_lightcurve(tpf, objective="my_tv")
+```
+
+### Key features
+
+- **Direct Physical Simplex Core**: Zero-mean softmax logits (`w = softmax(u - mean(u))`) optimized in locally scoped `float64` via `optax.lbfgs` + zoom line search without mutating global `jax_enable_x64`.
+- **Scale-Invariant Smooth L1 & $\mathcal{O}(N)$ `tv_exp`**: Cancellation-free Charbonnier smoothing scales dynamically to `eps_eff = epsilon * median(|df_init|)` across `0.1 ppm` to `10%` targets, strictly masks spacecraft downlink gaps, and evaluates multi-lag `tv_exp` via `jax.lax.scan` in `< 10 MB` RAM.
+- **Unified Coherent `flux_err` & Low-RAM 20-s Processing**: Keeps 3D TPF arrays as `float32` views (`< 2 GiB` host RAM on 20-s *TESS* sectors), excludes `PIXEL_QUALITY` bad pixels, flags `sigclip` outliers in `lc["inlier_mask"]` without discarding astrophysical eclipses, and propagates uncorrelated pixel noise, exact WLS oblique `SMEAR_ERR`, and `BKG_CHOL` / `BKG_BASIS` covariance without double-counting.
 - **HPC Templates**: Root-mapped Apptainer (`halo.sif` via `hpc/virgil_halophot.def` and `hpc/build_halo_sif.sbatch`) and CPU/A100 Slurm templates (`hpc/halophot_survey_cpu.sbatch`, `hpc/halophot_survey_gpu.sbatch`) for Swinburne Ngarrgu Tindebeek (`tooarrana` / `trevor`) are provided in `hpc/`.
 
 ### Command-line usage
 
 Call `halo` from the command line as, e.g.
 
-`halo ktwo200007768-c04_lpd-targ.fits --data-dir /path/to/data/directory/ --name Atlas -c 4 --do-plot`
+```bash
+halo ktwo200007768-c04_lpd-targ.fits --data-dir /path/to/data/directory/ --name Atlas -c 4 --do-plot
+```
 
-where `--name` is the star name you would like to save the outputs under, and `-c` is the campaign. Add `--hlsp-fits` (and `--offline --cache-dir "$SCRATCH/.cache/tess_bright"` on HPC clusters; `--strict-hpc` is enabled by default and can be relaxed with `--no-strict-hpc`) to emit `HALOCVER = 1` `lightkurve` FITS files with `WEIGHTMAP` extensions.
+Add `--hlsp-fits` (and `--offline --cache-dir "$SCRATCH/.cache/tess_bright"` on HPC clusters; `--strict-hpc` is enabled by default in the CLI and can be relaxed with `--no-strict-hpc`) to emit `HALOCVER = 1` FITS files with `WEIGHTMAP` extensions.
 
 ### Swinburne NT / OzSTAR HPC usage
 
-1. **Build the single-inode `halo.sif` container on `trevor`** (internet access required for Docker Hub, PyPI, and GitHub):
+1. **Build the single-inode `halo.sif` container on `trevor`** (internet access required):
    ```bash
    mkdir -p "$SCRATCH/logs"
    sbatch hpc/build_halo_sif.sbatch
-   # For pre-tag branch or commit builds, override the default v2.0.0 release refs:
+   # For pre-tag branch or commit builds:
    # MUNDEY_REF=dev TESSBKGD_REF=dev HALOPHOT_REF=dev sbatch hpc/build_halo_sif.sbatch
    ```
-   `hpc/virgil_halophot.def` builds directly on `python:3.12.7-bookworm` with zero `apt-get` calls so `apptainer build --fakeroot --ignore-fakeroot-command` succeeds inside OzSTAR/NT's root-mapped user namespace, defaulting `%arguments` (`mundey_ref`, `tessbkgd_ref`, `halophot_ref`) to immutable `v2.0.0` release tags and resolving `jax[cuda12]>=0.4.35` with all downstream packages in a single atomic `uv pip install` pass. The job stages its layer cache and rootfs under `$SCRATCH/apptainer/build-$SLURM_JOB_ID`, smoke-tests CPU imports (`jax`, `mundey`, `tessbkgd`, `halophot`) and `jax` / `jaxlib` / `jax-cuda12-plugin` / `jax-cuda12-pjrt` ABI parity, writes `$MYFRED/containers/halo-YYYYMMDD.sif` plus `.sha256`, and updates the `$MYFRED/containers/halo.sif` symlink (consuming a single inode on `/fred`). Measured on Swinburne NT `trevor` (Slurm job `20702665`, including a Sirius Sector 6 `mundey` -> `tessbkgd` -> `halophot` smoke test): `19m 03s` wall time and `2.05 GiB` MaxRSS (`#SBATCH --time=00:45:00`, `--mem=8G`).
-
 2. **Run CPU array or A100 GPU survey jobs on `tooarrana`**:
    ```bash
    mkdir -p "$SCRATCH/logs"
-   # Default: pre-calibrated SPOC, K2, or HALOCVER=1 TPFs (PIPELINE_MODE=halophot_only)
    sbatch hpc/halophot_survey_cpu.sbatch
    sbatch hpc/halophot_survey_gpu.sbatch
-
-   # End-to-end 3-package pass on raw MAST _tp.fits after Stage-1 `mundey prefetch`
+   # Full 3-package pass (mundey -> tessbkgd -> halophot) after Stage-1 `mundey prefetch`:
    sbatch --export=ALL,PIPELINE_MODE=full_e2e hpc/halophot_survey_cpu.sbatch
    sbatch --export=ALL,PIPELINE_MODE=full_e2e hpc/halophot_survey_gpu.sbatch
    ```
-   Both survey scripts use `set -eo pipefail` (avoiding `-u` failures when Lmod's `module -q load apptainer` inspects unset `PS1`), redirect `APPTAINER_CACHEDIR` and `APPTAINER_TMPDIR` onto `$SCRATCH` / `$JOBFS` (keeping `/home` untouched), default `SIF` to `$MYFRED/containers/halo.sif`, write Slurm logs under `/aphid/scratch-3month/%u/logs/`, and archive per-task products into single-inode `.tar` files on `/fred`. When `PIPELINE_MODE=full_e2e` is set, each target executes `mundey.recalibrate_tpf(..., offline=True, strict_hpc=True)` -> `tessbkgd.subtract_background(...)` -> `halophot.extract_halo_lightcurve(...)` -> `halophot.write_fits(...)` in one pass (override smear mode via `MUNDEY_SMEAR`, default `automatic`).
 
 ## Licence
 

@@ -78,7 +78,7 @@ all_inds = range(npix)
 
 start = clock()
 for kk in range(nsim):
-	print 'Iteration',kk
+	print('Iteration', kk)
 	for jj,sampling in enumerate(samplings):
 		# print 'Taking',sampling,'pixels'
 
@@ -146,8 +146,8 @@ for kk in range(nsim):
 
 
 finish = clock()
-print 'Done'
-print 'Time elapsed:',finish-start
+print('Done')
+print('Time elapsed:', finish - start)
 
 std_raw = np.std(sigs_raw,axis=1)
 sigs_raw = np.nanmean(sigs_raw,axis=1)

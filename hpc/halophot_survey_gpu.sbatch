@@ -10,10 +10,11 @@
 #SBATCH --output=/aphid/scratch-3month/%u/logs/%x-%j.out
 #SBATCH --error=/aphid/scratch-3month/%u/logs/%x-%j.err
 #
-# Swinburne Ngarrgu Tindebeek (tooarrana) NVIDIA A100 80GB GPU survey template for halophot v2.0.
-# Bucketed N_pad padding in HaloObservation reuses compiled FP64 XLA kernels across targets.
+# Swinburne Ngarrgu Tindebeek (tooarrana) NVIDIA A100 80GB GPU survey template for halophot.
+# Running a target batch in one Python process amortizes JAX startup and XLA compilation across targets.
 # Set PIPELINE_MODE=full_e2e (after Stage-1 `mundey prefetch`) to run mundey -> tessbkgd -> halophot
 # in a single pass on raw MAST _tp.fits files; defaults to PIPELINE_MODE=halophot_only.
+# Set MAX_FAIL_FRAC (default 0.0) to control the maximum tolerated target failure fraction.
 # Submit after creating log directory: mkdir -p "$SCRATCH/logs" && sbatch hpc/halophot_survey_gpu.sbatch
 
 set -eo pipefail  # omit -u: Lmod reads unset variables (PS1) inside `module load`
@@ -44,12 +45,22 @@ mkdir -p "$ARCHIVE_DIR" "$SCRATCH/jax_cache" "$CACHE_DIR" \
     "$SCRATCH/.cache/lightkurve" "$SCRATCH/.cache/astropy" \
     "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR"
 
-STAGE_OUT="${JOBFS:-$SCRATCH/stage/${SLURM_JOB_NAME}-${SLURM_JOB_ID}}/out"
+STAGE_BASE="${JOBFS:-$SCRATCH/stage/${SLURM_JOB_NAME}-${SLURM_JOB_ID}}"
+STAGE_OUT="${STAGE_BASE}/out"
 mkdir -p "$STAGE_OUT"
 
 archive_outputs() {
+    local tar_name="${SLURM_JOB_NAME}-${SLURM_JOB_ID}.tar"
+    local tar_part="${ARCHIVE_DIR}/.${tar_name}.part.$$"
     if [ -d "$STAGE_OUT" ] && [ -n "$(ls -A "$STAGE_OUT" 2>/dev/null || true)" ]; then
-        tar -cf "${ARCHIVE_DIR}/${SLURM_JOB_NAME}-${SLURM_JOB_ID}.tar" -C "$STAGE_OUT" .
+        if tar -cf "$tar_part" -C "$STAGE_OUT" .; then
+            mv -f "$tar_part" "${ARCHIVE_DIR}/${tar_name}"
+        else
+            rm -f "$tar_part"
+        fi
+    fi
+    if [ -z "${JOBFS:-}" ] && [ -n "${STAGE_BASE:-}" ]; then
+        rm -rf "$STAGE_BASE"
     fi
 }
 trap archive_outputs EXIT
@@ -72,12 +83,15 @@ export MPLBACKEND=Agg
 
 module -q load apptainer
 
-# Run an entire target batch in one Python process on A100 (--nv) so XLA compilation is shared.
+# Run an entire target batch in one Python process on A100 (--nv) so JAX startup and intra-target
+# (sigclip / jackknife) XLA compilations are amortized across the batch.
 apptainer exec --nv "$SIF" python - "$MANIFEST" "$STAGE_OUT" "$CATALOG_DIR" "$CACHE_DIR" "$PIPELINE_MODE" <<'PY'
+from collections import Counter
 import os
 import sys
 from pathlib import Path
 
+from astropy.io import fits
 from astropy.table import Table
 import halophot
 
@@ -96,19 +110,41 @@ elif pipeline_mode != "halophot_only":
     )
 
 smear_mode = os.environ.get("MUNDEY_SMEAR", "automatic")
+max_fail_frac = float(os.environ.get("MAX_FAIL_FRAC", "0.0"))
+
+manifest_entries = [
+    Path(raw_line.strip())
+    for raw_line in manifest_path.read_text().splitlines()
+    if raw_line.strip() and not raw_line.strip().startswith("#")
+]
+raw_stems = [p.name.removesuffix(".gz").removesuffix(".fits") for p in manifest_entries]
+stem_counts = Counter(raw_stems)
+used_out_stems: set[str] = set()
 
 rows = []
-for raw_line in manifest_path.read_text().splitlines():
-    tpf_str = raw_line.strip()
-    if not tpf_str or tpf_str.startswith("#"):
-        continue
-    tpf_path = Path(tpf_str)
-    stem = tpf_path.name.removesuffix(".gz").removesuffix(".fits")
+for entry_idx, (tpf_path, stem) in enumerate(zip(manifest_entries, raw_stems, strict=True)):
     cat_file = catalog_dir / f"{stem}_cat.parquet"
+    if not cat_file.is_file() and stem.endswith("-sub"):
+        alt_cat = catalog_dir / f"{stem.removesuffix('-sub')}_cat.parquet"
+        if alt_cat.is_file():
+            cat_file = alt_cat
     has_cat = cat_file.is_file()
     tpf_input = None
     lc = None
+    out_stem = stem
     try:
+        if stem_counts[stem] > 1:
+            sector_val = None
+            if tpf_path.is_file():
+                with fits.open(tpf_path) as h_sec:
+                    sector_val = h_sec[0].header.get("SECTOR")
+            if isinstance(sector_val, int) and not isinstance(sector_val, bool):
+                out_stem = f"{stem}_s{sector_val:04d}"
+            if out_stem == stem or out_stem in used_out_stems:
+                out_stem = f"{stem}_{entry_idx:04d}"
+        elif out_stem in used_out_stems:
+            out_stem = f"{stem}_{entry_idx:04d}"
+
         if pipeline_mode == "full_e2e":
             cal_tpf = mundey.recalibrate_tpf(
                 tpf_path,
@@ -132,11 +168,12 @@ for raw_line in manifest_path.read_text().splitlines():
             strict_hpc=True,
             compute_uncertainty=True,
         )
-        out_fits = out_dir / f"{stem}_halo_lc_tv.fits"
+        used_out_stems.add(out_stem)
+        out_fits = out_dir / f"{out_stem}_halo_lc_tv.fits"
         halophot.write_fits(lc, out_fits, overwrite=True)
         rows.append(
             {
-                "target": stem,
+                "target": out_stem,
                 "pipeline_mode": pipeline_mode,
                 "status": "ok",
                 "n_cad": len(lc),
@@ -145,10 +182,10 @@ for raw_line in manifest_path.read_text().splitlines():
             }
         )
     except Exception as exc:
-        print(f"ERROR [{stem}]: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        print(f"ERROR [{out_stem}]: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         rows.append(
             {
-                "target": stem,
+                "target": out_stem,
                 "pipeline_mode": pipeline_mode,
                 "status": "failed",
                 "n_cad": 0,
@@ -163,9 +200,13 @@ for raw_line in manifest_path.read_text().splitlines():
 if rows:
     Table(rows=rows).write(out_dir / "summary.parquet", format="parquet", overwrite=True)
 
-if not rows or all(r["status"] == "failed" for r in rows):
+n_total = len(rows)
+n_failed = sum(1 for r in rows if r["status"] == "failed")
+n_ok = n_total - n_failed
+if n_total == 0 or n_ok == 0 or (n_failed / n_total) > max_fail_frac:
     print(
-        f"FATAL: 0/{len(rows)} targets succeeded in {manifest_path}; failing Slurm job.",
+        f"FATAL: {n_ok}/{n_total} targets succeeded ({n_failed} failed, "
+        f"MAX_FAIL_FRAC={max_fail_frac}) in {manifest_path}; failing Slurm job.",
         file=sys.stderr,
         flush=True,
     )
