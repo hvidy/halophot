@@ -43,10 +43,7 @@ dependencies = [
   "matplotlib>=3.8",
   "pyarrow>=15.0",
   "jax>=0.4.30",
-  "equinox>=0.11.5",
-  "optimistix>=0.0.7",
   "optax>=0.2.2",
-  "zodiax>=0.5.0",
   "tqdm>=4.66",
 ]
 

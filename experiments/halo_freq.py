@@ -89,8 +89,8 @@ for jj, period in enumerate(periods):
 
 
 finish = clock()
-print 'Done'
-print 'Time elapsed:',finish-start
+print('Done')
+print('Time elapsed:', finish - start)
 
 plt.figure(0)
 plt.clf()

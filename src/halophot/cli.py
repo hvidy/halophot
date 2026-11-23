@@ -9,7 +9,6 @@ from os.path import exists, join
 from time import time as clock
 
 import lightkurve as lk
-import matplotlib.pyplot as plt
 import numpy as np
 from astropy.io import fits
 from astropy.table import Table
@@ -185,7 +184,7 @@ def build_parser() -> ArgumentParser:
         "--sigclip",
         action=BooleanOptionalAction,
         default=True,
-        help="sigma-clip the final light curve",
+        help="Exclude local flux outliers during weight optimization and record inlier_mask",
     )
     ap.add_argument(
         "--deathstar", action="store_true", default=False, help="remove background star pixels"
@@ -218,7 +217,7 @@ def build_parser() -> ArgumentParser:
         "--legacy-tv",
         action="store_true",
         default=False,
-        help="Use unregularized w-simplex TV in --hlsp-fits v2.0 mode",
+        help="Deprecated no-op (halophot now optimizes physical simplex weights directly)",
     )
     ap.add_argument(
         "--hlsp-fits",
@@ -392,7 +391,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     if not exists(args.save_dir):
         raise FileNotFoundError(f"Save directory {args.save_dir!r} does not exist.")
 
-    resolved_cache_dir = resolve_cache_dir(args.cache_dir, strict_hpc=args.strict_hpc)
+    needs_live_cache = bool(args.deathstar and args.catalog_table is None and not args.offline)
+    resolved_cache_dir = (
+        resolve_cache_dir(args.cache_dir, strict_hpc=args.strict_hpc, create=True)
+        if needs_live_cache
+        else args.cache_dir
+    )
 
     fname = join(args.data_dir, args.fname) if args.data_dir else args.fname
     if args.hlsp_fits:
@@ -486,7 +490,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             sub=args.sub,
             objective=args.objective,
             lag=args.lag,
-            legacy_tv=args.legacy_tv,
+            legacy_tv=True if args.legacy_tv else None,
             maxiter=args.maxiter,
             sigclip=args.sigclip,
             thresh=eff_thresh,
@@ -504,6 +508,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             print(f"Saved HALOCVER=1 halo light curve to {out_fits}")
 
         if args.do_plot:
+            import matplotlib.pyplot as plt
+
             flux_vals = np.asarray(
                 lc.flux.value if hasattr(lc.flux, "value") else lc.flux,
                 dtype=np.float64,
@@ -589,6 +595,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     # Estimate target_mag from header or unmasked stamp BEFORE get_annulus NaN-masks the core.
     eff_mission_legacy = hdr_mission if hdr_mission else ("K2" if is_legacy_k2 else "TESS")
+    do_lc_mission = "tess" if eff_mission_legacy == "TESS" else "kepler"
     deathstar_target_mag: float | None = None
     if args.deathstar:
         deathstar_target_mag = _read_tpf_header_mag(fname)
@@ -645,6 +652,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             verbose=not args.quiet,
             objective=args.objective,
             lag=args.lag,
+            mission=do_lc_mission,
             bitmask=args.bitmask,
         )
 
@@ -672,6 +680,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 verbose=not args.quiet,
                 objective=args.objective,
                 lag=args.lag,
+                mission=do_lc_mission,
                 bitmask=args.bitmask,
             )
             seg_tables.append(seg_ts)
@@ -701,6 +710,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             verbose=not args.quiet,
             objective=args.objective,
             lag=args.lag,
+            mission=do_lc_mission,
             bitmask=args.bitmask,
         )
 
@@ -729,6 +739,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     masked_weightmap = np.ma.array(weightmap, mask=np.isnan(weightmap))
 
     if args.do_plot:
+        import matplotlib.pyplot as plt
+
         formal_name = translate_greek(args.name).replace("_", " ")
         if hdr_sector is not None:
             legacy_label = f"S{hdr_sector:02d}"

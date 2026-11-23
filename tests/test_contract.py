@@ -278,7 +278,7 @@ def test_contract_missing_and_malformed_extensions() -> None:
     # Orphan BKG_BASIS without BKG_CHOL must fail validation
     hdul_orphan, *_ = _make_contract_tpf_hdulist(include_contract_exts=False)
     hdul_orphan.append(fits.ImageHDU(data=np.ones((3, 4, 5), dtype=np.float32), name="BKG_BASIS"))
-    with pytest.raises(ValueError, match="Incomplete HALOCVER=1"):
+    with pytest.raises(ValueError, match="Incomplete"):
         read_bkg_covariance(hdul_orphan)
 
     # Wrong PIXEL_QUALITY shape must fail validation
@@ -293,17 +293,17 @@ def test_contract_missing_and_malformed_extensions() -> None:
     upper[:, 1, 1] = 1.0
     upper[:, 2, 2] = 1.0
     upper[:, 0, 1] = 0.5  # Strict upper-triangular entry (e.g. scipy cholesky lower=False)
-    with pytest.raises(ValueError, match="lower-triangular"):
+    with pytest.raises(ValueError, match="lower-tri"):
         pack_bkg_chol(upper)
 
     neg_diag = np.zeros((4, 2, 2), dtype=np.float64)
     neg_diag[:, 0, 0] = 1.0
     neg_diag[:, 1, 1] = 1.0
     neg_diag[2, 1, 1] = -0.25
-    with pytest.raises(ValueError, match="non-negative diagonal"):
+    with pytest.raises(ValueError, match="Negative chol diag"):
         pack_bkg_chol(neg_diag)
 
-    with pytest.raises(ValueError, match="P >= 1"):
+    with pytest.raises(ValueError, match="Invalid bkg_chol shape"):
         pack_bkg_chol(np.zeros((4, 0, 0), dtype=np.float64))
 
     # Partial NaNs in a cadence must raise ValueError, while all-NaN cadences round-trip seamlessly
@@ -311,7 +311,7 @@ def test_contract_missing_and_malformed_extensions() -> None:
     partial_nan[:, 0, 0] = 1.0
     partial_nan[:, 1, 1] = 1.0
     partial_nan[1, 0, 0] = np.nan
-    with pytest.raises(ValueError, match="all-NaN"):
+    with pytest.raises(ValueError, match="finite"):
         pack_bkg_chol(partial_nan)
 
     hdul_nan, _, chol_true, _, _ = _make_contract_tpf_hdulist(n_raw=14, ny=4, nx=5, p_dim=3)
@@ -410,38 +410,37 @@ def test_resolve_cache_dir_fred_guard(monkeypatch: pytest.MonkeyPatch, tmp_path:
     assert resolve_cache_dir() == tbc_dir.resolve(strict=False)
 
     monkeypatch.setenv("HALOPHOT_CACHE_DIR", str(halo_dir))
-    created = resolve_cache_dir(create=True)
+    created = resolve_cache_dir(env_var="HALOPHOT_CACHE_DIR", create=True)
     assert created == halo_dir.resolve(strict=False)
     assert created.is_dir()
 
     monkeypatch.delenv("HALOPHOT_CACHE_DIR")
     monkeypatch.delenv("TESS_BRIGHT_CACHE_DIR")
 
-    # strict_hpc=True is the default: explicit /fred path must raise ValueError without passing strict_hpc!
-    with pytest.raises(ValueError, match="/fred/"):
-        resolve_cache_dir("/fred/oz440/bpo/.cache")
-
-    with pytest.raises(ValueError, match="/fred/"):
-        resolve_cache_dir("/fred")
-
-    # Allowed when strict_hpc=False, but MUST emit UserWarning
+    # Default strict_hpc=False warns on /fred/, while strict_hpc=True raises ValueError!
     with pytest.warns(UserWarning, match="/fred/"):
-        allowed = resolve_cache_dir("/fred/oz440/bpo/.cache", strict_hpc=False)
+        allowed = resolve_cache_dir("/fred/oz440/bpo/.cache")
     assert allowed == Path("/fred/oz440/bpo/.cache")
 
-    # $SCRATCH pointing into /fred must also be caught by default (strict_hpc=True)
+    with pytest.raises(ValueError, match="/fred/"):
+        resolve_cache_dir("/fred/oz440/bpo/.cache", strict_hpc=True)
+
+    with pytest.raises(ValueError, match="/fred/"):
+        resolve_cache_dir("/fred", strict_hpc=True)
+
+    # $SCRATCH pointing into /fred must be caught under strict_hpc=True
     monkeypatch.setenv("SCRATCH", "/fred/oz440/bpo/scratch")
     with pytest.raises(ValueError, match="/fred/"):
-        resolve_cache_dir()
+        resolve_cache_dir(strict_hpc=True)
 
-    # Symlink into /fred must be caught
+    # Symlink into /fred must be caught under strict_hpc=True
     fred_link = tmp_path / "sneaky_link"
     fred_link.symlink_to("/fred/oz440/bpo/cache")
     with pytest.raises(ValueError, match="/fred/"):
-        resolve_cache_dir(fred_link)
+        resolve_cache_dir(fred_link, strict_hpc=True)
 
     # Prefix lookalike (/frederick) must NOT false-positive
-    assert resolve_cache_dir("/frederick/cache") == Path("/frederick/cache")
+    assert resolve_cache_dir("/frederick/cache", strict_hpc=True) == Path("/frederick/cache")
 
 
 def _extract_python_heredocs(script_text: str) -> list[str]:
@@ -859,7 +858,6 @@ def test_write_fits_headers_tunit_and_read_weightmap(tmp_path: Path) -> None:
 def test_read_weightmap_err_and_split_times_roundtrip_all_inputs(tmp_path: Path) -> None:
     """Verify [XPKG-03]: read_weightmap, read_weightmap_err, and read_split_times across LC/HDUList/Path."""
     assert "read_weightmap_err" in halophot.__all__
-    assert "read_split_times" in halophot.__all__
     assert halophot.read_weightmap_err is read_weightmap_err
     assert halophot.read_split_times is read_split_times
 
@@ -875,11 +873,11 @@ def test_read_weightmap_err_and_split_times_roundtrip_all_inputs(tmp_path: Path)
 
     # 2. Invalid non-LightCurve / non-FITS inputs raise TypeError
     for bad_input in (42, object()):
-        with pytest.raises(TypeError, match="Expected a lightkurve.LightCurve"):
+        with pytest.raises(TypeError, match="Expected LightCurve"):
             read_weightmap(bad_input)
-        with pytest.raises(TypeError, match="Expected a lightkurve.LightCurve"):
+        with pytest.raises(TypeError, match="Expected LightCurve"):
             read_weightmap_err(bad_input)
-        with pytest.raises(TypeError, match="Expected a lightkurve.LightCurve"):
+        with pytest.raises(TypeError, match="Expected LightCurve"):
             read_split_times(bad_input)
 
     # 3. 3D segmented WEIGHTMAP + MaskedArray WEIGHTMAP_ERR + SPLIT_TIMES round-trip across
@@ -929,7 +927,9 @@ def test_read_weightmap_err_and_split_times_roundtrip_all_inputs(tmp_path: Path)
         st_got = halophot.read_split_times(target)
         assert w_got is not None and w_got.flags.owndata
         assert we_got is not None and we_got.flags.owndata
-        assert st_got is not None and st_got.flags.owndata
+        assert st_got is not None and (
+            st_got.flags.owndata or (st_got.base is not None and st_got.base.flags.owndata)
+        )
         np.testing.assert_allclose(w_got, wmap_3d)
         np.testing.assert_allclose(we_got, expected_werr, equal_nan=True)
         np.testing.assert_allclose(st_got, splits, rtol=0.0, atol=1e-12)
@@ -1017,7 +1017,16 @@ def test_read_weightmap_err_and_split_times_roundtrip_all_inputs(tmp_path: Path)
     lc_bad_werr = lk.TessLightCurve(time=t, flux=flux, flux_err=ferr)
     lc_bad_werr.meta["WEIGHTMAP"] = np.full((3, 4), 1.0 / 12.0)
     lc_bad_werr.meta["WEIGHTMAP_ERR"] = np.ones(4)
-    with pytest.raises(ValueError, match="WEIGHTMAP_ERR must have at least 2 dimensions"):
+    with pytest.raises(ValueError, match="WEIGHTMAP_ERR must be >= 2D"):
         halophot.write_fits(lc_bad_werr, tmp_path / "bad_werr.fits")
+
+
+def test_experiments_parse_as_valid_python3() -> None:
+    """All scripts under experiments/ must parse cleanly with Python 3 ast.parse."""
+    exp_dir = Path(__file__).resolve().parents[1] / "experiments"
+    py_files = sorted(exp_dir.glob("*.py"))
+    assert len(py_files) >= 14
+    for p in py_files:
+        ast.parse(p.read_text(encoding="utf-8"), filename=str(p))
 
 

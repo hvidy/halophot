@@ -1,16 +1,12 @@
 import functools
 import warnings
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import astropy.table
-import equinox as eqx
 import jax
 import jax.numpy as jnp
 import lightkurve
-import matplotlib as mpl
-import matplotlib.pyplot as plt
 import numpy as np
-import optimistix as optx
 from astropy.io import fits
 from astropy.stats import sigma_clip
 from astropy.table import Table
@@ -18,9 +14,6 @@ from astropy.time import Time
 from astropy.timeseries import LombScargle
 from astropy.units import Quantity
 from lightkurve.utils import KeplerQualityFlags, TessQualityFlags
-from matplotlib.gridspec import GridSpec
-from matplotlib.pyplot import subplot
-from mpl_toolkits.axes_grid1 import axes_size, make_axes_locatable
 from scipy import ndimage
 from scipy.ndimage import gaussian_filter1d as gaussfilt
 from scipy.signal import savgol_filter
@@ -39,6 +32,8 @@ from ._contract import (
 from ._precision import in_float64
 from .lightcurve import compute_coherent_flux_err
 from .masking import remove_stars as remove_stars
+from .optimise import _run_optax_lbfgs_loop
+from .simplex import logits_to_weights
 
 """-----------------------------------------------------------------
 halo_tools.py
@@ -284,8 +279,14 @@ def censor_tpf(
                 )
                 fl = ts_iter["corr_flux"]
                 fs = fl[~np.isnan(fl)] / np.nanmedian(fl)
-                sfs = savgol_filter(fs, int(np.floor(len(fs) / 8) * 2 - 1), 3)
-                stds.append(np.std(fs / sfs))
+                win_sg = int(np.floor(len(fs) / 8) * 2 - 1)
+                max_odd = len(fs) if len(fs) % 2 == 1 else (len(fs) - 1)
+                win_sg = max(3, min(win_sg, max_odd))
+                if len(fs) >= 3 and win_sg >= 3:
+                    sfs = savgol_filter(fs, win_sg, min(3, win_sg - 1))
+                    stds.append(np.std(fs / sfs))
+                else:
+                    stds.append(float(np.std(fs)) if len(fs) > 0 else np.inf)
             stds = np.asarray(stds)
             d1 = np.r_[0, stds[1:] - stds[:-1]]
             d2 = np.r_[0, stds[2:] - 2 * stds[1:-1] + stds[:-2], 0]
@@ -413,19 +414,15 @@ def diff_1(z):
     return np.sum(np.abs(z[1:] - z[:-1]))
 
 
-def diff_2(z):
-    return np.sum(np.abs(2.0 * z[1:-1] - z[2:] - z[:-2]))
-
-
 # =========================================================================
 # =========================================================================
 
 
 class OptimResult(NamedTuple):
-    """Optimization result pairing parameter logits with the Optimistix solution."""
+    """Optimization result pairing parameter logits with solver diagnostics."""
 
     params: jax.Array
-    solution: optx.Solution
+    solution: dict[str, Any]
 
 
 def _min_cadences_for_objective(objective: str, lag: int) -> int:
@@ -439,40 +436,29 @@ def _min_cadences_for_objective(objective: str, lag: int) -> int:
 
 @functools.lru_cache(maxsize=32)
 def _get_cached_minimiser(objective: str, lag: int):
-    """Build and cache a JIT-compiled Optimistix L-BFGS runner for ``(objective, lag)``."""
+    """Build and cache a JIT-compiled ``optax.lbfgs`` runner for ``(objective, lag)``."""
     obj_callable = objectives.mapping[objective]
-    solver = optx.BestSoFarMinimiser(optx.LBFGS(rtol=1e-6, atol=1e-6))
 
-    if objective == "owl":
+    @jax.jit
+    def _run(w0: jax.Array, pvec: jax.Array, max_steps: int):
+        if objective == "owl":
 
-        def loss_fn(weights, args):
-            (pvec,) = args
-            return obj_callable(weights, pvec)
+            def _val_fn(logits: jax.Array) -> jax.Array:
+                return obj_callable(logits, pvec)
 
-    else:
+        else:
 
-        def loss_fn(weights, args):
-            (pvec,) = args
-            return obj_callable(weights, lag, pvec)
+            def _val_fn(logits: jax.Array) -> jax.Array:
+                return obj_callable(logits, lag, pvec)
 
-    @eqx.filter_jit
-    def _run(w0: jax.Array, pvec: jax.Array, max_steps: int) -> tuple[optx.Solution, jax.Array]:
-        sol = optx.minimise(
-            loss_fn,
-            solver,
-            w0,
-            args=(pvec,),
-            max_steps=max_steps,
-            throw=False,
-        )
-        return sol, loss_fn(sol.value, (pvec,))
+        return _run_optax_lbfgs_loop(_val_fn, logits_to_weights, w0, max_steps, 1e-7, 1e-12)
 
     return _run
 
 
 @in_float64
 def jax_func(pixelvector_jax, w_init, objective, maxiter, lag):
-    """Solve a halo photometry objective function using Optimistix L-BFGS in float64."""
+    """Solve a halo photometry objective function using ``optax.lbfgs`` in float64."""
     if objective not in objectives.mapping:
         valid = ", ".join(sorted(objectives.mapping))
         raise ValueError(f"Unknown objective {objective!r}; expected one of: {valid}")
@@ -499,6 +485,8 @@ def jax_func(pixelvector_jax, w_init, objective, maxiter, lag):
         )
     if not bool(jnp.all(jnp.isfinite(pvec))):
         raise ValueError("pixelvector_jax contains non-finite values.")
+    if not bool(jnp.any(jnp.abs(pvec) > 1e-30)):
+        raise ValueError("pixelvector_jax has zero flux (non-finite normalized objective).")
 
     w0 = jnp.asarray(w_init, dtype=jnp.float64)
     if w0.shape != (npix,):
@@ -507,12 +495,18 @@ def jax_func(pixelvector_jax, w_init, objective, maxiter, lag):
         raise ValueError("w_init contains non-finite values.")
 
     runner = _get_cached_minimiser(objective, lag_int)
-    sol, final_loss = runner(w0, pvec, maxiter_int)
-    if not bool(jnp.all(jnp.isfinite(sol.value))) or not bool(jnp.isfinite(final_loss)):
+    best_logits, loss_init, final_loss, converged, n_steps = runner(w0, pvec, maxiter_int)
+    if not bool(jnp.all(jnp.isfinite(best_logits))) or not bool(jnp.isfinite(final_loss)):
         raise ValueError(
             f"Optimization for objective={objective!r} produced a non-finite solution or loss."
         )
-    return OptimResult(params=sol.value, solution=sol)
+    sol_info = {
+        "loss_init": float(loss_init),
+        "loss_final": float(final_loss),
+        "converged": bool(converged),
+        "n_steps": int(n_steps),
+    }
+    return OptimResult(params=best_logits, solution=sol_info)
 
 
 @in_float64
@@ -633,18 +627,6 @@ def tv_tpf(
     lc_opt = np.asarray(np.dot(w_best.T, pixelvector_np), dtype=np.float64).copy()
     lc_opt[~good] = np.nan
     return w_best, lc_opt, res
-
-
-# =========================================================================
-# =========================================================================
-
-
-def print_flex(splits):
-    s = "Taking cadences from: beginning to "
-    for split in splits:
-        s += f"{split:.1f}; to "
-    s += "end"
-    print(s)
 
 
 # =========================================================================
@@ -852,6 +834,8 @@ def do_lc(
 
 
 def plot_lc(ax1, time, lc, name, trends=None, title=False):
+    import matplotlib as mpl
+
     m = (lc > 0.0) * (np.isfinite(lc))
 
     ax1.plot(time[m], lc[m] / np.nanmedian(lc[m]), ".")
@@ -869,17 +853,21 @@ def plot_lc(ax1, time, lc, name, trends=None, title=False):
     ax1.set_xlabel("Time")
     ax1.set_ylabel("Relative Flux")
     if title:
-        plt.title(f"{name}")
+        ax1.set_title(f"{name}")
 
 
 def plot_fluxmap(ax1, image, name, title=False):
+    import matplotlib as mpl
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.axes_grid1 import axes_size, make_axes_locatable
+
     cmap = mpl.colormaps["hot"].with_extremes(bad="k")
     img_arr = np.asarray(image, dtype=np.float64)
     pos = np.isfinite(img_arr) & (img_arr > 0.0)
     im = np.where(pos, np.log10(np.where(pos, img_arr, 1.0)), np.nan)
     pic = ax1.imshow(im, cmap=cmap, vmax=np.nanmax(im), interpolation="nearest", origin="lower")
     if title:
-        plt.title(f"{name} Flux Map")
+        ax1.set_title(f"{name} Flux Map")
 
     aspect = 20
     pad_fraction = 0.5
@@ -891,13 +879,15 @@ def plot_fluxmap(ax1, image, name, title=False):
     plt.colorbar(pic, cax=cax)
 
     ax1.yaxis.set_ticks_position("right")
-
     cax.yaxis.set_ticks_position("left")
 
 
 def plot_weightmap(ax1, weightmap, name, title=False, aspect=None):
-    norm = np.size(weightmap)
+    import matplotlib as mpl
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.axes_grid1 import axes_size, make_axes_locatable
 
+    norm = np.size(weightmap)
     cmap = mpl.colormaps["seismic"].with_extremes(bad="k")
 
     wm_scaled = np.ma.filled(weightmap.T * norm, np.nan).astype(np.float64)
@@ -913,27 +903,16 @@ def plot_weightmap(ax1, weightmap, name, title=False, aspect=None):
         aspect=aspect,
     )
     if title:
-        plt.title(f"TV-min Weightmap: {name}")
+        ax1.set_title(f"TV-min Weightmap: {name}")
 
-    if aspect is not None:
-        aspect_val = 20
-        pad_fraction = 0.5
-
-        divider = make_axes_locatable(ax1)
-        width = axes_size.AxesY(ax1, aspect=1.0 / aspect_val)
-        pad = axes_size.Fraction(pad_fraction, width)
-        cax = divider.append_axes("right", size=0.1 * width, pad=0.1 * pad)
-    else:
-        aspect_val = 20
-        pad_fraction = 0.5
-
-        divider = make_axes_locatable(ax1)
-        width = axes_size.AxesY(ax1, aspect=1.0 / aspect_val)
-        pad = axes_size.Fraction(pad_fraction, width)
-        cax = divider.append_axes("right", size=width, pad=pad)
+    divider = make_axes_locatable(ax1)
+    width = axes_size.AxesY(ax1, aspect=1.0 / 20)
+    pad = axes_size.Fraction(0.5, width)
+    size_arg = 0.1 * width if aspect is not None else width
+    pad_arg = 0.1 * pad if aspect is not None else pad
+    cax = divider.append_axes("right", size=size_arg, pad=pad_arg)
 
     plt.colorbar(pic, cax=cax, label="log Weight")
-
     ax1.yaxis.set_ticks_position("left")
 
 
@@ -954,15 +933,15 @@ def plot_pgram(
     ax1.set_xlim(1.0 / max_p * DAY_TO_MUHZ, 1.0 / min_p * DAY_TO_MUHZ)
     ax1.set_xlabel(r"Frequency ($\mu$Hz)")
     ax1.set_ylabel(r"Power (ppm$^2/{\mu}Hz)$")
+    ax1.set_ylim(0, np.max(power))
 
     ax2 = ax1.twiny()
     ax2.tick_params(axis="x", direction="in", pad=-20)
-
     ax2.set_xlim(1.0 / max_p, 1.0 / min_p)
     ax2.set_xlabel("c/d", labelpad=-20)
-    plt.ylim(0, np.max(power))
+
     if title:
-        plt.title(f"{name} Power Spectrum", y=1.01)
+        ax1.set_title(f"{name} Power Spectrum", y=1.01)
     ax1.legend()
     peak_period = 1.0 / frequency[np.argmax(power)] * alias
     ax1.text(
@@ -979,26 +958,27 @@ def plot_log_pgram(ax1, frequency, power, spower, name, min_p=1.0 / 24.0, max_p=
     ax1.set_xlim(1.0 / max_p * DAY_TO_MUHZ, 1.0 / min_p * DAY_TO_MUHZ)
     ax1.set_xlabel(r"Frequency ($\mu$Hz)")
     ax1.set_ylabel(r"Power (ppm$^2/{\mu}Hz)$")
+    ax1.set_ylim(np.percentile(spower, 5), np.max(power))
+    ax1.set_xscale("log")
+    ax1.set_yscale("log")
 
     ax2 = ax1.twiny()
     ax2.tick_params(axis="x", direction="in", pad=-20)
-
     ax2.set_xlim(1.0 / max_p, 1.0 / min_p)
     ax2.set_xlabel("c/d", labelpad=-35)
-
-    plt.ylim(np.percentile(spower, 5), np.max(power))
-    ax1.set_xscale("log")
     ax2.set_xscale("log")
 
-    plt.yscale("log")
     if title:
-        plt.title(f"{name} Power Spectrum", y=1.01)
+        ax1.set_title(f"{name} Power Spectrum", y=1.01)
     ax1.legend()
 
 
 def plot_all(ts, image, weightmap, save_file=None, formal_name="test", title=True):
-    min_p, max_p = 1.0 / 24.0, 20.0
+    import matplotlib as mpl
+    import matplotlib.pyplot as plt
+    from matplotlib.gridspec import GridSpec
 
+    min_p, max_p = 1.0 / 24.0, 20.0
     PW, PH = 8.27, 11.69
 
     frequency, power, spower = get_pgram(ts["time"], ts["whitened"], min_p=min_p, max_p=max_p)
@@ -1020,12 +1000,12 @@ def plot_all(ts, image, weightmap, save_file=None, formal_name="test", title=Tru
         gs3 = GridSpec(2, 2)
         gs3.update(top=1 / 3.0 * 0.96, bottom=0.04, hspace=0.07, left=0.09, right=0.96)
 
-        ax_lctime = subplot(gs1[0, :])
-        ax_lcwhite = subplot(gs1[1, :], sharex=ax_lctime)
-        ax_fluxmap = subplot(gs2[0, 0])
-        ax_weightmap = subplot(gs2[0, 1])
-        ax_periodogram = subplot(gs3[0, :])
-        ax_logpgram = subplot(gs3[1, :])
+        ax_lctime = fig.add_subplot(gs1[0, :])
+        ax_lcwhite = fig.add_subplot(gs1[1, :], sharex=ax_lctime)
+        ax_fluxmap = fig.add_subplot(gs2[0, 0])
+        ax_weightmap = fig.add_subplot(gs2[0, 1])
+        ax_periodogram = fig.add_subplot(gs3[0, :])
+        ax_logpgram = fig.add_subplot(gs3[1, :])
 
         plot_lc(ax_lctime, ts["time"], ts["corr_flux"], formal_name, trends=[ts["trend"]])
         plot_lc(ax_lcwhite, ts["time"], ts["whitened"], formal_name + ": Whitened")
@@ -1041,7 +1021,7 @@ def plot_all(ts, image, weightmap, save_file=None, formal_name="test", title=Tru
         ax_weightmap.set_title("TV-Min Weight Map")
 
         if save_file is not None:
-            plt.savefig(save_file)
+            fig.savefig(save_file)
     return fig
 
 
@@ -1078,8 +1058,8 @@ def _compute_legacy_tpf_flux_err(
     if fbe_arr is not None and not np.any(np.isfinite(fbe_arr) & (fbe_arr > 0.0)):
         fbe_arr = None
 
-    se_arr = read_smear_err(tpf_obj, apply_quality_mask=True)
-    bkg_cov = read_bkg_covariance(tpf_obj, apply_quality_mask=True)
+    se_arr = read_smear_err(tpf_obj, quality_mask=True)
+    bkg_cov = read_bkg_covariance(tpf_obj, quality_mask=True)
     if fe_arr is None and se_arr is None and bkg_cov is None and fbe_arr is None:
         return np.full(n_total, np.nan, dtype=np.float64)
 
@@ -1215,6 +1195,119 @@ def _deprecated(message: str):
     return decorator
 
 
+def _run_legacy_tpf_halo(
+    tpf_obj,
+    lc_cls,
+    extra_keys: dict[str, Any],
+    *,
+    use_tpf_headers: bool,
+    aperture_mask="pipeline",
+    split_times=None,
+    sub=1,
+    maxiter=101,
+    w_init=None,
+    random_init=False,
+    thresh=-1,
+    minflux=-100.0,
+    objective="tv",
+    rr=None,
+    analytic=True,
+    sigclip=False,
+    mask=None,
+    verbose=True,
+    lag=1,
+    bitmask="default",
+):
+    """Shared implementation backing deprecated ``halo_tpf.halo`` and ``halo_tpf_tess.halo``."""
+    ap_mask = tpf_obj._parse_aperture_mask(aperture_mask) if mask is None else mask
+    mission = "tess" if tpf_obj.mission == "TESS" else "kepler"
+
+    cent_col, cent_row = tpf_obj.estimate_centroids(aperture_mask=ap_mask)
+    ts = Table(
+        {
+            "time": tpf_obj.time.value,
+            "cadence": tpf_obj.cadenceno,
+            "x": tpf_obj.hdu[1].data["POS_CORR1"][tpf_obj.quality_mask],
+            "y": tpf_obj.hdu[1].data["POS_CORR2"][tpf_obj.quality_mask],
+            "quality": tpf_obj.quality,
+        }
+    )
+
+    flux = np.copy(tpf_obj.flux)
+    flux[:, ~ap_mask] = np.nan
+    if rr is not None:
+        rmin, rmax = rr
+        if verbose:
+            print("Getting annulus from", rmin, "to", rmax)
+        flux = get_annulus(flux, rmin, rmax)
+        if verbose:
+            print("Using", np.sum(np.isfinite(flux[0, :, :])), "pixels")
+
+    flux_arr = flux.value if hasattr(flux, "value") else np.asarray(flux)
+    _, ts, _, weightmap, _ = do_lc(
+        flux_arr,
+        ts,
+        (None, None),
+        sub,
+        maxiter=maxiter,
+        split_times=split_times,
+        w_init=w_init,
+        random_init=random_init,
+        thresh=thresh,
+        minflux=minflux,
+        analytic=analytic,
+        sigclip=sigclip,
+        verbose=verbose,
+        lag=lag,
+        objective=objective,
+        mission=mission,
+        bitmask=bitmask,
+    )
+
+    keys = {
+        "centroid_col": cent_col,
+        "centroid_row": cent_row,
+        "quality": ts["quality"],
+        "targetid": tpf_obj.targetid,
+        "mission": tpf_obj.mission,
+        "ra": tpf_obj.ra,
+        "dec": tpf_obj.dec,
+        "cadenceno": ts["cadence"],
+        **extra_keys,
+    }
+    flux_err_lc = _compute_legacy_tpf_flux_err(
+        tpf_obj, weightmap, ts["corr_flux"], flux_arr, split_times=split_times
+    )
+    lc_out = lc_cls(
+        flux=ts["corr_flux"],
+        time=Time(ts["time"], format=tpf_obj.time.format, scale=tpf_obj.time.scale),
+        flux_err=flux_err_lc,
+        **keys,
+    )
+    lc_out["pos_corr1"] = tpf_obj.pos_corr1
+    lc_out["pos_corr2"] = tpf_obj.pos_corr2
+    lc_out.meta = dict(lc_out.meta)
+    if use_tpf_headers:
+        object.__setattr__(lc_out, "primary_header", tpf_obj.hdu[0].header)
+        object.__setattr__(lc_out, "data_header", tpf_obj.hdu[1].header)
+    else:
+        hdu = lc_out.to_fits()
+        object.__setattr__(lc_out, "primary_header", hdu[0].header)
+        object.__setattr__(lc_out, "data_header", hdu[1].header)
+
+    if "weightmaps" in weightmap:
+        lc_out.meta["WEIGHTMAP"] = np.swapaxes(
+            np.asarray(weightmap["weightmaps"], dtype=np.float64), -1, -2
+        )
+        if split_times is not None:
+            lc_out.meta["SPLIT_TIMES"] = np.sort(
+                np.asarray(split_times, dtype=np.float64).ravel()
+            ).tolist()
+    else:
+        lc_out.meta["WEIGHTMAP"] = np.asarray(weightmap["weightmap"], dtype=np.float64).T
+    return weightmap, lc_out
+
+
 @_deprecated(_HALO_TPF_DEPRECATION_MSG)
 class halo_tpf(lightkurve.KeplerTargetPixelFile):
     @_deprecated(_HALO_TPF_DEPRECATION_MSG)
@@ -1237,145 +1330,29 @@ class halo_tpf(lightkurve.KeplerTargetPixelFile):
         lag=1,
         bitmask="default",
     ):
-        """Performs 'halo' TV-min weighted-aperture photometry.
-         Parameters
-        ----------
-        aperture_mask : array-like, 'pipeline', or 'all'
-            A boolean array describing the aperture such that `False` means
-            that the pixel will be masked out.
-            If the string 'all' is passed, all pixels will be used.
-            The default behaviour is to use the Kepler pipeline mask.
-         split_times : sequence of float, optional
-            Timestamps at which to split the light curve and run halo separately on each segment.
-         sub : int
-            Do you want to subsample every nth pixel in your light curve? Not advised,
-            but can come in handy for very large TPFs.
-         maxiter: int
-            Number of iterations to optimize. 101 is default & usually sufficient.
-         w_init: None or array-like.
-            Initialize weights with a particular weight vector - useful if you have
-            already run TV-min and want to update, but otherwise set to None
-            and it will have default initialization.
-         random_init: Boolean
-            If False, and w_init is None, it will initialize with uniform weights; if True, it
-            will initialize with random weights. False is usually better.
-         thresh: float
-            A float greater than 0. Pixels less than this fraction of the maximum
-            flux at any pixel will be masked out - this is to deal with saturation.
-            Because halo is usually intended for saturated stars, the default is 0.8,
-            to deal with saturated pixels. If your star is not saturated, set this
-            greater than 1.0.
-         analytic: Boolean
-            If True, it will optimize the TV with JAX analytic derivatives, which is
-            several orders of magnitude faster than with numerical derivatives. This is
-            by default True but you can run it numerically with False if you prefer.
-         sigclip: Boolean
-            If True, it will iteratively run the TV-min algorithm clipping outliers.
-            Use this for data with a lot of outliers, but by default it is set False.
-         Returns
-        -------
-        lc : KeplerLightCurve object
-            Array containing the TV-min flux within the aperture for each
-            cadence.
-        """
-
-        if mask is None:
-            aperture_mask = self._parse_aperture_mask(aperture_mask)
-        else:
-            aperture_mask = mask
-
-        if self.mission == "TESS":
-            mission = "tess"
-        else:
-            mission = "kepler"
-
-        cent_col, cent_row = self.estimate_centroids(aperture_mask=aperture_mask)
-
-        x = self.hdu[1].data["POS_CORR1"][self.quality_mask]
-        y = self.hdu[1].data["POS_CORR2"][self.quality_mask]
-        quality = self.quality
-        ts = Table(
-            {
-                "time": self.time.value,
-                "cadence": self.cadenceno,
-                "x": x,
-                "y": y,
-                "quality": quality,
-            }
-        )
-
-        flux = np.copy(self.flux)
-
-        flux[:, ~aperture_mask] = np.nan
-        if rr is not None:
-            rmin, rmax = rr
-            if verbose:
-                print("Getting annulus from", rmin, "to", rmax)
-            flux = get_annulus(flux, rmin, rmax)
-            if verbose:
-                print("Using", np.sum(np.isfinite(flux[0, :, :])), "pixels")
-
-        flux_arr = flux.value if hasattr(flux, "value") else np.asarray(flux)
-        pf, ts, weights, weightmap, pixels_sub = do_lc(
-            flux_arr,
-            ts,
-            (None, None),
-            sub,
-            maxiter=maxiter,
+        """Performs legacy 'halo' TV-min weighted-aperture photometry on Kepler/K2 TPFs."""
+        return _run_legacy_tpf_halo(
+            self,
+            lightkurve.KeplerLightCurve,
+            {"channel": self.channel, "campaign": self.campaign, "quarter": self.quarter},
+            use_tpf_headers=False,
+            aperture_mask=aperture_mask,
             split_times=split_times,
+            sub=sub,
+            maxiter=maxiter,
             w_init=w_init,
             random_init=random_init,
             thresh=thresh,
             minflux=minflux,
+            objective=objective,
+            rr=rr,
             analytic=analytic,
             sigclip=sigclip,
+            mask=mask,
             verbose=verbose,
             lag=lag,
-            objective=objective,
-            mission=mission,
             bitmask=bitmask,
         )
-
-        keys = {
-            "centroid_col": cent_col,
-            "centroid_row": cent_row,
-            "quality": ts["quality"],
-            "channel": self.channel,
-            "campaign": self.campaign,
-            "targetid": self.targetid,
-            "mission": self.mission,
-            "quarter": self.quarter,
-            "ra": self.ra,
-            "dec": self.dec,
-            "cadenceno": ts["cadence"],
-        }
-
-        flux_err_lc = _compute_legacy_tpf_flux_err(
-            self, weightmap, ts["corr_flux"], flux_arr, split_times=split_times
-        )
-        lc_out = lightkurve.KeplerLightCurve(
-            flux=ts["corr_flux"],
-            time=Time(ts["time"], format=self.time.format, scale=self.time.scale),
-            flux_err=flux_err_lc,
-            **keys,
-        )
-        lc_out["pos_corr1"] = self.pos_corr1
-        lc_out["pos_corr2"] = self.pos_corr2
-        lc_out.meta = dict(lc_out.meta)
-        hdu = lc_out.to_fits()
-        object.__setattr__(lc_out, "primary_header", hdu[0].header)
-        object.__setattr__(lc_out, "data_header", hdu[1].header)
-        if "weightmaps" in weightmap:
-            lc_out.meta["WEIGHTMAP"] = np.swapaxes(
-                np.asarray(weightmap["weightmaps"], dtype=np.float64), -1, -2
-            )
-            if split_times is not None:
-                lc_out.meta["SPLIT_TIMES"] = (
-                    np.sort(np.asarray(split_times, dtype=np.float64).ravel()).tolist()
-                )
-        else:
-            lc_out.meta["WEIGHTMAP"] = np.asarray(weightmap["weightmap"], dtype=np.float64).T
-        return weightmap, lc_out
 
 
 @_deprecated(_HALO_TPF_TESS_DEPRECATION_MSG)
@@ -1400,143 +1377,29 @@ class halo_tpf_tess(lightkurve.TessTargetPixelFile):
         lag=1,
         bitmask="default",
     ):
-        """Performs 'halo' TV-min weighted-aperture photometry.
-         Parameters
-        ----------
-        aperture_mask : array-like, 'pipeline', or 'all'
-            A boolean array describing the aperture such that `False` means
-            that the pixel will be masked out.
-            If the string 'all' is passed, all pixels will be used.
-            The default behaviour is to use the Kepler pipeline mask.
-         split_times : sequence of float, optional
-            Timestamps at which to split the light curve and run halo separately on each segment.
-         sub : int
-            Do you want to subsample every nth pixel in your light curve? Not advised,
-            but can come in handy for very large TPFs.
-         maxiter: int
-            Number of iterations to optimize. 101 is default & usually sufficient.
-         w_init: None or array-like.
-            Initialize weights with a particular weight vector - useful if you have
-            already run TV-min and want to update, but otherwise set to None
-            and it will have default initialization.
-         random_init: Boolean
-            If False, and w_init is None, it will initialize with uniform weights; if True, it
-            will initialize with random weights. False is usually better.
-         thresh: float
-            A float greater than 0. Pixels less than this fraction of the maximum
-            flux at any pixel will be masked out - this is to deal with saturation.
-            Because halo is usually intended for saturated stars, the default is 0.8,
-            to deal with saturated pixels. If your star is not saturated, set this
-            greater than 1.0.
-         analytic: Boolean
-            If True, it will optimize the TV with JAX analytic derivatives, which is
-            several orders of magnitude faster than with numerical derivatives. This is
-            by default True but you can run it numerically with False if you prefer.
-         sigclip: Boolean
-            If True, it will iteratively run the TV-min algorithm clipping outliers.
-            Use this for data with a lot of outliers, but by default it is set False.
-         Returns
-        -------
-        lc : TessLightCurve object
-            Array containing the TV-min flux within the aperture for each
-            cadence.
-        """
-
-        if mask is None:
-            aperture_mask = self._parse_aperture_mask(aperture_mask)
-        else:
-            aperture_mask = mask
-
-        if self.mission == "TESS":
-            mission = "tess"
-        else:
-            mission = "kepler"
-
-        cent_col, cent_row = self.estimate_centroids(aperture_mask=aperture_mask)
-
-        x = self.hdu[1].data["POS_CORR1"][self.quality_mask]
-        y = self.hdu[1].data["POS_CORR2"][self.quality_mask]
-        quality = self.quality
-        ts = Table(
-            {
-                "time": self.time.value,
-                "cadence": self.cadenceno,
-                "x": x,
-                "y": y,
-                "quality": quality,
-            }
-        )
-
-        flux = np.copy(self.flux)
-
-        flux[:, ~aperture_mask] = np.nan
-        if rr is not None:
-            rmin, rmax = rr
-            if verbose:
-                print("Getting annulus from", rmin, "to", rmax)
-            flux = get_annulus(flux, rmin, rmax)
-            if verbose:
-                print("Using", np.sum(np.isfinite(flux[0, :, :])), "pixels")
-
-        flux_arr = flux.value if hasattr(flux, "value") else np.asarray(flux)
-        pf, ts, weights, weightmap, pixels_sub = do_lc(
-            flux_arr,
-            ts,
-            (None, None),
-            sub,
-            maxiter=maxiter,
+        """Performs legacy 'halo' TV-min weighted-aperture photometry on TESS TPFs."""
+        return _run_legacy_tpf_halo(
+            self,
+            lightkurve.TessLightCurve,
+            {"sector": self.sector, "camera": self.camera, "ccd": self.ccd},
+            use_tpf_headers=True,
+            aperture_mask=aperture_mask,
             split_times=split_times,
+            sub=sub,
+            maxiter=maxiter,
             w_init=w_init,
             random_init=random_init,
             thresh=thresh,
             minflux=minflux,
+            objective=objective,
+            rr=rr,
             analytic=analytic,
             sigclip=sigclip,
+            mask=mask,
             verbose=verbose,
             lag=lag,
-            objective=objective,
-            mission=mission,
             bitmask=bitmask,
         )
-
-        keys = {
-            "centroid_col": cent_col,
-            "centroid_row": cent_row,
-            "quality": ts["quality"],
-            "targetid": self.targetid,
-            "ra": self.ra,
-            "dec": self.dec,
-            "sector": self.sector,
-            "camera": self.camera,
-            "ccd": self.ccd,
-            "mission": self.mission,
-            "cadenceno": ts["cadence"],
-        }
-        flux_err_lc = _compute_legacy_tpf_flux_err(
-            self, weightmap, ts["corr_flux"], flux_arr, split_times=split_times
-        )
-        lc_out = lightkurve.TessLightCurve(
-            flux=ts["corr_flux"],
-            time=Time(ts["time"], format=self.time.format, scale=self.time.scale),
-            flux_err=flux_err_lc,
-            **keys,
-        )
-        lc_out["pos_corr1"] = self.pos_corr1
-        lc_out["pos_corr2"] = self.pos_corr2
-        lc_out.meta = dict(lc_out.meta)
-        if "weightmaps" in weightmap:
-            lc_out.meta["WEIGHTMAP"] = np.swapaxes(
-                np.asarray(weightmap["weightmaps"], dtype=np.float64), -1, -2
-            )
-            if split_times is not None:
-                lc_out.meta["SPLIT_TIMES"] = (
-                    np.sort(np.asarray(split_times, dtype=np.float64).ravel()).tolist()
-                )
-        else:
-            lc_out.meta["WEIGHTMAP"] = np.asarray(weightmap["weightmap"], dtype=np.float64).T
-        object.__setattr__(lc_out, "primary_header", self.hdu[0].header)
-        object.__setattr__(lc_out, "data_header", self.hdu[1].header)
-        return weightmap, lc_out
 
     @property
     def flux(self) -> Quantity:

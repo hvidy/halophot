@@ -8,23 +8,27 @@
 
 Simply run
 
-`pip install halophot`
+```bash
+pip install halophot
+```
 
-or else clone this git repository, enter the directory, and run
+or clone this git repository, enter the directory, and run
 
-`pip install -e .`
+```bash
+pip install -e .
+```
 
 ## K2 and TESS Halo Photometry
 
-This is code that implements a Total Variation (TV) based regularization for *Kepler*/*K2* and *TESS* photometry of very bright stars.
+This package implements Total Variation (TV) halo photometry for *Kepler*/*K2* and *TESS* observations of very bright, saturated stars in JAX.
 
-We minimize nth order TV - i.e. the sum of the absolute values of the nth differences of a light curve - of a light curve created as the weighted sum of pixels, with weights in (0,1). This appears remarkably effective at removing pointing-based and scattered-light systematics from *K2* and *TESS* light curves where it is impractical to do photometry otherwise and apply more standard detrending methods.
-
-We believe this is of practical use for *Kepler* targets brighter than Kp ~ 6 and saturated *TESS* targets brighter than T ~ 4.
+We minimize a smoothness objective (by default 1st-order smooth Charbonnier total variation) of a normalized light curve created as the non-negative weighted sum of unsaturated halo pixels, $w \in \Delta^{M-1}$, parameterized directly via symmetric zero-mean softmax logits. This is effective for *Kepler* targets brighter than $K_p \sim 6$ and saturated *TESS* targets brighter than $T \sim 4$.
 
 ## Basic usage
 
-### Functional `lightkurve` API (`halophot` v2.0)
+### Functional `lightkurve` API
+
+`extract_halo_lightcurve` accepts a `lightkurve.TargetPixelFile`, a TPF FITS path, or a raw 3D `(N_cad, ny, nx)` NumPy array, and returns a `HaloLightCurve` (`KeplerLightCurve` / `TessLightCurve` subclass) whose `.to_fits()` delegates directly to `write_lightcurve_fits`:
 
 ```python
 import lightkurve as lk
@@ -36,37 +40,80 @@ lc = halophot.extract_halo_lightcurve(
     sigclip=True,
     compute_uncertainty=True,
 )
-# Save HLSP FITS with lossless WEIGHTMAP ImageHDU and coherent flux_err
-halophot.write_fits(lc, "target_halo_lc.fits")
 
-# Reload light curve and pixel weightmap (do NOT use lc.to_fits(), which drops HALOCVER=1 extensions)
+# Visual diagnostic summary (stamp, weightmap, light curve, Lomb-Scargle PSD)
+fig = halophot.plot_diagnostics(lc, tpf)
+
+# Save and reload with lossless WEIGHTMAP, WEIGHTMAP_ERR, SPLIT_TIMES, SEGMENT_SCALES, POS_CORR1/2
+lc.to_fits("target_halo_lc.fits", overwrite=True)
 lc_reloaded = lk.read("target_halo_lc.fits")
-wmap = halophot.read_weightmap(lc_reloaded)
+wmap = halophot.read_weightmap("target_halo_lc.fits")
 ```
 
-> **Note:** Always use `halophot.write_fits(lc, path)` and `halophot.read_weightmap(lc_or_path)` (plus `halophot.read_weightmap_err` and `halophot.read_split_times` when requested) rather than `lc.to_fits(path)`. Lightkurve's built-in `to_fits()` drops the `HALOCVER = 1` extensions (`WEIGHTMAP`, `WEIGHTMAP_ERR`, `SPLIT_TIMES`), provenance header cards, and unnormalized `e-/s` flux units.
+Returned `HaloLightCurve` objects include:
 
-`extract_halo_lightcurve` returns a standard `lightkurve.LightCurve` (`KeplerLightCurve` or `TessLightCurve`) with:
+- `flux`, unified coherent `flux_err` (uncorrelated pixel noise with `float32`-ULP and detector shot-noise floor, WLS oblique `SMEAR_ERR`, and `BKG_CHOL` / `BKG_BASIS` covariance), and `lc["inlier_mask"]` marking cadences kept during `sigclip` weight fitting;
+- positive-flux weightmap-weighted `centroid_col` / `centroid_row` alongside preserved `pos_corr1` / `pos_corr2`;
+- native `(ny, nx)` `lc.meta["WEIGHTMAP"]` (or `(n_splits, ny, nx)` with `split_times`), preserved automatically by both `lc.to_fits(path)` and `halophot.write_fits(lc, path)`.
 
-- `flux` and unified coherent `flux_err` propagated in `float64` across uncorrelated pixel noise (with a `float32`-ULP cancellation floor), exact WLS oblique column-projected `SMEAR_ERR`, and `BKG_CHOL` / `BKG_BASIS` background covariance;
-- positive-flux, weightmap-weighted aperture centroids in `centroid_col` / `centroid_row` (keeping `pos_corr1` / `pos_corr2` separate and preserved in HDU 1 across `halophot.write_fits` / `lk.read` round-trips);
-- non-transposed `(ny, nx)` `lc.meta['WEIGHTMAP']` (or `(n_splits, ny, nx)` when `split_times` is supplied), preserved losslessly on disk via `halophot.write_fits(lc, path)` and read back via `halophot.read_weightmap(...)`.
+### Writing custom JAX objective functions
 
-Legacy `halo_tpf` / `halo_tpf_tess` subclass shims are **deprecated in v2.0.0** (emitting `DeprecationWarning` in favour of `extract_halo_lightcurve`), while `do_lc` and `legacy_tv=True` remain available for *K2* and `halo-tess` DR1 compatibility. Root-mapped Apptainer (`hpc/virgil_halophot.def`, `hpc/build_halo_sif.sbatch` -> `halo.sif`) and Slurm CPU/A100 survey templates (`hpc/halophot_survey_cpu.sbatch`, `hpc/halophot_survey_gpu.sbatch`) are provided in `hpc/`.
+All built-in objectives (`"tv"`, `"tv_o2"`, `"tv_exp"`, `"l2v"`, `"l3v"`, `"owl"`) live in `halophot.objectives.OBJECTIVES`. You can test your own JAX objective function directly without modifying `halophot`:
+
+```python
+import jax.numpy as jnp
+import halophot
+
+# 1-argument objective on unit-mean 1D flux
+def my_tv(flux):
+    diffs = jnp.diff(flux)
+    return jnp.mean(jnp.sqrt(diffs**2 + 1e-8))
+
+lc = halophot.extract_halo_lightcurve(tpf, objective=my_tv)
+
+# Gap-safe 2-argument objective receiving boolean step_mask of shape (N - lag,)
+def gap_safe_tv(flux, step_mask):
+    diffs = jnp.diff(flux)
+    return jnp.sum(jnp.where(step_mask, jnp.sqrt(diffs**2 + 1e-10), 0.0)) / jnp.sum(step_mask)
+
+fit = halophot.optimise_halo(pixels, times, objective=gap_safe_tv)
+
+# Keyword-aware objective requesting any subset of
+# (flux, *, step_mask, weights, pixels, times, dt_nom, lag)
+def weighted_custom_obj(flux, *, step_mask, weights):
+    diffs = jnp.diff(flux)
+    tv = jnp.sum(jnp.where(step_mask, jnp.sqrt(diffs**2 + 1e-10), 0.0)) / jnp.sum(step_mask)
+    return tv + 1e-3 * jnp.sum(weights**2)
+
+fit = halophot.optimise_halo(pixels, times, objective=weighted_custom_obj)
+
+# Register by name in halophot.OBJECTIVES
+@halophot.register_objective("l2_entropy")
+def l2_entropy(flux, *, step_mask, weights):
+    diffs = jnp.diff(flux)
+    l2 = jnp.sum(jnp.where(step_mask, diffs**2, 0.0)) / jnp.sum(step_mask)
+    return l2 + 1e-4 * jnp.sum(weights * jnp.log(jnp.maximum(weights, 1e-12)))
+
+lc = halophot.extract_halo_lightcurve(tpf, objective="l2_entropy")
+```
+
+Structured options can be grouped into `halophot.MaskConfig(...)` and `halophot.OptimConfig(...)` or passed directly as keyword arguments. Legacy `halo_tpf` / `halo_tpf_tess` shims remain available (emitting `DeprecationWarning`).
 
 ### Command-line usage
 
 Call `halo` from the command line as, e.g.
 
-`halo ktwo200007768-c04_lpd-targ.fits --data-dir /path/to/data/directory/ --name Atlas -c 4 --do-plot`
+```bash
+halo ktwo200007768-c04_lpd-targ.fits --data-dir /path/to/data/directory/ --name Atlas -c 4 --do-plot
+```
 
-where `--name` is the star name you would like to save the outputs under, and `-c` is the campaign. Key v2.0 CLI flags include:
+Key CLI flags:
 
-- `--hlsp-fits`: emit a `HALOCVER = 1` `lightkurve` FITS file with lossless `WEIGHTMAP` (and `SPLIT_TIMES` / `WEIGHTMAP_ERR` when requested), while honouring `--bitmask`, `--do-split` / `--splits` / `--split-cadences` / `-c`, and `--do-plot`;
+- `--hlsp-fits`: run `extract_halo_lightcurve` and write a `HALOCVER = 1` FITS file with lossless `WEIGHTMAP` (plus `SPLIT_TIMES`, `SEGMENT_SCALES`, and `WEIGHTMAP_ERR` when requested);
 - `--uncertainty`: compute orbit block-jackknife pixel weight uncertainties (`WEIGHTMAP_ERR`) in `--hlsp-fits` mode;
-- `--legacy-tv`: reproduce unregularized $w$-simplex total variation for *K2* and `halo-tess` DR1 compatibility;
-- `--deathstar --catalog-table <path>`: mask contaminant stars via WCS using a pre-cached FITS/Parquet/ECSV catalogue table (pair with `--offline` on compute nodes without internet access);
-- `--cache-dir <path>` and `--strict-hpc` / `--no-strict-hpc`: `strict_hpc=True` is enabled by default in both `resolve_cache_dir` and the CLI (`$HALOPHOT_CACHE_DIR` -> `$TESS_BRIGHT_CACHE_DIR` -> `$SCRATCH/.cache/tess_bright`), rejecting `/fred/` cache paths to protect HPC project inode quotas.
+- `--sigclip` / `--no-sigclip`: exclude local flux outliers during weight optimization and record `inlier_mask`;
+- `--deathstar --catalog-table <path>`: mask contaminant stars via WCS using a pre-cached FITS/Parquet/ECSV catalogue table (pair with `--offline` on compute nodes);
+- `--cache-dir <path>` and `--strict-hpc` / `--no-strict-hpc`: guard HPC `/fred/` inode quotas when performing live catalogue downloads.
 
 ## Licence
 

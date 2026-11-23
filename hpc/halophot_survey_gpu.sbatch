@@ -10,9 +10,8 @@
 #SBATCH --output=/aphid/scratch-3month/%u/logs/%x-%j.out
 #SBATCH --error=/aphid/scratch-3month/%u/logs/%x-%j.err
 #
-# Swinburne Ngarrgu Tindebeek (tooarrana) NVIDIA A100 80GB GPU survey template for halophot v2.0.1.
-# Bucketed N_pad padding in HaloObservation reuses compiled FP64 XLA kernels across sigclip passes
-# and jackknife folds within each target (and across targets sharing active pixel count M and N_pad).
+# Swinburne Ngarrgu Tindebeek (tooarrana) NVIDIA A100 80GB GPU survey template for halophot.
+# Running a target batch in one Python process amortizes JAX startup and XLA compilation across targets.
 # Set PIPELINE_MODE=full_e2e (after Stage-1 `mundey prefetch`) to run mundey -> tessbkgd -> halophot
 # in a single pass on raw MAST _tp.fits files; defaults to PIPELINE_MODE=halophot_only.
 # Set MAX_FAIL_FRAC (default 0.0) to control the maximum tolerated target failure fraction.

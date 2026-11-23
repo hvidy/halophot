@@ -1,22 +1,20 @@
-"""Spatial halo masking, sky-dominance guards, and WCS contaminant-star exclusion.
+"""Spatial halo masking, saturation dilation, and WCS contaminant-star exclusion.
 
-Implements Section 5.2 and Section 6.1 aperture selection rules:
+Implements clean aperture selection for halo photometry:
 
-* Automatic exclusion of ``PIXEL_QUALITY`` bits ``STRAP_COL | SAT_BLEED |
-  SMEAR_UNRESOLVED | SOURCE_MASK | BKG_USED`` so ``Omega_halo`` and ``Omega_bg``
-  are strictly disjoint (``Omega_halo cap Omega_bg = empty``).
-* 2D saturation + bleed + LDE-undershoot dilation via ``scipy.ndimage.binary_dilation``,
-  calibrated to physical single-read CCD full-well rates per frame integration time
-  (Vanderspek et al. 2018 for *TESS*; Van Cleve & Caldwell 2016 for *Kepler*/*K2*).
-* Sky-dominance guard (``U_bar_i - B_bar_i >= kappa * B_bar_i`` when ``BKGSUB=False``
-  and ``P_bar_i >= kappa * sigma_{B,i}`` from ``BKG_CHOL`` / ``FLUX_BKG_ERR`` when
-  ``BKGSUB=True``, with ``kappa = 2.0`` default and ``not legacy_tv``) plus pixel
-  ``SNR_i >= 5`` preventing TV minimization from diluting astrophysical
-  amplitudes on sky-dominated pixels.
-* WCS-projected contaminant-star masking with proper-motion propagation, plate-scale
-  and flux-contrast scaling from Gaussian PRF encircled energy (Ricker et al. 2015;
-  Bryson et al. 2010), supporting pre-cached Astropy ``Table`` inputs for ``--offline``
-  HPC execution or live ``astroquery.mast`` queries.
+* Excludes ``PIXEL_QUALITY`` bits ``STRAP_COL | SAT_BLEED | SMEAR_UNRESOLVED |
+  SOURCE_MASK | BKG_USED`` so halo and background pixels stay disjoint.
+* 2D saturation + bleed + LDE-undershoot dilation calibrated to physical CCD
+  full-well rates (7.5e4 e-/s for *TESS*; 1.661e5 e-/s for *Kepler*/*K2*),
+  processed in memory-bounded chunks/strips so 20-s *TESS* TPFs never copy
+  full 3D cubes to ``float64``.
+* Optional cadence-invariant ``min_snr`` cut (default ``0.0``, disabled; when
+  ``> 0``, normalized to 2-min-equivalent exposure time via
+  ``sqrt(120 / dt_sec)`` so 20 s, 2 min, and 30 min agree).
+* WCS-projected contaminant-star masking with proper-motion propagation and
+  Gaussian PRF encircled-energy radii, supporting pre-cached Astropy tables or
+  live ``astroquery.mast`` queries without touching cache directories unless a
+  live query is actually executed.
 """
 
 from __future__ import annotations
@@ -48,6 +46,7 @@ __all__ = [
     "DEFAULT_EXCLUDE_QUALITY",
     "HaloMaskResult",
     "KEPLER_SAT_RATE_E_PER_S",
+    "MaskConfig",
     "TESS_SAT_RATE_E_PER_S",
     "_estimate_target_mag",
     "_resolve_tpf_obs_time",
@@ -65,27 +64,14 @@ DEFAULT_EXCLUDE_QUALITY: PixelQuality = (
     | PixelQuality.BKG_USED
 )
 
-# Physical single-frame CCD full-well depth divided by single-frame integration time:
-# - TESS CCID-80: 1.5e5 e- full well / 2.0 s frame = 7.5e4 e-/s
-#   (Vanderspek et al. 2018, TESS Instrument Handbook, Section 4.2 / Table 4.1).
-# - Kepler/K2 e2v CCD90: 1.0e6 e- full well / 6.02 s integration = 1.661e5 e-/s
-#   (Van Cleve & Caldwell 2016, Kepler Instrument Handbook, Section 4.2 / Table 13).
-TESS_FULL_WELL_ELECTRONS: float = 1.5e5
-TESS_FRAME_TIME_SEC: float = 2.0
-TESS_SAT_RATE_E_PER_S: float = TESS_FULL_WELL_ELECTRONS / TESS_FRAME_TIME_SEC
+TESS_SAT_RATE_E_PER_S: float = 1.5e5 / 2.0  # 7.5e4 e-/s (Vanderspek et al. 2018)
+KEPLER_SAT_RATE_E_PER_S: float = 1.0e6 / 6.02  # 1.661e5 e-/s (Van Cleve & Caldwell 2016)
 
-KEPLER_FULL_WELL_ELECTRONS: float = 1.0e6
-KEPLER_FRAME_TIME_SEC: float = 6.02
-KEPLER_SAT_RATE_E_PER_S: float = KEPLER_FULL_WELL_ELECTRONS / KEPLER_FRAME_TIME_SEC
-
-# Pixel-integrated 50% encircled energy in 1x1 pixel (Ricker et al. 2015, JATIS, 1, 014003):
-# erf(0.5 / (sqrt(2) * sigma_det))^2 = 0.50 => sigma_det = 0.5 / (sqrt(2) * erfinv(sqrt(0.5))).
 _DETECTOR_PRF_SIGMA_PIX: float = float(0.5 / (math.sqrt(2.0) * erfinv(math.sqrt(0.5))))
 _OPTICAL_CORE_SIGMA_ARCSEC: float = 2.0
-# Zodiacal sky background reference surface brightness (mag / arcsec^2; Ricker et al. 2015)
-# and 10^-4 total-flux halo-wing contrast threshold (10.0 mag = -2.5 * log10(1e-4)).
 _ZODIACAL_SKY_MU_MAG_ARCSEC2: float = 22.0
 _HALO_WING_CONTRAST_MAG: float = 10.0
+_MASK_CHUNK_CADENCES: int = 4096
 
 _MAG_CANDIDATES: tuple[str, ...] = (
     "tmag",
@@ -98,6 +84,31 @@ _MAG_CANDIDATES: tuple[str, ...] = (
 
 
 @dataclass(frozen=True)
+class MaskConfig:
+    """Structured spatial and cadence masking options for :func:`extract_halo_lightcurve`."""
+
+    aperture_mask: str | np.ndarray = "all"
+    rr: tuple[float, float] | None = None
+    sub: int = 1
+    thresh: float = -1.0
+    auto_sat_level: float | None = None
+    bleed_dilation: tuple[int, int] = (3, 3)
+    minflux: float = -100.0
+    min_snr: float = 0.0
+    exclude_quality: PixelQuality = DEFAULT_EXCLUDE_QUALITY
+    remove_contaminants: bool = False
+    catalog_table: Table | str | os.PathLike[str] | None = None
+    catalog: str = "TIC"
+    offline: bool = False
+    cache_dir: str | os.PathLike[str] | None = None
+    strict_hpc: bool = False
+    target_mag: float | None = None
+    target_exclusion_arcsec: float | None = None
+    mag_limit: float | None = None
+    star_radius_pix: float | None = None
+
+
+@dataclass(frozen=True)
 class HaloMaskResult:
     """Spatial and temporal masks constructed for halo weight optimization."""
 
@@ -105,13 +116,16 @@ class HaloMaskResult:
     cadence_mask: np.ndarray
     saturated_mask: np.ndarray
     quality_excluded_mask: np.ndarray
-    sky_excluded_mask: np.ndarray
     snr_excluded_mask: np.ndarray
     source_excluded_mask: np.ndarray
 
+    @property
+    def sky_excluded_mask(self) -> np.ndarray:
+        """All-False compatibility mask (sky-dominance cuts were removed in v2.0.2)."""
+        return np.zeros_like(self.pixel_mask, dtype=bool)
+
 
 def _load_catalog_table(catalog_table: Table | str | os.PathLike[str]) -> Table:
-    """Load an Astropy ``Table`` from an in-memory instance or local disk path."""
     if isinstance(catalog_table, Table):
         return catalog_table
     path = Path(catalog_table)
@@ -141,13 +155,6 @@ def _find_column_case_insensitive(table: Table, candidates: tuple[str, ...]) -> 
 
 
 def _coalesce_magnitudes(table: Table) -> tuple[np.ndarray | None, bool, str | None]:
-    """Coalesce per-row magnitudes across standard optical/NIR bandpass columns.
-
-    Returns ``(mag_array, has_mag_col, primary_col_lower)``. When one or more
-    magnitude columns exist, missing ``NaN`` entries in the primary column fall
-    back per-row to secondary columns (e.g. ``phot_g_mean_mag`` when ``Tmag``
-    is ``NaN``).
-    """
     lower_map = {col.lower(): col for col in table.colnames}
     found_cols = [lower_map[c] for c in _MAG_CANDIDATES if c in lower_map]
     if not found_cols:
@@ -162,34 +169,28 @@ def _coalesce_magnitudes(table: Table) -> tuple[np.ndarray | None, bool, str | N
 
 
 def _is_electron_count_unit(unit_obj: Any) -> bool:
-    """Return True if ``unit_obj`` represents integrated electrons per cadence."""
     if unit_obj is None or unit_obj == u.dimensionless_unscaled:
         return False
     if unit_obj == u.electron:
         return True
-    text = str(unit_obj).strip().lower()
-    return text in ("electron", "electrons", "e-")
+    return str(unit_obj).strip().lower() in ("electron", "electrons", "e-")
 
 
 def _is_integrated_count_unit(unit_obj: Any) -> bool:
-    """Return True if ``unit_obj`` represents integrated counts/electrons per cadence."""
     if _is_electron_count_unit(unit_obj):
         return True
     if unit_obj is None or unit_obj == u.dimensionless_unscaled:
         return False
     if unit_obj == u.count:
         return True
-    text = str(unit_obj).strip().lower()
-    return text in ("count", "counts", "ct", "adu")
+    return str(unit_obj).strip().lower() in ("count", "counts", "ct", "adu")
 
 
 def _integrated_to_rate_unit(unit_obj: Any) -> u.UnitBase:
-    """Return ``e-/s`` for electron count units, or ``count/s`` for ADU/count units."""
     return (u.electron / u.s) if _is_electron_count_unit(unit_obj) else (u.count / u.s)
 
 
 def _resolve_tpf_column_unit(tpf: Any, col_name: str, attr_unit: Any) -> Any:
-    """Resolve column unit from Lightkurve Quantity or raw HDU 1 ``TUNIT*`` header."""
     if attr_unit is not None and attr_unit != u.dimensionless_unscaled:
         return attr_unit
     hdul = getattr(tpf, "hdu", None)
@@ -204,7 +205,6 @@ def _resolve_tpf_column_unit(tpf: Any, col_name: str, attr_unit: Any) -> Any:
 
 
 def _resolve_hdu_unit(tpf: Any, hdu_name: str, fallback_unit: Any) -> Any:
-    """Resolve ``BUNIT`` from a named FITS extension HDU, falling back to ``fallback_unit``."""
     hdul = getattr(tpf, "hdu", None)
     if hdul is not None and hdu_name in hdul:
         bunit = hdul[hdu_name].header.get("BUNIT")
@@ -214,7 +214,7 @@ def _resolve_hdu_unit(tpf: Any, hdu_name: str, fallback_unit: Any) -> Any:
 
 
 def _resolve_cadence_exposure_sec(tpf: Any, dt_days: float) -> float:
-    """Resolve per-cadence effective integration time in seconds for count->rate conversion."""
+    """Resolve per-cadence effective integration time in seconds."""
     hdul = getattr(tpf, "hdu", None)
     headers: list[Any] = []
     if hdul is not None:
@@ -227,25 +227,26 @@ def _resolve_cadence_exposure_sec(tpf: Any, dt_days: float) -> float:
         headers.append(meta)
 
     for hdr in headers:
-        timedel = hdr.get("TIMEDEL") if hasattr(hdr, "get") else None
+        if not hasattr(hdr, "get"):
+            continue
+        timedel = hdr.get("TIMEDEL")
         if timedel is not None and not isinstance(timedel, bool):
             try:
                 td_val = float(timedel)
             except (TypeError, ValueError):
                 td_val = np.nan
             if np.isfinite(td_val) and td_val > 0.0:
-                deadc_raw = hdr.get("DEADC", 1.0) if hasattr(hdr, "get") else 1.0
                 try:
-                    deadc_val = float(deadc_raw)
+                    deadc_val = float(hdr.get("DEADC", 1.0))
                 except (TypeError, ValueError):
                     deadc_val = 1.0
                 if not np.isfinite(deadc_val) or deadc_val <= 0.0 or deadc_val > 1.0:
                     deadc_val = 1.0
                 return td_val * 86400.0 * deadc_val
 
-        int_time = hdr.get("INT_TIME") if hasattr(hdr, "get") else None
-        n_readout = hdr.get("NREADOUT") if hasattr(hdr, "get") else None
-        num_frm = hdr.get("NUM_FRM") if hasattr(hdr, "get") else None
+        int_time = hdr.get("INT_TIME")
+        n_readout = hdr.get("NREADOUT")
+        num_frm = hdr.get("NUM_FRM")
         if int_time is not None and (n_readout is not None or num_frm is not None):
             try:
                 it_val = float(int_time)
@@ -265,7 +266,6 @@ def _query_mast_region(
     catalog: str = "TIC",
     cache_dir: Path | None = None,
 ) -> Table:
-    """Query MAST ``Catalogs.query_region`` when ``offline=False``."""
     try:
         from astroquery.mast import Catalogs
     except ImportError as exc:
@@ -306,7 +306,6 @@ def _query_mast_region(
 
 
 def _wcs_pixel_scale_arcsec(wcs: WCS) -> float:
-    """Compute geometric mean celestial pixel scale in arcsec/pixel from ``wcs``."""
     scales_deg = np.asarray(proj_plane_pixel_scales(wcs.celestial), dtype=np.float64)
     pos_scales = scales_deg[np.isfinite(scales_deg) & (scales_deg > 0.0)]
     if pos_scales.size == 0:
@@ -315,7 +314,6 @@ def _wcs_pixel_scale_arcsec(wcs: WCS) -> float:
 
 
 def _coerce_obs_time(obs_time: Time | str | float | None, wcs: WCS) -> Time | None:
-    """Resolve observation epoch from ``obs_time`` or ``wcs`` header keywords."""
     if obs_time is not None:
         if isinstance(obs_time, Time):
             jd_arr = np.asarray(np.ma.filled(obs_time.tdb.jd, np.nan), dtype=np.float64)
@@ -331,7 +329,6 @@ def _coerce_obs_time(obs_time: Time | str | float | None, wcs: WCS) -> Time | No
         if isinstance(obs_time, int | float | np.floating):
             val = float(obs_time)
             if np.isfinite(val):
-                # Values < 3000 are Julian years (e.g. 2020.5); > 2.4e6 are JD; else MJD.
                 if 1900.0 <= val <= 2200.0:
                     return Time(val, format="jyear", scale="tdb")
                 if val > 2.4e6:
@@ -363,7 +360,6 @@ def _propagate_catalogue_coords(
     ra_col: str | None = None,
     dec_col: str | None = None,
 ) -> tuple[SkyCoord, SkyCoord, SkyCoord]:
-    """Return ``(coords_raw, coords_j2000, coords_obs)`` propagating proper motions when present."""
     coords_raw = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="icrs")
     pmra_col = _find_column_case_insensitive(table_valid, ("pmra", "pm_ra"))
     pmdec_col = _find_column_case_insensitive(table_valid, ("pmdec", "pm_dec", "pmde"))
@@ -381,36 +377,31 @@ def _propagate_catalogue_coords(
     ra_lower = (ra_col or "").lower()
     dec_lower = (dec_col or "").lower()
     has_gaia_cols = bool(
-        lower_names
-        & {"source_id", "phot_g_mean_mag", "gmag", "dr3_source_id", "dr2_source_id"}
+        lower_names & {"source_id", "phot_g_mean_mag", "gmag", "dr3_source_id", "dr2_source_id"}
     )
     has_tic_cols = bool(lower_names & {"tic", "ticid", "posflag"}) or (
         "id" in lower_names and "tmag" in lower_names and "source_id" not in lower_names
     )
     if ra_lower == "raj2000" or dec_lower == "dej2000":
-        # CDS/VizieR RAJ2000/DEJ2000 columns are already pre-propagated to J2000.0.
         default_ep = 2000.0
-    elif ra_lower == "ra_icrs" or dec_lower in ("de_icrs", "dec_icrs"):
-        default_ep = 2016.0
-    elif "gaia" in catalog.lower():
+    elif ra_lower == "ra_icrs" or dec_lower in ("de_icrs", "dec_icrs") or "gaia" in catalog.lower():
         default_ep = 2016.0
     elif has_gaia_cols and not has_tic_cols:
         default_ep = 2016.0
     else:
         default_ep = 2000.0
+
     if ep_col is not None:
         ep_raw = np.asarray(table_valid[ep_col], dtype=np.float64)
         ref_ep = np.where(np.isfinite(ep_raw) & (ep_raw > 1900.0), ep_raw, default_ep)
     else:
         ref_ep = np.full(len(table_valid), default_ep, dtype=np.float64)
 
-    pmra_clean = np.where(has_pm, pmra, 0.0)
-    pmdec_clean = np.where(has_pm, pmdec, 0.0)
     sc_motion = SkyCoord(
         ra=ra_deg * u.deg,
         dec=dec_deg * u.deg,
-        pm_ra_cosdec=pmra_clean * (u.mas / u.yr),
-        pm_dec=pmdec_clean * (u.mas / u.yr),
+        pm_ra_cosdec=np.where(has_pm, pmra, 0.0) * (u.mas / u.yr),
+        pm_dec=np.where(has_pm, pmdec, 0.0) * (u.mas / u.yr),
         obstime=Time(ref_ep, format="jyear", scale="tdb"),
         frame="icrs",
     )
@@ -421,7 +412,6 @@ def _propagate_catalogue_coords(
             new_obstime=Time(2000.0, format="jyear", scale="tdb")
         )
         coords_j2000 = SkyCoord(ra=sc_j2000_pm.ra, dec=sc_j2000_pm.dec, frame="icrs")
-
         if obs_time is not None:
             sc_obs_pm = sc_motion.apply_space_motion(new_obstime=obs_time)
             coords_obs = SkyCoord(ra=sc_obs_pm.ra, dec=sc_obs_pm.dec, frame="icrs")
@@ -436,8 +426,9 @@ def _estimate_target_mag(
     tpf: Any | None = None,
     flux: np.ndarray | None = None,
     mission: str | None = None,
+    flux_scale: float = 1.0,
 ) -> float | None:
-    """Infer fallback primary target magnitude from TPF header cards or integrated flux."""
+    """Infer primary target magnitude from TPF headers or median stamp flux without full-cube copies."""
     if tpf is not None:
         header_sources: list[Any] = []
         hdul = getattr(tpf, "hdu", None)
@@ -458,19 +449,19 @@ def _estimate_target_mag(
                         return fval
 
     if flux is not None:
-        flux_arr = np.asarray(flux, dtype=np.float64)
+        flux_arr = np.asarray(flux)
         if flux_arr.ndim == 3 and flux_arr.size > 0:
-            any_fin = np.any(np.isfinite(flux_arr), axis=0)
+            n_cad = flux_arr.shape[0]
+            stride = max(1, n_cad // 512)
+            sample = np.asarray(flux_arr[::stride], dtype=np.float64) * float(flux_scale)
+            any_fin = np.any(np.isfinite(sample), axis=0)
             if np.any(any_fin):
-                med_img = np.zeros(flux_arr.shape[1:], dtype=np.float64)
-                med_img[any_fin] = np.nanmedian(flux_arr[:, any_fin], axis=0)
+                med_img = np.zeros(sample.shape[1:], dtype=np.float64)
+                med_img[any_fin] = np.nanmedian(sample[:, any_fin], axis=0)
                 sum_pos = float(np.sum(np.maximum(med_img, 0.0)))
                 if np.isfinite(sum_pos) and sum_pos > 0.0:
-                    eff_mission = mission
-                    if eff_mission is None and tpf is not None:
-                        eff_mission = getattr(tpf, "mission", None)
-                    mission_upper = str(eff_mission or "").upper()
-                    zp = 25.3 if mission_upper in ("KEPLER", "K2") else 20.44
+                    eff_mission = mission if mission is not None else getattr(tpf, "mission", None)
+                    zp = 25.3 if str(eff_mission or "").upper() in ("KEPLER", "K2") else 20.44
                     return float(zp - 2.5 * math.log10(sum_pos))
     return None
 
@@ -482,7 +473,7 @@ def mask_background_stars(
     catalog_table: Table | str | os.PathLike[str] | None = None,
     offline: bool = False,
     cache_dir: str | os.PathLike[str] | None = None,
-    strict_hpc: bool = True,
+    strict_hpc: bool = False,
     target_coord: SkyCoord | tuple[float, float] | None = None,
     target_mag: float | None = None,
     target_exclusion_arcsec: float | None = None,
@@ -491,23 +482,7 @@ def mask_background_stars(
     obs_time: Time | str | float | None = None,
     catalog: str = "TIC",
 ) -> np.ndarray:
-    """Construct a ``(ny, nx)`` boolean mask of background stars projected via ``wcs``.
-
-    Contaminant exclusion thresholds and pixel radii are derived from WCS plate scale
-    and Gaussian PRF encircled energy:
-
-    * **Sky & halo-wing contrast cut**: When ``mag_limit`` is ``None``, stars fainter
-      than ``min(m_target + 10.0, mu_sky - 2.5 * log10(s_pix^2 / 0.5))`` (``14.6`` mag
-      at *TESS* ``21"/px``, ``17.9`` mag at *Kepler*/*K2* ``3.98"/px``) are below sky
-      or ``10^-4`` of the primary target flux and are not masked.
-    * **Gaussian PRF radius**: When ``radius_pix`` is ``None``, a contaminant of
-      magnitude ``m_s`` is masked out to ``sqrt(2 * sigma_prf^2 * (ln 10 / 2.5) *
-      (m_lim - m_s) + 0.5)`` pixels, where ``sigma_prf`` combines the ``2"`` optical
-      core with the ``0.678``-pixel 50%-encircled-energy detector core.
-    * **Proper-motion & target exclusion**: Propagates ``pmra``/``pmdec`` when present
-      and matches ``target_coord`` across both J2000 and observation epochs so nearby
-      high-proper-motion halo stars are never self-masked.
-    """
+    """Construct a ``(ny, nx)`` boolean mask of background stars projected via ``wcs``."""
     ny, nx = int(shape[0]), int(shape[1])
     if ny < 1 or nx < 1:
         raise ValueError(f"Invalid stamp shape {shape}; expected positive (ny, nx).")
@@ -519,16 +494,12 @@ def mask_background_stars(
     resolved_obs_time = _coerce_obs_time(obs_time, wcs)
 
     if catalog_table is None:
-        resolved_cache = resolve_cache_dir(
-            cache_dir,
-            strict_hpc=strict_hpc,
-            create=not offline,
-        )
         if offline:
             raise RuntimeError(
                 "Live catalogue queries are disabled when offline=True; "
                 "pass a pre-cached Astropy Table via catalog_table."
             )
+        resolved_cache = resolve_cache_dir(cache_dir, strict_hpc=strict_hpc, create=True)
         corners_x = np.array([-0.5, nx - 0.5, -0.5, nx - 0.5], dtype=np.float64)
         corners_y = np.array([-0.5, -0.5, ny - 0.5, ny - 0.5], dtype=np.float64)
         center_sky = wcs.celestial.pixel_to_world((nx - 1) / 2.0, (ny - 1) / 2.0)
@@ -543,7 +514,6 @@ def mask_background_stars(
             cache_dir=resolved_cache,
         )
     else:
-        resolve_cache_dir(cache_dir, strict_hpc=strict_hpc, create=False)
         tbl = _load_catalog_table(catalog_table)
 
     out_mask = np.zeros((ny, nx), dtype=bool)
@@ -581,9 +551,7 @@ def mask_background_stars(
 
     mag_vals, has_mag_col, primary_mag_col = _coalesce_magnitudes(tbl)
     if has_mag_col and mag_vals is not None:
-        # Never retain unmeasured NaN-magnitude rows when magnitude columns are present.
         valid &= np.isfinite(mag_vals)
-
     if not np.any(valid):
         return out_mask
 
@@ -640,10 +608,6 @@ def mask_background_stars(
                     if mag_vals is not None:
                         cand_idx = np.flatnonzero(in_excl)
                         best_idx = cand_idx[int(np.argmin(mag_vals[cand_idx]))]
-                        # Bandpass-aware tolerance between inferred T/Kp target_mag and
-                        # optical catalogue columns: cool M giants can have G - T ~ 4 mag
-                        # and V - T ~ 6 mag, whereas a missing G < 3 naked-eye primary leaves
-                        # faint G ~ 12-14 field neighbours > 8 mag fainter.
                         if primary_mag_col == "vmag":
                             primary_mag_tol = 6.5
                         elif primary_mag_col in ("phot_g_mean_mag", "gmag"):
@@ -659,13 +623,10 @@ def mask_background_stars(
                             if inferred_tgt_mag is None:
                                 inferred_tgt_mag = float(mag_vals[best_idx])
                         if target_exclusion_arcsec is not None:
-                            # Always honour an explicit caller-supplied exclusion radius.
                             keep = ~in_excl
                             coords_obs = coords_obs[keep]
                             mag_vals = mag_vals[keep]
                         elif valid_primary:
-                            # Exclude only the primary star (and duplicate entries within 2")
-                            # so resolved fainter neighbours inside 1.5 TESS pixels remain masked.
                             is_primary = (
                                 coords_obs.separation(coords_obs[best_idx]).arcsec <= 2.0
                             ) & (mag_vals <= mag_vals[best_idx] + 0.5)
@@ -679,7 +640,6 @@ def mask_background_stars(
     if len(coords_obs) == 0:
         return out_mask
 
-    # Resolve sky- and contrast-calibrated magnitude limit when mag_limit is None.
     sky_mag_limit = _ZODIACAL_SKY_MU_MAG_ARCSEC2 - 2.5 * math.log10(
         max(pix_scale_arcsec**2, 1e-6) / 0.50
     )
@@ -707,14 +667,10 @@ def mask_background_stars(
         radii = np.full(col_pix.shape, float(radius_pix), dtype=np.float64)
     elif mag_vals is not None:
         delta_m = np.maximum(eff_mag_limit - mag_vals, 0.0)
-        radii = np.sqrt(
-            2.0 * (sigma_prf_pix**2) * (math.log(10.0) / 2.5) * delta_m + 0.5
-        )
+        radii = np.sqrt(2.0 * (sigma_prf_pix**2) * (math.log(10.0) / 2.5) * delta_m + 0.5)
     else:
         radii = np.full(col_pix.shape, max(2.0 * sigma_prf_pix, 1.0), dtype=np.float64)
 
-    # Do not mask blended visual-binary companions (e.g. alpha Cen A/B, Castor A/B) inside
-    # the target core radius whose contaminant disc would engulf the target coordinate itself.
     if target_exclusion_arcsec is None and primary_sky_obs is not None:
         blend_sep_arcsec = max(1.5 * pix_scale_arcsec, 2.0 * sigma_prf_pix * pix_scale_arcsec)
         sep_from_primary = coords_obs.separation(primary_sky_obs).arcsec
@@ -741,19 +697,14 @@ def mask_background_stars(
     if not np.any(in_box):
         return out_mask
 
-    col_pix = col_pix[in_box]
-    row_pix = row_pix[in_box]
-    radii = radii[in_box]
-
     yy, xx = np.mgrid[0:ny, 0:nx]
-    for c_s, r_s, rad_s in zip(col_pix, row_pix, radii, strict=True):
+    for c_s, r_s, rad_s in zip(col_pix[in_box], row_pix[in_box], radii[in_box], strict=True):
         out_mask |= (xx - c_s) ** 2 + (yy - r_s) ** 2 <= rad_s**2
 
     return out_mask
 
 
 def _resolve_tpf_wcs(tpf: Any) -> WCS | None:
-    """Extract a celestial ``WCS`` from ``tpf.wcs`` or its ``APERTURE`` extension."""
     cand = getattr(tpf, "wcs", None)
     if cand is not None and cand.has_celestial:
         return cand
@@ -771,7 +722,6 @@ def _resolve_tpf_wcs(tpf: Any) -> WCS | None:
 
 
 def _resolve_tpf_obs_time(tpf: Any) -> Time | None:
-    """Extract mid-observation ``astropy.time.Time`` in standard JD (TDB) from a TPF."""
     t_attr = getattr(tpf, "time", None)
     if t_attr is None or len(t_attr) == 0:
         return None
@@ -789,7 +739,7 @@ def remove_stars(
     catalog_table: Table | str | os.PathLike[str] | None = None,
     offline: bool = False,
     cache_dir: str | os.PathLike[str] | None = None,
-    strict_hpc: bool = True,
+    strict_hpc: bool = False,
     target_coord: SkyCoord | tuple[float, float] | None = None,
     target_mag: float | None = None,
     target_exclusion_arcsec: float | None = None,
@@ -799,14 +749,7 @@ def remove_stars(
     catalog: str = "TIC",
     mission: str | None = None,
 ) -> Any:
-    """Mask background contaminant stars on a ``TargetPixelFile`` or 3D flux array via WCS.
-
-    * Given a ``lightkurve.TargetPixelFile``, returns a non-mutating copy with
-      ``FLUX[:, star_mask] = NaN`` and ``PixelQuality.SOURCE_MASK`` set in
-      ``PIXEL_QUALITY``.
-    * Given a 3D ``(N_cad, ny, nx)`` ``ndarray``, requires ``wcs=...`` and returns
-      a copy with ``arr[:, star_mask] = NaN``.
-    """
+    """Mask background contaminant stars on a ``TargetPixelFile`` or 3D flux array via WCS."""
     if hasattr(tpf, "hdu") and hasattr(tpf, "flux"):
         resolved_wcs = wcs if wcs is not None else _resolve_tpf_wcs(tpf)
         if resolved_wcs is None or not resolved_wcs.has_celestial:
@@ -818,33 +761,29 @@ def remove_stars(
             if ra_t is not None and dec_t is not None:
                 resolved_target = (float(ra_t), float(dec_t))
         resolved_obs_time = obs_time if obs_time is not None else _resolve_tpf_obs_time(tpf)
-        flux_vals_tpf = np.asarray(
-            tpf.flux.value if hasattr(tpf.flux, "value") else tpf.flux,
-            dtype=np.float64,
-        )
-        tpf_flux_unit = _resolve_tpf_column_unit(
-            tpf, "FLUX", getattr(tpf.flux, "unit", None)
-        )
+        flux_view = np.asarray(tpf.flux.value if hasattr(tpf.flux, "value") else tpf.flux)
+        tpf_flux_unit = _resolve_tpf_column_unit(tpf, "FLUX", getattr(tpf.flux, "unit", None))
+        flux_scale = 1.0
         if _is_integrated_count_unit(tpf_flux_unit):
             t_attr = getattr(tpf, "time", None)
             dt_tpf = 1.0 / 48.0
             if t_attr is not None and len(t_attr) > 1:
                 tv = np.asarray(t_attr.value, dtype=np.float64)
-                tv_fin = tv[np.isfinite(tv)]
-                d_tv = np.diff(tv_fin)
+                d_tv = np.diff(tv[np.isfinite(tv)])
                 pos_d = d_tv[d_tv > 0.0]
                 if pos_d.size > 0:
                     dt_tpf = float(np.median(pos_d))
-            exp_sec_tpf = _resolve_cadence_exposure_sec(tpf, dt_tpf)
-            flux_vals_tpf = flux_vals_tpf / exp_sec_tpf
+            flux_scale = 1.0 / _resolve_cadence_exposure_sec(tpf, dt_tpf)
+
         eff_mission_tpf = mission if mission is not None else getattr(tpf, "mission", None)
         resolved_target_mag = (
             target_mag
             if target_mag is not None
             else _estimate_target_mag(
                 tpf=tpf,
-                flux=flux_vals_tpf,
+                flux=flux_view,
                 mission=eff_mission_tpf,
+                flux_scale=flux_scale,
             )
         )
 
@@ -930,12 +869,66 @@ def remove_stars(
     return out
 
 
+def _chunked_flux_stats(
+    flux_arr: np.ndarray,
+    good_idx: np.ndarray,
+    *,
+    flux_scale: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute ``(finite_counts, min_img, max_img)`` over ``good_idx`` without copying the 3D cube."""
+    _, ny, nx = flux_arr.shape
+    fin_counts = np.zeros((ny, nx), dtype=np.int64)
+    min_img = np.full((ny, nx), np.inf, dtype=np.float64)
+    max_img = np.full((ny, nx), -np.inf, dtype=np.float64)
+
+    for start in range(0, good_idx.size, _MASK_CHUNK_CADENCES):
+        idx_chunk = good_idx[start : start + _MASK_CHUNK_CADENCES]
+        chunk = np.asarray(flux_arr[idx_chunk], dtype=np.float64)
+        if flux_scale != 1.0:
+            chunk = chunk * flux_scale
+        fin = np.isfinite(chunk)
+        fin_counts += np.sum(fin, axis=0)
+        min_img = np.minimum(min_img, np.min(np.where(fin, chunk, np.inf), axis=0))
+        max_img = np.maximum(max_img, np.max(np.where(fin, chunk, -np.inf), axis=0))
+
+    return fin_counts, min_img, max_img
+
+
+def _strip_p99_unsub(
+    flux_arr: np.ndarray,
+    good_idx: np.ndarray,
+    *,
+    bkg_arr: np.ndarray | None,
+    bkgsub: bool,
+    flux_scale: float = 1.0,
+    bkg_scale: float = 1.0,
+) -> np.ndarray:
+    """Compute exact 99th-percentile unsubtracted flux row-by-row in bounded host memory."""
+    _, ny, nx = flux_arr.shape
+    p99 = np.full((ny, nx), np.nan, dtype=np.float64)
+    add_bkg = bkgsub and bkg_arr is not None
+
+    for r in range(ny):
+        strip = np.asarray(flux_arr[good_idx, r, :], dtype=np.float64)
+        if flux_scale != 1.0:
+            strip = strip * flux_scale
+        if add_bkg:
+            assert bkg_arr is not None
+            b_strip = np.asarray(bkg_arr[good_idx, r, :], dtype=np.float64)
+            if bkg_scale != 1.0:
+                b_strip = b_strip * bkg_scale
+            strip = np.where(np.isfinite(b_strip), strip + np.maximum(b_strip, 0.0), strip)
+        any_fin = np.any(np.isfinite(strip), axis=0)
+        if np.any(any_fin):
+            p99[r, any_fin] = np.nanpercentile(strip[:, any_fin], 99.0, axis=0)
+    return p99
+
+
 def build_halo_masks(
     flux: np.ndarray,
     *,
     flux_err: np.ndarray | None = None,
     flux_bkg: np.ndarray | None = None,
-    flux_bkg_err: np.ndarray | None = None,
     bkgsub: bool = True,
     pixel_quality: np.ndarray | None = None,
     aperture_mask: np.ndarray | None = None,
@@ -951,7 +944,7 @@ def build_halo_masks(
     catalog: str = "TIC",
     offline: bool = False,
     cache_dir: str | os.PathLike[str] | None = None,
-    strict_hpc: bool = True,
+    strict_hpc: bool = False,
     target_exclusion_arcsec: float | None = None,
     mag_limit: float | None = None,
     star_radius_pix: float | None = None,
@@ -960,14 +953,34 @@ def build_halo_masks(
     mission: str | None = None,
     bleed_dilation: tuple[int, int] = (3, 3),
     minflux: float = -100.0,
-    sky_kappa: float = 2.0,
-    min_snr: float = 5.0,
+    min_snr: float = 0.0,
     dt_days: float | None = None,
     exclude_quality: PixelQuality = DEFAULT_EXCLUDE_QUALITY,
-    legacy_tv: bool = False,
+    flux_scale: float = 1.0,
+    flux_err_scale: float = 1.0,
+    flux_bkg_scale: float = 1.0,
+    config: MaskConfig | None = None,
 ) -> HaloMaskResult:
-    """Build active spatial ``Omega_halo`` and cadence ``G`` masks for v2.0 halo photometry."""
-    flux_arr = np.asarray(flux, dtype=np.float64)
+    """Build active spatial and cadence masks without copying 3D cubes to ``float64``."""
+    if config is not None:
+        thresh = config.thresh
+        auto_sat_level = config.auto_sat_level
+        bleed_dilation = config.bleed_dilation
+        minflux = config.minflux
+        min_snr = config.min_snr
+        exclude_quality = config.exclude_quality
+        remove_contaminants = config.remove_contaminants
+        catalog_table = config.catalog_table
+        catalog = config.catalog
+        offline = config.offline
+        cache_dir = config.cache_dir
+        strict_hpc = config.strict_hpc
+        target_mag = config.target_mag if target_mag is None else target_mag
+        target_exclusion_arcsec = config.target_exclusion_arcsec
+        mag_limit = config.mag_limit
+        star_radius_pix = config.star_radius_pix
+
+    flux_arr = np.asarray(flux)
     if flux_arr.ndim != 3:
         raise ValueError(f"flux must be 3D (N_cad, ny, nx), got shape {flux_arr.shape}.")
     n_cad, ny, nx = flux_arr.shape
@@ -980,11 +993,8 @@ def build_halo_masks(
         else np.asarray(cadence_quality_mask, dtype=bool).copy()
     )
     if cad_mask.shape != (n_cad,):
-        raise ValueError(
-            f"cadence_quality_mask shape {cad_mask.shape} does not match ({n_cad},)."
-        )
+        raise ValueError(f"cadence_quality_mask shape {cad_mask.shape} does not match ({n_cad},).")
 
-    # Exclude gross pointing excursions (> 5 px from median) when >= 80% of pos_corr are finite.
     if pos_corr1 is not None and pos_corr2 is not None and np.any(cad_mask):
         pc1 = np.asarray(pos_corr1, dtype=np.float64)
         pc2 = np.asarray(pos_corr2, dtype=np.float64)
@@ -993,8 +1003,7 @@ def build_halo_masks(
             if np.sum(fin_pc) >= 0.8 * np.sum(cad_mask):
                 xc = float(np.nanmedian(pc1[cad_mask]))
                 yc = float(np.nanmedian(pc2[cad_mask]))
-                rr = np.hypot(pc1[cad_mask] - xc, pc2[cad_mask] - yc)
-                good_pos = fin_pc & (rr < 5.0)
+                good_pos = fin_pc & (np.hypot(pc1[cad_mask] - xc, pc2[cad_mask] - yc) < 5.0)
                 cad_mask[np.flatnonzero(cad_mask)[~good_pos]] = False
 
     if not np.any(cad_mask):
@@ -1020,8 +1029,9 @@ def build_halo_masks(
     else:
         qual_excl = np.zeros((ny, nx), dtype=bool)
 
-    flux_cad = flux_arr[cad_mask]
-    any_finite_pix = np.any(np.isfinite(flux_cad), axis=0)
+    good_idx = np.flatnonzero(cad_mask)
+    fin_counts, min_img, max_img = _chunked_flux_stats(flux_arr, good_idx, flux_scale=flux_scale)
+    any_finite_pix = fin_counts > 0
     if not np.any(any_finite_pix & base_mask):
         raise ValueError("No finite pixels exist inside aperture_mask on valid cadences.")
 
@@ -1033,7 +1043,7 @@ def build_halo_masks(
         resolved_tmag = (
             target_mag
             if target_mag is not None
-            else _estimate_target_mag(flux=flux_cad, mission=mission)
+            else _estimate_target_mag(flux=flux_arr, mission=mission, flux_scale=flux_scale)
         )
         source_excl = mask_background_stars(
             wcs,
@@ -1051,32 +1061,24 @@ def build_halo_masks(
             catalog=catalog,
         )
     else:
-        resolve_cache_dir(cache_dir, strict_hpc=strict_hpc, create=False)
         source_excl = np.zeros((ny, nx), dtype=bool)
 
     bkg_arr: np.ndarray | None = None
     if flux_bkg is not None:
-        bkg_arr = np.asarray(flux_bkg, dtype=np.float64)
+        bkg_arr = np.asarray(flux_bkg)
         if bkg_arr.shape != (n_cad, ny, nx):
-            raise ValueError(
-                f"flux_bkg shape {bkg_arr.shape} does not match {(n_cad, ny, nx)}."
-            )
+            raise ValueError(f"flux_bkg shape {bkg_arr.shape} does not match {(n_cad, ny, nx)}.")
 
-    # 2D saturation + vertical bleed + horizontal LDE undershoot dilation.
     structure_2d = np.ones(bleed_dilation, dtype=bool)
     sat_raw = np.zeros((ny, nx), dtype=bool)
     if thresh is not None and thresh >= 0.0:
         if thresh < 1.0:
-            maxflux = float(np.nanmax(flux_cad[:, any_finite_pix]))
-            sat_raw[any_finite_pix] = (
-                np.nanmax(flux_cad[:, any_finite_pix], axis=0) > float(thresh) * maxflux
-            )
+            maxflux = float(np.max(max_img[any_finite_pix]))
+            sat_raw[any_finite_pix] = max_img[any_finite_pix] > float(thresh) * maxflux
             sat_mask = ndimage.binary_dilation(sat_raw, structure=structure_2d)
         else:
             sat_mask = sat_raw
     else:
-        # Automatic physical full-well saturation guard using 99th-percentile unsubtracted flux
-        # to catch partial-sector bleed; always honoured when auto_sat_level is explicitly passed.
         already_flagged = pixel_quality is not None and np.any(
             (np.asarray(pixel_quality, dtype=np.uint16) & np.uint16(PixelQuality.SAT_BLEED)) != 0
         )
@@ -1084,44 +1086,33 @@ def build_halo_masks(
             resolved_sat = float(auto_sat_level)
             apply_auto_sat = resolved_sat > 0.0
         else:
-            mission_upper = str(mission or "").upper()
             resolved_sat = (
                 KEPLER_SAT_RATE_E_PER_S
-                if mission_upper in ("KEPLER", "K2")
+                if str(mission or "").upper() in ("KEPLER", "K2")
                 else TESS_SAT_RATE_E_PER_S
             )
             apply_auto_sat = (not already_flagged) and (resolved_sat > 0.0)
 
         if apply_auto_sat:
-            if bkgsub and bkg_arr is not None:
-                bkg_cad = bkg_arr[cad_mask]
-                flux_for_sat = np.where(
-                    np.isfinite(bkg_cad),
-                    flux_cad + np.maximum(bkg_cad, 0.0),
-                    flux_cad,
-                )
-            else:
-                flux_for_sat = flux_cad
-            p99_img = np.full((ny, nx), np.nan, dtype=np.float64)
-            p99_img[any_finite_pix] = np.nanpercentile(
-                flux_for_sat[:, any_finite_pix], 99.0, axis=0
+            p99_img = _strip_p99_unsub(
+                flux_arr,
+                good_idx,
+                bkg_arr=bkg_arr,
+                bkgsub=bkgsub,
+                flux_scale=flux_scale,
+                bkg_scale=flux_bkg_scale,
             )
             sat_raw = np.isfinite(p99_img) & (p99_img >= resolved_sat)
             sat_mask = ndimage.binary_dilation(sat_raw, structure=structure_2d)
         else:
             sat_mask = np.zeros((ny, nx), dtype=bool)
 
-    minflux_excl = np.zeros((ny, nx), dtype=bool)
-    minflux_excl[any_finite_pix] = np.nanmin(flux_cad[:, any_finite_pix], axis=0) < float(minflux)
+    minflux_excl = any_finite_pix & (min_img < float(minflux))
 
-    # Require pixels to be finite on the majority of surviving cadences, then drop any cadence
-    # where a surviving candidate pixel is NaN.
-    n_good_cad = int(np.sum(cad_mask))
-    finite_counts = np.sum(np.isfinite(flux_cad), axis=0)
-    min_valid_cad = min(60, (n_good_cad - 1) // 2)
+    min_valid_cad = min(60, (good_idx.size - 1) // 2)
     cand_pix = (
         base_mask
-        & (finite_counts > min_valid_cad)
+        & (fin_counts > min_valid_cad)
         & ~qual_excl
         & ~source_excl
         & ~sat_mask
@@ -1130,113 +1121,72 @@ def build_halo_masks(
     if not np.any(cand_pix):
         raise ValueError("No valid halo pixels survived spatial quality and saturation masking.")
 
-    all_cand_finite = np.all(np.isfinite(flux_arr[cad_mask][:, cand_pix]), axis=1)
+    cand_r, cand_c = np.where(cand_pix)
+    all_cand_finite = np.ones(good_idx.size, dtype=bool)
+    for start in range(0, good_idx.size, _MASK_CHUNK_CADENCES):
+        stop = min(start + _MASK_CHUNK_CADENCES, good_idx.size)
+        sub = flux_arr[good_idx[start:stop]][:, cand_r, cand_c]
+        all_cand_finite[start:stop] = np.all(np.isfinite(sub), axis=1)
+
     if not np.any(all_cand_finite):
         raise ValueError("No cadences with all-finite candidate halo pixels survived.")
-    cad_mask[np.flatnonzero(cad_mask)[~all_cand_finite]] = False
+    cad_mask[good_idx[~all_cand_finite]] = False
 
-    flux_final_cad = flux_arr[cad_mask]
-    mean_p = np.zeros((ny, nx), dtype=np.float64)
-    mean_p[cand_pix] = np.mean(flux_final_cad[:, cand_pix], axis=0)
-
-    sky_excl = np.zeros((ny, nx), dtype=bool)
     snr_excl = np.zeros((ny, nx), dtype=bool)
+    if float(min_snr) > 0.0:
+        final_idx = np.flatnonzero(cad_mask)
+        sum_p = np.zeros(cand_r.size, dtype=np.float64)
+        for start in range(0, final_idx.size, _MASK_CHUNK_CADENCES):
+            sub = np.asarray(flux_arr[final_idx[start : start + _MASK_CHUNK_CADENCES]][:, cand_r, cand_c], dtype=np.float64)
+            if flux_scale != 1.0:
+                sub = sub * flux_scale
+            sum_p += np.sum(sub, axis=0)
+        mean_cand = sum_p / float(final_idx.size)
 
-    if not legacy_tv:
-        # Charnes-Cooper coordinates require strictly positive mean pixel flux.
-        sky_excl |= cand_pix & (mean_p <= 0.0)
+        eff_dt_days = float(dt_days) if (dt_days is not None and float(dt_days) > 0.0) else (1.0 / 48.0)
+        dt_sec = max(eff_dt_days * 86400.0, 1.0)
+        # Normalize per-cadence SNR to 2-min (120 s) equivalent exposure time so 20 s, 2 min,
+        # and 30 min cadences select identical apertures: SNR_2min = SNR_cad * sqrt(120 / dt_sec).
+        cadence_to_2min = math.sqrt(120.0 / dt_sec)
 
-        if sky_kappa > 0.0:
-            if not bkgsub:
-                # Unsubtracted FLUX = P + B: enforce P_bar = U_bar - B_bar >= kappa * B_bar
-                # so starlight fraction P / (P + B) >= kappa / (1 + kappa).
-                if bkg_arr is not None:
-                    bkg_sub = bkg_arr[cad_mask]
-                    fin_bkg = bkg_sub[np.isfinite(bkg_sub)]
-                    if fin_bkg.size > 0 and np.any(fin_bkg != 0.0):
-                        mean_bkg = np.zeros((ny, nx), dtype=np.float64)
-                        for r_idx, c_idx in zip(*np.where(cand_pix), strict=True):
-                            col_b = bkg_sub[:, r_idx, c_idx]
-                            fin_col = col_b[np.isfinite(col_b)]
-                            if fin_col.size > 0:
-                                mean_bkg[r_idx, c_idx] = max(float(np.mean(fin_col)), 0.0)
-                        sky_excl |= cand_pix & ((mean_p - mean_bkg) < float(sky_kappa) * mean_bkg)
-            elif flux_bkg_err is not None:
-                # Background-subtracted FLUX = P: guard against background-model uncertainty
-                # sigma_{B,i} (from FLUX_BKG_ERR or BKG_CHOL + BKG_BASIS) continuously without
-                # rejecting clean outer wings under already-subtracted Earthshine.
-                fbe_arr = np.asarray(flux_bkg_err, dtype=np.float64)
-                if fbe_arr.shape == (ny, nx):
-                    med_fbe = np.where(np.isfinite(fbe_arr) & (fbe_arr > 0.0), fbe_arr, 0.0)
-                    if np.any(med_fbe[cand_pix] > 0.0):
-                        sky_excl |= cand_pix & (mean_p < float(sky_kappa) * med_fbe)
-                elif fbe_arr.shape == (n_cad, ny, nx):
-                    fbe_sub = fbe_arr[cad_mask]
-                    fin_fbe = fbe_sub[np.isfinite(fbe_sub) & (fbe_sub > 0.0)]
-                    if fin_fbe.size > 0:
-                        med_fbe = np.zeros((ny, nx), dtype=np.float64)
-                        for r_idx, c_idx in zip(*np.where(cand_pix), strict=True):
-                            fbe_col = fbe_sub[:, r_idx, c_idx]
-                            pos_fbe = fbe_col[np.isfinite(fbe_col) & (fbe_col > 0.0)]
-                            if pos_fbe.size > 0:
-                                med_fbe[r_idx, c_idx] = float(np.median(pos_fbe))
-                        sky_excl |= cand_pix & (mean_p < float(sky_kappa) * med_fbe)
-                else:
-                    raise ValueError(
-                        f"flux_bkg_err shape {fbe_arr.shape} does not match "
-                        f"{(n_cad, ny, nx)} or {(ny, nx)}."
-                    )
+        if flux_err is not None:
+            err_arr = np.asarray(flux_err)
+            if err_arr.shape != (n_cad, ny, nx):
+                raise ValueError(f"flux_err shape {err_arr.shape} does not match {(n_cad, ny, nx)}.")
+            err_sub = np.asarray(err_arr[final_idx][:, cand_r, cand_c], dtype=np.float64)
+            if flux_err_scale != 1.0:
+                err_sub = err_sub * flux_err_scale
+            for k in range(cand_r.size):
+                pos_e = err_sub[:, k]
+                pos_e = pos_e[np.isfinite(pos_e) & (pos_e > 0.0)]
+                if pos_e.size > 0:
+                    snr_2min = (mean_cand[k] / float(np.median(pos_e))) * cadence_to_2min
+                    if snr_2min < float(min_snr):
+                        snr_excl[cand_r[k], cand_c[k]] = True
+        else:
+            bg_shot = np.zeros(cand_r.size, dtype=np.float64)
+            if bkg_arr is not None and bkgsub:
+                bkg_sub = np.asarray(bkg_arr[final_idx][:, cand_r, cand_c], dtype=np.float64)
+                if flux_bkg_scale != 1.0:
+                    bkg_sub = bkg_sub * flux_bkg_scale
+                for k in range(cand_r.size):
+                    fin_b = bkg_sub[:, k]
+                    fin_b = fin_b[np.isfinite(fin_b)]
+                    if fin_b.size > 0:
+                        bg_shot[k] = max(float(np.median(fin_b)), 0.0)
+            shot_err_2min = np.sqrt((np.maximum(mean_cand, 0.0) + bg_shot) / 120.0)
+            snr_2min = np.where(shot_err_2min > 0.0, mean_cand / shot_err_2min, 0.0)
+            snr_excl[cand_r, cand_c] = snr_2min < float(min_snr)
 
-        if min_snr > 0.0:
-            active_for_snr = cand_pix & ~sky_excl
-            if np.any(active_for_snr):
-                if flux_err is not None:
-                    err_arr = np.asarray(flux_err, dtype=np.float64)
-                    if err_arr.shape != (n_cad, ny, nx):
-                        raise ValueError(
-                            f"flux_err shape {err_arr.shape} does not match {(n_cad, ny, nx)}."
-                        )
-                    err_sub = err_arr[cad_mask]
-                    for r_idx, c_idx in zip(*np.where(active_for_snr), strict=True):
-                        e_col = err_sub[:, r_idx, c_idx]
-                        pos_e = e_col[np.isfinite(e_col) & (e_col > 0.0)]
-                        if pos_e.size > 0:
-                            med_err = float(np.median(pos_e))
-                            if mean_p[r_idx, c_idx] / med_err < float(min_snr):
-                                snr_excl[r_idx, c_idx] = True
-                else:
-                    eff_dt_days = (
-                        float(dt_days)
-                        if (dt_days is not None and float(dt_days) > 0.0)
-                        else (1.0 / 48.0)
-                    )
-                    dt_sec = eff_dt_days * 86400.0
-                    bg_shot = np.zeros((ny, nx), dtype=np.float64)
-                    if bkg_arr is not None and bkgsub:
-                        bkg_sub_snr = bkg_arr[cad_mask]
-                        for r_idx, c_idx in zip(*np.where(active_for_snr), strict=True):
-                            b_col = bkg_sub_snr[:, r_idx, c_idx]
-                            fin_b = b_col[np.isfinite(b_col)]
-                            if fin_b.size > 0:
-                                bg_shot[r_idx, c_idx] = max(float(np.median(fin_b)), 0.0)
-                    shot_err = np.sqrt(
-                        (np.maximum(mean_p, 0.0) + bg_shot) / max(dt_sec, 1.0)
-                    )
-                    snr_val = np.where(shot_err > 0.0, mean_p / shot_err, 0.0)
-                    snr_excl |= active_for_snr & (snr_val < float(min_snr))
-
-    final_pix = cand_pix & ~sky_excl & ~snr_excl
+    final_pix = cand_pix & ~snr_excl
     if not np.any(final_pix):
-        raise ValueError(
-            "No valid halo pixels survived sky-dominance (P_bar >= kappa * B) and SNR filtering."
-        )
+        raise ValueError("No valid halo pixels survived spatial masking and min_snr filtering.")
 
     return HaloMaskResult(
         pixel_mask=final_pix,
         cadence_mask=cad_mask,
         saturated_mask=sat_mask,
         quality_excluded_mask=qual_excl,
-        sky_excluded_mask=sky_excl,
         snr_excluded_mask=snr_excl,
         source_excluded_mask=source_excl,
     )

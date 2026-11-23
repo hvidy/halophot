@@ -79,7 +79,7 @@ all_inds = range(npix)
 start = clock()
 
 for jj,saturation in enumerate(saturations):
-	print 'Saturating',saturation,'columns'
+	print('Saturating', saturation, 'columns')
 	# print 'Taking',sampling,'pixels'
 	bad = all_inds[(nx/2-saturation/2):(nx/2+saturation/2)]
 	tpf_masked = np.delete(tpf,bad,1)
@@ -124,7 +124,7 @@ for jj,saturation in enumerate(saturations):
 	# xbest_2 = res2['x']
 	# toc2 = clock()
 
-	print 'Time taken for TV1:',(toc-tic)
+	print('Time taken for TV1:', (toc - tic))
 	# print 'Time taken for TV2:', (toc2-toc)
 
 	lc_opt_1 = np.dot(xbest_1.T,pixelvectors)
@@ -144,8 +144,8 @@ for jj,saturation in enumerate(saturations):
 	times_1[jj] = toc-tic
 
 finish = clock()
-print 'Done'
-print 'Time elapsed:',finish-start
+print('Done')
+print('Time elapsed:', finish - start)
 
 # ticks = np.unique(sizes[sizes%5==0])
 
