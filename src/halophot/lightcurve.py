@@ -519,17 +519,29 @@ def _compute_detector_shot_var(
     mean_col_unsub = col_sum_unsub / max(float(col_cnt), 1.0)
 
     mission_upper = str(getattr(tpf_obj, "mission", "") or "").upper() if tpf_obj is not None else ""
-    deadc_raw = _header_get_first(tpf_obj, ("DEADC",)) if tpf_obj is not None else None
-    try:
-        deadc = float(deadc_raw) if deadc_raw is not None and not isinstance(deadc_raw, bool) else np.nan
-    except (TypeError, ValueError):
-        deadc = np.nan
-
-    if np.isfinite(deadc) and 0.0 < deadc < 1.0:
-        n_rows_ccd = 1024.0 if mission_upper in ("KEPLER", "K2") else 2048.0
-        f_transfer = (1.0 - deadc) / (n_rows_ccd * deadc)
-    elif mission_upper == "TESS":
-        f_transfer = 0.01 / (2048.0 * 0.99)
+    if mission_upper == "TESS":
+        rt_raw = _header_get_first(tpf_obj, ("READTIME",)) if tpf_obj is not None else None
+        it_raw = _header_get_first(tpf_obj, ("INT_TIME",)) if tpf_obj is not None else None
+        try:
+            readtime = float(rt_raw) if rt_raw is not None and not isinstance(rt_raw, bool) else np.nan
+        except (TypeError, ValueError):
+            readtime = np.nan
+        try:
+            int_time = float(it_raw) if it_raw is not None and not isinstance(it_raw, bool) else np.nan
+        except (TypeError, ValueError):
+            int_time = np.nan
+        if not np.isfinite(readtime) or readtime <= 0.0:
+            readtime = 0.02
+        if not np.isfinite(int_time) or int_time <= 0.0:
+            int_time = 1.98
+        f_transfer = readtime / (int_time * 2058.0)
+    elif mission_upper in ("KEPLER", "K2"):
+        deadc_raw = _header_get_first(tpf_obj, ("DEADC",)) if tpf_obj is not None else None
+        try:
+            deadc = float(deadc_raw) if deadc_raw is not None and not isinstance(deadc_raw, bool) else np.nan
+        except (TypeError, ValueError):
+            deadc = np.nan
+        f_transfer = (1.0 - deadc) / (1024.0 * deadc) if (np.isfinite(deadc) and 0.0 < deadc < 1.0) else 0.0
     else:
         f_transfer = 0.0
     smear_rate_act = f_transfer * mean_col_unsub[cols_h]
@@ -1520,10 +1532,11 @@ def plot_diagnostics(
         dt_g = float(np.median(np.diff(t_g)))
         f_nyq = 0.5 / max(dt_g, 1e-5)
         ls = LombScargle(t_g, rel_g, normalization="psd")
+        spp = 2 if span * f_nyq > 5000.0 else 5
         freq, power = ls.autopower(
             minimum_frequency=1.0 / span,
-            maximum_frequency=min(f_nyq, 24.0),
-            samples_per_peak=5,
+            maximum_frequency=f_nyq,
+            samples_per_peak=spp,
         )
         if freq.size > 1 and np.sum(power) > 0.0:
             df_muhz = float(np.mean(np.diff(freq * _DAY_TO_MUHZ)))

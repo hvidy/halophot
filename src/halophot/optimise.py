@@ -326,15 +326,14 @@ def _run_optax_lbfgs_loop(
         )
 
         dv_rel = jnp.abs(v_curr - v_next) / v_scale
-        dw_l1 = jnp.sum(jnp.abs(w_next - w_curr))
+        ftol = jnp.maximum(500.0 * rtol, 1e-15)
         step_small = (
             finite_step
             & (v_next <= v_curr + 1e-12 * v_scale)
-            & (dv_rel <= rtol)
-            & (dw_l1 <= 1e-4)
+            & (dv_rel <= ftol)
         )
         consec_next = jnp.where(step_small, consec + 1, jnp.zeros_like(consec))
-        conv_next = grad_ok | ((step >= 5) & (consec_next >= 3))
+        conv_next = grad_ok | ((step >= 15) & (consec_next >= 5))
         failed_next = ~finite_step
         return (
             xi_next,

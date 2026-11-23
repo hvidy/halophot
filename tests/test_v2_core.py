@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import jax
@@ -259,12 +260,31 @@ def test_real_k2_tpf_and_sirius_scale_lbfgs_convergence() -> None:
     valid_pix = np.all(np.isfinite(flux_c), axis=0) & ~sat & (np.min(flux_c, axis=0) >= -100.0)
     pix_k2 = flux_c[:, valid_pix].T
 
-    fit_k2 = optimise_halo(pix_k2, t_c, objective="tv", maxiter=500)
+    with warnings.catch_warnings(record=True) as caught_k2:
+        warnings.simplefilter("always")
+        fit_k2 = optimise_halo(pix_k2, t_c, objective="tv", maxiter=500)
     sm = compute_step_mask(t_c)
     std_diff_ppm = float(np.std(np.diff(fit_k2.norm_flux)[sm]) * 1e6)
+    assert fit_k2.converged is True
+    assert not any(issubclass(w.category, RuntimeWarning) for w in caught_k2)
     assert fit_k2.n_steps > 10
     assert fit_k2.loss_final < 0.1 * fit_k2.loss_init
     assert std_diff_ppm < 600.0
+
+    # Confirm maxiter=2 still triggers RuntimeWarning and converged=False
+    with pytest.warns(RuntimeWarning, match="did not converge"):
+        fit_k2_short = optimise_halo(pix_k2, t_c, objective="tv", maxiter=2)
+    assert fit_k2_short.converged is False
+
+    # Confirm extract_halo_lightcurve on real K2 TPF slice emits zero non-convergence RuntimeWarnings
+    import lightkurve as lk
+
+    k2_tpf_full = lk.read(str(K2_TPF_FITS))
+    with warnings.catch_warnings(record=True) as caught_ext:
+        warnings.simplefilter("always")
+        lc_k2_ext = halophot.extract_halo_lightcurve(k2_tpf_full[:500], maxiter=500)
+    assert len(lc_k2_ext) == 500
+    assert not any(issubclass(w.category, RuntimeWarning) for w in caught_ext)
 
     # Sirius-scale stamp (M = 1808, asymmetric wings + pointing jitter + Poisson noise):
     # TV drops scatter >100x with zero step-0 stall or one-hot collapse; smooth l2v converges < 100 steps.

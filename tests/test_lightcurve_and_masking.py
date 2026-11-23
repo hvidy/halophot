@@ -1912,14 +1912,59 @@ def test_v2_simplify_regressions_halo_lc_smear_nan_sub_min_snr_raw_array_and_plo
         assert "INLIER_MASK" in h_chk[1].columns.names
 
     # 5. plot_diagnostics(lc, tpf=None) runs cleanly with zero global rcParams mutation
+    #    and plots the full 2-min Nyquist PSD (> 3500 uHz, not truncated at K2 278 uHz!)
     rc_before = dict(mpl.rcParams)
     diag_png = tmp_path / "diag_raw.png"
     fig = halophot.plot_diagnostics(lc_raw, save_path=diag_png)
     assert diag_png.is_file()
+    ax_pg = next(ax for ax in fig.axes if ax.get_title() == "Lomb-Scargle Power Spectrum")
+    assert len(ax_pg.lines) == 1
+    max_freq_muhz = float(np.max(ax_pg.lines[0].get_xdata()))
+    assert max_freq_muhz > 3500.0
     import matplotlib.pyplot as plt
 
     plt.close(fig)
     assert dict(mpl.rcParams) == rc_before
+
+    # 5b. TESS DEADC=0.792 + CRMITEN=True must use READTIME / (INT_TIME * 2058), NOT (1-DEADC)/(2048*DEADC)!
+    from halophot.lightcurve import _compute_detector_shot_var
+
+    tpf_smear_path = tmp_path / "tess_deadc_smear.fits"
+    flux_sm = np.full((20, 4, 4), 100.0, dtype=np.float64)
+    flux_sm[:, :, 0] = 1.0e6  # High column sum = 4e6 e-/s so smear_rate dominates if 26x inflated!
+    flux_sm[:, 0, 0] = 100.0  # Active wing pixel in same column as bright core
+    _build_synthetic_halocver_tpf_file(
+        tpf_smear_path,
+        flux=flux_sm,
+        flux_err=np.full_like(flux_sm, 10.0),
+        flux_bkg=np.full_like(flux_sm, 20.0),
+        bkgsub=True,
+    )
+    with fits.open(tpf_smear_path, mode="update") as h_sm:
+        h_sm[1].header["DEADC"] = 0.792
+        h_sm[1].header["CRMITEN"] = True
+        h_sm[1].header["CRBLKSZ"] = 10
+        h_sm[1].header["READTIME"] = 0.02
+        h_sm[1].header["INT_TIME"] = 1.98
+        h_sm[1].header["READNOIS"] = 0.0
+        h_sm.flush()
+    tpf_sm = lk.read(str(tpf_smear_path))
+    sv_2d = _compute_detector_shot_var(
+        tpf_sm,
+        np.asarray(tpf_sm.flux.value, dtype=np.float32),
+        np.asarray(tpf_sm.flux_bkg.value, dtype=np.float32),
+        np.ones(20, dtype=bool),
+        np.array([0], dtype=np.intp),
+        np.array([0], dtype=np.intp),
+        bkgsub=True,
+        dt_days=2.0 / 1440.0,
+    )
+    col_sum_expected = 3.0 * 1.0e6 + 100.0 + 4.0 * 20.0
+    smear_true = (0.02 / (1.98 * 2058.0)) * col_sum_expected
+    # Without EXPTIME/EXPOSURE header, exp_sec defaults to dt_days * 86400 = 120 s;
+    # old buggy (1 - DEADC) / (2048 * DEADC) gave 5.26 (3.75x inflated)!
+    expected_sv = (120.0 + smear_true) / 120.0 * (10.0 / 8.0)
+    assert float(sv_2d[0, 0]) == pytest.approx(expected_sv, rel=1e-4)
 
     # 6. B9: CLI legacy mode passes mission="tess" to do_lc and rejects TESS QUALITY=16 cadences!
     tpf_q16_path = tmp_path / "tess_q16_legacy.fits"
