@@ -59,9 +59,9 @@ widths = [1.,2.5,5.]
 start = clock()
 
 for width in widths:
-	print 'Doing witdth',width
+	print('Doing witdth', width)
 	for jj, nn in enumerate(sizes):
-		print 'Trying window size',nn
+		print('Trying window size', nn)
 		nx, ny = nn, nn
 		npix = nx*ny
 		pixels = np.zeros((nx,ny))
@@ -119,8 +119,8 @@ for width in widths:
 		xbest_2 = res2['x']
 		toc2 = clock()
 
-		print 'Time taken for TV1:',(toc-tic)
-		print 'Time taken for TV2:', (toc2-toc)
+		print('Time taken for TV1:', (toc - tic))
+		print('Time taken for TV2:', (toc2 - toc))
 
 		lc_opt_1 = np.dot(xbest_1.T,pixelvectors)
 		lc_opt_2 = np.dot(xbest_2.T,pixelvectors)
@@ -142,8 +142,8 @@ for width in widths:
 		times_2[jj] = toc2-toc
 
 	finish = clock()
-	print 'Done'
-	print 'Time elapsed:',finish-start
+	print('Done')
+	print('Time elapsed:', finish - start)
 
 	ticks = np.unique(sizes[sizes%5==0])
 

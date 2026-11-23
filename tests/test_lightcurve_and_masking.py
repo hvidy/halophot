@@ -200,8 +200,8 @@ def _build_synthetic_halocver_tpf_file(
     return loaded
 
 
-def test_sky_dilution_guard_preserves_pulsation_and_transit_amplitude(tmp_path: Path) -> None:
-    """Prove v2.0 sky-dominance guard preserves astrophysical amplitude under positive sky residual."""
+def test_sky_masking_via_bkg_used_and_legacy_tv_noop(tmp_path: Path) -> None:
+    """Verify PIXEL_QUALITY.BKG_USED excludes sky pixels cleanly and legacy_tv is a deprecated no-op."""
     n_cad, ny, nx = 96, 4, 4
     t = np.arange(n_cad, dtype=np.float64) * (2.0 / 1440.0)
 
@@ -213,17 +213,18 @@ def test_sky_dilution_guard_preserves_pulsation_and_transit_amplitude(tmp_path: 
     flux = np.zeros((n_cad, ny, nx), dtype=np.float64)
     flux_bkg = np.full((n_cad, ny, nx), 120.0, dtype=np.float64)
 
-    # Rows 0..1: bright halo wing pixels (mean ~ 1200 >= 2 * 120) with complementary jitter
     for r in range(2):
         for c in range(nx):
             sens = -1.0 if (c % 2 == 0) else 1.0
             flux[:, r, c] = 1200.0 * stellar * (1.0 + sens * jitter)
 
-    # Rows 2..3: sky-dominated outer pixels with +60 e-/s unsubtracted sky pedestal residual
-    # and almost zero starlight (mean ~ 62 < 2 * 120 = 240): normalized curve is nearly flat!
+    # Rows 2..3 are marked BKG_USED by tessbkgd and carry a flat sky residual pedestal
     for r in range(2, ny):
         for c in range(nx):
             flux[:, r, c] = 2.0 * stellar + 60.0
+
+    pq = np.zeros((ny, nx), dtype=np.uint16)
+    pq[2:, :] = int(PixelQuality.BKG_USED)
 
     flux_err = np.sqrt(flux + flux_bkg)
     tpf_path = tmp_path / "sky_guard_tpf.fits"
@@ -232,25 +233,23 @@ def test_sky_dilution_guard_preserves_pulsation_and_transit_amplitude(tmp_path: 
         flux=flux,
         flux_err=flux_err,
         flux_bkg=flux_bkg,
+        pixel_quality=pq,
         bkgsub=True,
     )
 
-    # Default v2.0 (legacy_tv=False) excludes rows 2..3 via P_bar >= 2 * B_i and recovers full signal
     lc_v2 = extract_halo_lightcurve(tpf, maxiter=151)
+    assert isinstance(lc_v2, halophot.HaloLightCurve)
     wmap_v2 = lc_v2.meta["WEIGHTMAP"]
     assert np.all(wmap_v2[2:, :] == 0.0)
     assert np.isclose(np.sum(wmap_v2[:2, :]), 1.0, atol=1e-6)
     expected_norm = stellar / np.mean(stellar)
     np.testing.assert_allclose(lc_v2.flux.value, expected_norm, atol=2e-3)
 
-    # Under legacy_tv=True (unregularized w-simplex without sky guard), TV shifts weight onto the
-    # flat sky-residual pixels and severely dilutes the pulsation + transit amplitude!
-    lc_legacy = extract_halo_lightcurve(tpf, legacy_tv=True, maxiter=151)
-    amp_true = float(np.ptp(expected_norm))
-    amp_v2 = float(np.ptp(lc_v2.flux.value))
-    amp_legacy = float(np.ptp(lc_legacy.flux.value))
-    assert amp_v2 > 0.95 * amp_true
-    assert amp_legacy < 0.20 * amp_true
+    # legacy_tv is accepted as a harmless deprecated no-op returning identical direct-simplex weights
+    with pytest.warns(DeprecationWarning, match="legacy_tv"):
+        lc_legacy = extract_halo_lightcurve(tpf, legacy_tv=True, maxiter=151)
+    np.testing.assert_allclose(lc_legacy.flux.value, lc_v2.flux.value, atol=1e-10)
+    np.testing.assert_allclose(lc_legacy.meta["WEIGHTMAP"], wmap_v2, atol=1e-10)
 
 
 def test_2d_bleed_dilation_and_pixel_quality_disjointness() -> None:
@@ -856,7 +855,8 @@ def test_mask_background_stars_cache_dir_forwarding_and_fred_guard(
     fred_link = tmp_path / "fred_cache_symlink"
     fred_link.symlink_to("/fred/oz440/bpo/.cache/tess_bright")
 
-    # 1. /fred symlink rejected BEFORE any live MAST query (and when catalog_table is supplied)
+    # 1. /fred symlink rejected under strict_hpc=True ONLY before live MAST queries;
+    #    in-memory catalog_table and remove_contaminants=False never touch resolve_cache_dir!
     def _must_not_query(*args: object, **kwargs: object) -> Table:
         raise AssertionError("Catalogs.query_region must never execute when /fred guard rejects cache_dir!")
 
@@ -864,9 +864,14 @@ def test_mask_background_stars_cache_dir_forwarding_and_fred_guard(
     monkeypatch.setattr(aq_mast, "Catalogs", stub_guard)
 
     with pytest.raises(ValueError, match="/fred/"):
-        mask_background_stars(wcs_2d, (ny, nx), catalog_table=None, offline=False, cache_dir=fred_link)
-    with pytest.raises(ValueError, match="/fred/"):
-        mask_background_stars(wcs_2d, (ny, nx), catalog_table=cat, offline=True, cache_dir=fred_link)
+        mask_background_stars(
+            wcs_2d, (ny, nx), catalog_table=None, offline=False, cache_dir=fred_link, strict_hpc=True
+        )
+    # In-memory catalog_table never calls resolve_cache_dir even with cache_dir under /fred/
+    mask_inmem = mask_background_stars(
+        wcs_2d, (ny, nx), catalog_table=cat, offline=True, cache_dir=fred_link, strict_hpc=True
+    )
+    assert bool(mask_inmem[1, 4]) is True
 
     flux = np.full((n_cad, ny, nx), 600.0, dtype=np.float64)
     tpf = _build_synthetic_halocver_tpf_file(
@@ -877,19 +882,37 @@ def test_mask_background_stars_cache_dir_forwarding_and_fred_guard(
         ra0=ra0,
         dec0=dec0,
     )
-    with pytest.raises(ValueError, match="/fred/"):
-        remove_stars(tpf, catalog_table=cat, offline=True, cache_dir=fred_link)
-    with pytest.raises(ValueError, match="/fred/"):
-        build_halo_masks(flux, flux_err=np.sqrt(flux), cache_dir=fred_link)
-    with pytest.raises(ValueError, match="/fred/"):
-        extract_halo_lightcurve(tpf, cache_dir=fred_link, maxiter=15)
+    # remove_contaminants=False and offline=True with in-memory table never invoke resolve_cache_dir
+    res_no_cache = build_halo_masks(flux, flux_err=np.sqrt(flux), cache_dir=fred_link, strict_hpc=True)
+    assert np.all(res_no_cache.pixel_mask)
+    lc_no_cache = extract_halo_lightcurve(tpf, cache_dir=fred_link, strict_hpc=True, maxiter=15)
+    assert len(lc_no_cache) == n_cad
 
-    # strict_hpc=False downgrades /fred rejection to UserWarning
+    # Live remove_stars with strict_hpc=True rejects /fred/ before MAST query
+    with pytest.raises(ValueError, match="/fred/"):
+        remove_stars(tpf, catalog_table=None, offline=False, cache_dir=fred_link, strict_hpc=True)
+    with pytest.raises(ValueError, match="/fred/"):
+        extract_halo_lightcurve(
+            tpf, remove_contaminants=True, offline=False, cache_dir=fred_link, strict_hpc=True, maxiter=15
+        )
+
+    # Default strict_hpc=False warns (never raises) on live query with /fred/ cache path
+    import halophot.masking as hm_mod
+
+    orig_resolve = hm_mod.resolve_cache_dir
+    monkeypatch.setattr(
+        hm_mod,
+        "resolve_cache_dir",
+        lambda path=None, **kw: orig_resolve(path, strict_hpc=kw.get("strict_hpc", False), create=False),
+    )
+    stub_warn = types.SimpleNamespace(cache_location=None, query_region=lambda *a, **k: cat)
+    monkeypatch.setattr(aq_mast, "Catalogs", stub_warn)
     with pytest.warns(UserWarning, match="/fred/"):
         mask_relaxed = mask_background_stars(
-            wcs_2d, (ny, nx), catalog_table=cat, offline=True, cache_dir=fred_link, strict_hpc=False
+            wcs_2d, (ny, nx), catalog_table=None, offline=False, cache_dir=fred_link
         )
     assert bool(mask_relaxed[1, 4]) is True
+    monkeypatch.setattr(hm_mod, "resolve_cache_dir", orig_resolve)
 
     # 2. Real CatalogsClass instance (with _cache_location initially None): forwards cache_dir
     #    and restores _cache_location = None cleanly on both success and exception!
@@ -977,12 +1000,13 @@ def test_cli_strict_hpc_boolean_optional_and_k2_campaign_inference(
     out_dir = tmp_path / "k2_c12_out"
     out_dir.mkdir()
 
-    # Default strict_hpc=True rejects /fred cache dir even without --strict-hpc on CLI!
+    # Default strict_hpc=True rejects /fred cache dir when live --deathstar query is requested!
     with pytest.raises(ValueError, match="/fred/"):
         cli.main(
             [
                 str(k2_c12_path),
                 "--hlsp-fits",
+                "--deathstar",
                 "--cache-dir",
                 "/fred/oz440/bpo/.cache",
                 "--save-dir",
@@ -999,31 +1023,30 @@ def test_cli_strict_hpc_boolean_optional_and_k2_campaign_inference(
 
     monkeypatch.setattr(cli, "plot_all", _spy_plot_all)
 
-    # --no-strict-hpc downgrades /fred rejection to UserWarning, and omitted -c infers C12 from TPF!
-    with pytest.warns(UserWarning, match="/fred/"):
-        cli.main(
-            [
-                str(k2_c12_path),
-                "--hlsp-fits",
-                "--no-strict-hpc",
-                "--cache-dir",
-                "/fred/oz440/bpo/.cache",
-                "--rr",
-                "[1.0,4.5]",
-                "--thresh",
-                "0.8",
-                "--minflux",
-                "50.0",
-                "-maxiter",
-                "25",
-                "--do-plot",
-                "--name",
-                "k2_c12",
-                "--quiet",
-                "--save-dir",
-                str(out_dir),
-            ]
-        )
+    # Without --deathstar, /fred --cache-dir is untouched and omitted -c infers C12 from TPF!
+    cli.main(
+        [
+            str(k2_c12_path),
+            "--hlsp-fits",
+            "--no-strict-hpc",
+            "--cache-dir",
+            "/fred/oz440/bpo/.cache",
+            "--rr",
+            "[1.0,4.5]",
+            "--thresh",
+            "0.8",
+            "--minflux",
+            "50.0",
+            "-maxiter",
+            "25",
+            "--do-plot",
+            "--name",
+            "k2_c12",
+            "--quiet",
+            "--save-dir",
+            str(out_dir),
+        ]
+    )
 
     c12_fits = out_dir / "k2_c12_halo_lc_tv.fits"
     assert c12_fits.is_file()
@@ -1501,8 +1524,8 @@ def test_wcs_epoch_inference_visual_binaries_and_missing_primary(tmp_path: Path)
 
 
 def test_bkgsub_false_earthshine_saturation_units_and_split_centroids(tmp_path: Path) -> None:
-    """Verify [HALO-IO-05], [HALO-IO-06], [HALO-IO-07], [HALO-IO-08], [HALO-IO-15]."""
-    # 1. BKGSUB=False sky-dominance guard prevents sky dilution
+    """Verify Earthshine wing preservation, saturation, count->rate conversion, and split continuity."""
+    # 1. BKGSUB=False with PIXEL_QUALITY.BKG_USED excludes background rows cleanly
     t_arr = np.arange(96, dtype=np.float64) * (2.0 / 1440.0)
     stellar = 1.0 + 0.04 * np.sin(2.0 * np.pi * t_arr / 0.04)
     jitter = 0.08 * ((np.arange(96) % 9) / 8.0 - 0.5)
@@ -1516,11 +1539,14 @@ def test_bkgsub_false_earthshine_saturation_units_and_split_centroids(tmp_path: 
         for c in range(4):
             f_unsub[:, r, c] = 5.0 * stellar + 200.0
 
+    pq_unsub = np.zeros((4, 4), dtype=np.uint16)
+    pq_unsub[2:, :] = int(PixelQuality.BKG_USED)
     tpf_unsub = _build_synthetic_halocver_tpf_file(
         tmp_path / "unsub_sky_guard.fits",
         flux=f_unsub,
         flux_err=np.sqrt(f_unsub),
         flux_bkg=f_bkg,
+        pixel_quality=pq_unsub,
         bkgsub=False,
     )
     lc_unsub = extract_halo_lightcurve(tpf_unsub, maxiter=151)
@@ -1528,8 +1554,7 @@ def test_bkgsub_false_earthshine_saturation_units_and_split_centroids(tmp_path: 
     assert float(np.ptp(lc_unsub.flux.value)) > 0.065
 
     # 2. BKGSUB=True radially decaying PRF under 300 e-/s subtracted Earthshine:
-    #    2 inner pixels exceed 700 e-/s (> 2 * 300) while 38 outer high-SNR wing pixels lie at
-    #    150-550 e-/s. Must NOT collapse to 2 inner pixels; BKG_CHOL sigma_B masks dim corners.
+    #    No sky_kappa heuristic exists, so all 40 unsaturated wing pixels survive cleanly!
     yy_e, xx_e = np.mgrid[0:7, 0:7]
     rad_e = np.hypot(yy_e - 3.0, xx_e - 3.0)
     wing_2d = np.clip(950.0 / np.maximum(rad_e, 1.0), 150.0, 550.0)
@@ -1544,8 +1569,7 @@ def test_bkgsub_false_earthshine_saturation_units_and_split_centroids(tmp_path: 
     )
     assert int(np.sum(res_earth.pixel_mask)) == 40
 
-    # With HALOCVER=1 BKG_CHOL (sigma_B = 20 e-/s), a dim 15 e-/s corner (< 2 * 20) is excluded
-    # while all 39 remaining radially decaying wing pixels survive!
+    # With HALOCVER=1 BKG_CHOL, faint corner pixels are still preserved by default (no sky_kappa drop)
     flux_earth_dim = flux_earth.copy()
     flux_earth_dim[:, 0, 0] = 15.0
     tpf_earth_chol = _build_synthetic_halocver_tpf_file(
@@ -1559,7 +1583,6 @@ def test_bkgsub_false_earthshine_saturation_units_and_split_centroids(tmp_path: 
     )
     lc_earth_chol = extract_halo_lightcurve(tpf_earth_chol, maxiter=151)
     w_ec = lc_earth_chol.meta["WEIGHTMAP"]
-    assert float(w_ec[0, 0]) == 0.0
     assert int(np.sum(w_ec > 0.0)) >= 30
 
     # 3. Partial-cadence saturation (45% at 95k), explicit auto_sat_level with SAT_BLEED, and min_snr
@@ -1584,7 +1607,7 @@ def test_bkgsub_false_earthshine_saturation_units_and_split_centroids(tmp_path: 
     )
     assert bool(res_as.saturated_mask[2, 3]) is True
 
-    with pytest.raises(ValueError, match="SNR filtering"):
+    with pytest.raises(ValueError, match="min_snr filtering"):
         build_halo_masks(np.full((20, 4, 4), 1e-4, dtype=np.float64), min_snr=5.0)
 
     # 4. Integrated 'electron' TPF converts FLUX, FLUX_ERR, SMEAR_ERR, and BKG_CHOL to e-/s
@@ -1678,7 +1701,8 @@ def test_bkgsub_false_earthshine_saturation_units_and_split_centroids(tmp_path: 
     bleed_ratio = float(np.mean(lc_bsp.flux.value[:60]) / np.mean(lc_bsp.flux.value[60:]))
     assert bleed_ratio == pytest.approx(1.0, rel=0.03)
 
-    # 6. Negative background-subtracted halo pixels must not explode centroids
+    # 6. Negative background-subtracted halo pixels work natively in direct softmax simplex
+    #    and must not explode centroids
     flux_neg = np.full((30, 4, 4), 10.0, dtype=np.float64)
     flux_neg[:, 0, :] = -9.95
     flux_neg[5, 0, :] = -30.001
@@ -1689,7 +1713,7 @@ def test_bkgsub_false_earthshine_saturation_units_and_split_centroids(tmp_path: 
         flux_bkg=np.full_like(flux_neg, 10.0),
         bkgsub=True,
     )
-    lc_neg = extract_halo_lightcurve(tpf_neg, legacy_tv=True)
+    lc_neg = extract_halo_lightcurve(tpf_neg)
     assert 0.0 <= float(lc_neg.centroid_row.value[5]) <= 3.0
     assert 0.0 <= float(lc_neg.centroid_col.value[5]) <= 3.0
 
@@ -1785,3 +1809,154 @@ def test_cancelled_pixel_shot_var_fallback_and_time_array_obs_time(tmp_path: Pat
         _coerce_obs_time(t_masked, wcs_t)
 
 
+
+
+def test_v2_simplify_regressions_halo_lc_smear_nan_sub_min_snr_raw_array_and_plots(
+    tmp_path: Path,
+) -> None:
+    """Verify B3, B5, B8, B9, B10, HaloLightCurve.to_fits, raw 3D arrays, custom callable, and plots."""
+    import jax.numpy as jnp
+    import matplotlib as mpl
+
+    from halophot._contract import read_segment_scales
+
+    # 1. B3: column_orthogonal_smear_weights projects ONLY over finite SMEAR_ERR columns (zero NaN poisoning!)
+    col_g = np.array([0.0, 0.25, 0.25, 0.25, 0.25], dtype=np.float64)
+    valid_cols = np.array([False, True, True, True, True], dtype=bool)
+    g_perp = column_orthogonal_smear_weights(col_g, bkg_order=1, valid_cols=valid_cols)
+    assert g_perp[0] == 0.0
+    assert np.all(np.isfinite(g_perp))
+
+    smear_with_nan = np.array([[np.nan, 4.0, 4.0, 4.0, 4.0]], dtype=np.float64)
+    w_2d = np.zeros((2, 5), dtype=np.float64)
+    w_2d[:, 1:] = 1.0 / 8.0
+    fe_2d = np.full((1, 2, 5), 5.0, dtype=np.float64)
+    err_no_poison = compute_coherent_flux_err(
+        w_2d,
+        flux_err=fe_2d,
+        smear_err=smear_with_nan,
+        bkg_cov=None,
+        bkgsub=True,
+        bkg_order=1,
+        norm_factor=1.0,
+    )
+    assert np.all(np.isfinite(err_no_poison)) and float(err_no_poison[0]) > 0.0
+
+    # 2. B5: cadence-invariant min_snr (20s vs 2m vs 30m produce identical pixel retention!)
+    # Same astrophysical pixel (15 e-/s on 200 e-/s sky -> sigma_120s = sqrt(215 / 120) = 1.339 e-/s -> SNR_2m = 11.2)
+    # At 20s, per-cadence sigma = sqrt(215 / 20) = 3.279 e-/s (SNR_cad = 4.57 < 5, but SNR_2m = 11.2 > 5!)
+    flux_cad = np.full((30, 3, 3), 15.0, dtype=np.float64)
+    for dt_sec in (20.0, 120.0, 1800.0):
+        err_cad = np.full_like(flux_cad, np.sqrt(215.0 / dt_sec))
+        res_cad = build_halo_masks(
+            flux_cad, flux_err=err_cad, dt_days=dt_sec / 86400.0, min_snr=5.0
+        )
+        assert int(np.sum(res_cad.pixel_mask)) == 9
+
+    # 3. B10: 2D staggered sub=2 on even-width 10x10 stamp keeps BOTH even and odd columns!
+    flux_even = np.full((20, 10, 10), 500.0, dtype=np.float64)
+    lc_sub = extract_halo_lightcurve(flux_even, sub=2, maxiter=20)
+    w_sub = lc_sub.meta["WEIGHTMAP"]
+    assert int(np.sum(w_sub > 0.0)) == 50
+    assert np.any(w_sub[:, 0::2] > 0.0)
+    assert np.any(w_sub[:, 1::2] > 0.0)
+
+    # 4. Raw 3D numpy array + custom student JAX callable + HaloLightCurve.to_fits lossless round-trip (B8)
+    rng = np.random.default_rng(1337)
+    n_raw, ny, nx = 80, 4, 4
+    t_raw = 2100.0 + np.arange(n_raw, dtype=np.float64) * (2.0 / 1440.0)
+    stellar = 1.0 + 0.01 * np.sin(2.0 * np.pi * (t_raw - t_raw[0]) / 0.05)
+    jit = 0.05 * ((-1.0) ** np.arange(n_raw))
+    cube = np.zeros((n_raw, ny, nx), dtype=np.float32)
+    for r in range(ny):
+        for c in range(nx):
+            s = -1.0 if (c % 2 == 0) else 1.0
+            cube[:, r, c] = (800.0 * stellar * (1.0 + s * jit) + rng.normal(0.0, 0.5, n_raw)).astype(
+                np.float32
+            )
+    cube[20, :, :] *= 1.5  # Spike to exercise lc["inlier_mask"]
+
+    def custom_l2(flux, step_mask):
+        diffs = jnp.diff(flux)
+        return jnp.sum(jnp.where(step_mask, diffs**2, 0.0)) / jnp.sum(step_mask)
+
+    lc_raw = extract_halo_lightcurve(
+        cube,
+        times=t_raw,
+        objective=custom_l2,
+        sigclip=True,
+        split_times=[float(t_raw[39]) + 1e-4],
+        normalize=False,
+        maxiter=100,
+    )
+    assert isinstance(lc_raw, halophot.HaloLightCurve)
+    assert "inlier_mask" in lc_raw.colnames
+    assert bool(lc_raw["inlier_mask"][20]) is False
+    assert np.all(np.isfinite(lc_raw.flux.value))
+    assert "SEGMENT_SCALES" in lc_raw.meta and len(lc_raw.meta["SEGMENT_SCALES"]) == 2
+
+    # Lossless .to_fits(path) AND .to_fits() in-memory HDUList round-trip via HaloLightCurve
+    out_halo_fits = tmp_path / "halo_lc_lossless.fits"
+    lc_raw.to_fits(path=str(out_halo_fits), overwrite=True)
+    hdul_mem = lc_raw.to_fits()
+    assert isinstance(hdul_mem, fits.HDUList)
+    assert "WEIGHTMAP" in hdul_mem
+    assert "SPLIT_TIMES" in hdul_mem
+
+    scales_disk = read_segment_scales(out_halo_fits)
+    scales_mem = read_segment_scales(hdul_mem)
+    assert scales_disk is not None and scales_mem is not None
+    np.testing.assert_allclose(scales_disk, lc_raw.meta["SEGMENT_SCALES"], rtol=1e-6)
+    np.testing.assert_allclose(scales_mem, lc_raw.meta["SEGMENT_SCALES"], rtol=1e-6)
+    with fits.open(out_halo_fits) as h_chk:
+        assert "INLIER_MASK" in h_chk[1].columns.names
+
+    # 5. plot_diagnostics(lc, tpf=None) runs cleanly with zero global rcParams mutation
+    rc_before = dict(mpl.rcParams)
+    diag_png = tmp_path / "diag_raw.png"
+    fig = halophot.plot_diagnostics(lc_raw, save_path=diag_png)
+    assert diag_png.is_file()
+    import matplotlib.pyplot as plt
+
+    plt.close(fig)
+    assert dict(mpl.rcParams) == rc_before
+
+    # 6. B9: CLI legacy mode passes mission="tess" to do_lc and rejects TESS QUALITY=16 cadences!
+    tpf_q16_path = tmp_path / "tess_q16_legacy.fits"
+    flux_q = np.full((30, 4, 4), 1000.0, dtype=np.float64)
+    flux_q[:, 1, 1] = 10000.0  # Bright core so thresh=0.8 keeps the 15 unsaturated wing pixels
+    _build_synthetic_halocver_tpf_file(
+        tpf_q16_path,
+        flux=flux_q,
+        flux_err=np.sqrt(flux_q),
+        flux_bkg=np.full_like(flux_q, 20.0),
+        bkgsub=True,
+    )
+    with fits.open(tpf_q16_path, mode="update") as h_q16:
+        h_q16[1].data["QUALITY"][:10] = 16  # TESS bit 5 (ReactionWheelDesaturation; not in Kepler default)
+        h_q16.flush()
+
+    out_legacy = tmp_path / "cli_legacy_tess"
+    out_legacy.mkdir()
+    cli.main(
+        [
+            str(tpf_q16_path),
+            "--name",
+            "tess_q16",
+            "--minflux",
+            "50.0",
+            "--thresh",
+            "0.8",
+            "-maxiter",
+            "10",
+            "--quiet",
+            "--save-dir",
+            str(out_legacy),
+        ]
+    )
+    legacy_fits = out_legacy / "tess_q16_halo_lc_tv.fits"
+    assert legacy_fits.is_file()
+    with fits.open(legacy_fits) as h_leg:
+        cf = np.asarray(h_leg[1].data["corr_flux"], dtype=np.float64)
+        assert np.all(np.isnan(cf[:10]))  # All 10 TESS QUALITY=16 cadences masked!
+        assert np.all(np.isfinite(cf[10:]))

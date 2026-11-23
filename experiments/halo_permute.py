@@ -82,8 +82,8 @@ for jj in range(nsims):
 
 
 finish = clock()
-print 'Done'
-print 'Time elapsed:',finish-start,'s'
+print('Done')
+print('Time elapsed:', finish - start, 's')
 
 raw, opt = do_sim(x,y,f)
 

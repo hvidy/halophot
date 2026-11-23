@@ -1,75 +1,58 @@
-"""Zodiax / Optax halo weight solvers, narrow local spike clipping, and block jackknife.
-
-Provides:
-* Cached ``eqx.filter_jit(eqx.filter_value_and_grad(loss_fn))`` evaluation on
-  :class:`~halophot.models.HaloWeights` PyTrees (scoped under ``@in_float64``).
-* Tier-1 two-tier preconditioned ``optax.lbfgs`` + zoom line search solver
-  (Fisher-preconditioned for ``M - 1 <= 256``, O(M) diagonal log-simplex
-  curvature scaled for ``M - 1 > 256`` or ``precondition=False``) and Tier-2
-  ``zodiax.optimisation`` (``optax.adam`` + ``safe_eigen_projection``), both
-  normalized internally by ``max(n_eff, 1.0)`` so loss and gradients remain O(1).
-* Gap-aware narrow local-median / Theil-Sen cosmic-ray and thruster spike
-  detector that excludes outlier cadences strictly during weight optimization
-  without overwriting finite astrophysical cadences in returned light curves.
-* Warm-started orbit-gap-aware ``K``-block jackknife uncertainty estimation
-  with Busing-Meijer-van der Leeden delete-``m_k`` weighting and static ``N_pad``
-  XLA reuse.
-"""
+"""Halo weight optimization via ``optax.lbfgs``, spike clipping, and orbit block jackknife."""
 
 from __future__ import annotations
 
-import functools
-import math
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
-import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import zodiax as zdx
 from astropy.stats import mad_std, sigma_clip
 
 from ._precision import in_float64
-from .models import HaloObservation, HaloWeights, _safe_minvar_frac_var
-from .objectives import (
-    AVAILABLE_OBJECTIVES,
-    _halo_objective,
-    _l2v_gap_masked,
-    _l3v_gap_masked,
-    _owl_masked,
-    _photon_noise_penalty,
-    _tv_charbonnier_o1,
-    _tv_charbonnier_o2,
-    _tv_exp_scan,
-)
-from .simplex import _ilr_to_logits, _ilr_to_simplex, _logits_to_ilr
+from .objectives import compute_step_mask, normalized_flux, resolve_objective
+from .simplex import initial_logits, logits_to_weights
 
 __all__ = [
     "HaloFitResult",
-    "build_value_and_grad",
+    "OptimConfig",
     "cadence_scaled_savgol_window",
     "cadence_scaled_sigclip_mask",
     "optimise_halo",
     "orbit_block_jackknife",
-    "safe_eigen_projection",
 ]
 
 
 @dataclass(frozen=True)
+class OptimConfig:
+    """Configuration for :func:`optimise_halo`."""
+
+    objective: str | Callable[..., Any] = "tv"
+    lag: int = 1
+    tau: float | None = None
+    epsilon: float = 1e-2
+    maxiter: int = 500
+    rtol: float = 1e-7
+    atol: float = 1e-12
+    precondition: bool = True
+    sigclip: bool = False
+    window_days: float = 0.02
+    sigma_lower: float = 10.0
+    sigma_upper: float = 3.0
+    compute_uncertainty: bool = False
+    jackknife_blocks: int = 4
+    gap_tol: float = 0.25
+
+
+@dataclass(frozen=True)
 class HaloFitResult:
-    """Result of ``optimise_halo`` on active halo pixels ``Omega_halo``.
+    """Result of :func:`optimise_halo` on active halo pixels."""
 
-    ``converged`` indicates stationarity or 2-step stabilized weights and objective
-    within ``(rtol, atol)`` for ``solver='lbfgs'``, or finite objective with
-    preconditioned max-norm gradient within ``atol + rtol * max(|loss / n_eff|, 1.0)``
-    for fixed-schedule first-order solvers (``'zodiax'`` / ``'adam'``).
-    """
-
-    weights_tree: HaloWeights
-    physical_weights: np.ndarray
-    flux_shares: np.ndarray
+    weights: np.ndarray
     norm_flux: np.ndarray
     raw_flux: np.ndarray
     inlier_mask: np.ndarray
@@ -80,301 +63,194 @@ class HaloFitResult:
     converged: bool = True
     n_steps: int = 0
 
-
-@functools.lru_cache(maxsize=32)
-def build_value_and_grad(
-    objective: str = "tv",
-    epsilon: float = 1e-5,
-    tau: float | None = None,
-):
-    """Return a cached ``@in_float64``-scoped ``eqx.filter_jit(eqx.filter_value_and_grad)`` callable."""
-    if objective not in AVAILABLE_OBJECTIVES:
-        valid = ", ".join(AVAILABLE_OBJECTIVES)
-        raise ValueError(f"Unknown objective {objective!r}; expected one of: {valid}.")
-
-    def _loss(weights: HaloWeights, obs: HaloObservation) -> jax.Array:
-        return _halo_objective(weights, obs, objective=objective, epsilon=epsilon, tau=tau)
-
-    jitted_vg = eqx.filter_jit(eqx.filter_value_and_grad(_loss))
-
-    @in_float64
-    def _scoped_vg(weights: HaloWeights, obs: HaloObservation):
-        return jitted_vg(weights, obs)
-
-    return _scoped_vg
+    @property
+    def physical_weights(self) -> np.ndarray:
+        """Alias for :attr:`weights` (v2.0 compatibility)."""
+        return self.weights
 
 
-@in_float64
-def safe_eigen_projection(
-    fmat: jax.Array | np.ndarray | None = None,
-    cov: jax.Array | np.ndarray | None = None,
+def cadence_scaled_savgol_window(dt_days: float, window_days: float = 1.0) -> int:
+    """Compute an odd Savitzky-Golay window ``max(5, int(round(window_days / dt_days)) | 1)``."""
+    if not np.isfinite(dt_days) or dt_days <= 0.0:
+        raise ValueError(f"dt_days must be finite and > 0, got {dt_days!r}.")
+    if not np.isfinite(window_days) or window_days <= 0.0:
+        raise ValueError(f"window_days must be finite and > 0, got {window_days!r}.")
+    return max(5, int(round(window_days / dt_days)) | 1)
+
+
+def cadence_scaled_sigclip_mask(
+    flux: np.ndarray,
+    times: np.ndarray | None = None,
     *,
-    eps: float = 1e-8,
-    rcond: float = 1e-6,
-) -> jax.Array:
-    """Compute a rank-deficiency-guarded Hessian / covariance preconditioning matrix.
+    dt_days: float | None = None,
+    window_days: float = 0.02,
+    sigma_lower: float = 10.0,
+    sigma_upper: float = 3.0,
+    gap_factor: float = 3.0,
+) -> np.ndarray:
+    """Return a boolean inlier mask using a gap-aware local leave-one-out median detector.
 
-    Wraps ``zodiax.optimisation.decompose`` while symmetrizing the input matrix and
-    clamping only non-positive diagonal entries (leaving all positive curvature scales
-    intact) and small/negative normalized eigenvalues strictly above zero so flat or
-    rank-deficient directions never emit ``0/0`` or ``1/sqrt(0)`` ``NaN``s.
+    Scales the local half-width to ``window_days`` via
+    ``half_width = clamp(round(0.5 * window_days / dt_days), 3, 15)`` so a
+    default ``window_days = 0.02`` (~29 min) yields ``half_width = 15`` at 20 s
+    (catching 5-cadence 100 s bursts cleanly) and ``half_width = 7`` at 2 min,
+    while preserving multi-hour eclipses and never bridging downlink gaps.
     """
-    if (fmat is None) == (cov is None):
-        raise ValueError("Specify exactly one of fmat or cov in safe_eigen_projection.")
-    if eps <= 0.0 or rcond < 0.0:
-        raise ValueError("eps must be > 0 and rcond must be >= 0.")
+    y = np.asarray(flux, dtype=np.float64)
+    n_cad = y.shape[0]
+    t_arr = np.asarray(times, dtype=np.float64) if times is not None else None
+    fin_mask = np.isfinite(y) if t_arr is None else (np.isfinite(y) & np.isfinite(t_arr))
 
-    raw = jnp.asarray(fmat if fmat is not None else cov, dtype=jnp.float64)
-    if raw.ndim != 2 or raw.shape[0] != raw.shape[1]:
-        raise ValueError(f"Expected a 2D square matrix, got shape {raw.shape}.")
-    dim = raw.shape[0]
-    if dim == 0:
-        return jnp.zeros((0, 0), dtype=jnp.float64)
+    if n_cad < 3:
+        return fin_mask.copy()
 
-    mat = 0.5 * (raw + raw.T)
-    diag = jnp.diag(mat)
-    tiny = jnp.finfo(raw.dtype).tiny
-    pos_mask = jnp.isfinite(diag) & (diag > tiny)
-    has_pos = jnp.any(pos_mask)
-    if fmat is not None:
-        max_pos = jnp.max(jnp.where(pos_mask, diag, 0.0))
-        fallback_diag = jnp.where(has_pos, max_pos, 1.0)
-        safe_diag = jnp.where(pos_mask, diag, fallback_diag)
-    else:
-        min_pos = jnp.min(jnp.where(pos_mask, diag, jnp.inf))
-        cov_floor = jnp.where(has_pos, jnp.maximum(eps * min_pos, tiny), eps)
-        safe_diag = jnp.where(pos_mask, diag, cov_floor)
+    fin_idx = np.flatnonzero(fin_mask)
+    if fin_idx.size == 0:
+        return np.zeros(n_cad, dtype=bool)
 
-    inv_sqrt_diag = 1.0 / jnp.sqrt(safe_diag)
-    norm_mat = mat * jnp.outer(inv_sqrt_diag, inv_sqrt_diag)
-    norm_mat = 0.5 * (norm_mat + norm_mat.T)
-
-    vals, vecs = zdx.optimisation.decompose(norm_mat, normalise=False)
-    top_val = jnp.maximum(vals[0], eps)
-    floor = jnp.maximum(rcond * top_val, eps)
-    safe_vals = jnp.maximum(vals, floor)
-
-    if fmat is not None:
-        diag_scale = inv_sqrt_diag
-        eig_scale = 1.0 / jnp.sqrt(safe_vals)
-    else:
-        diag_scale = jnp.sqrt(safe_diag)
-        eig_scale = jnp.sqrt(safe_vals)
-
-    return (diag_scale[:, None] * vecs.T) * eig_scale[None, :]
-
-
-@functools.lru_cache(maxsize=16)
-def _get_fisher_fn(
-    objective: str,
-    tau: float | None,
-    epsilon: float = 1e-5,
-):
-    """Build and cache a JIT-compiled Gauss-Newton Fisher curvature evaluator wrt ``z_ilr``.
-
-    Evaluates the convex simplex Hessian ``H_theta`` of the ``1 / max(n_eff, 1)``-normalized
-    objective at a noise-matched smoothing scale ``eps_gn`` (``max(b_hat, eps_eff)`` in
-    regularized mode, or the active difference scale at ``theta0`` floored at ``epsilon``
-    under ``legacy_tv=True``) and pulls it back through ``J_theta = d(theta)/d(z_ilr)``.
-    """
-
-    @eqx.filter_jit
-    def _fisher(w0: HaloWeights, obs: HaloObservation) -> jax.Array:
-        z0 = w0.z_ilr
-        theta0 = _ilr_to_simplex(z0)
-        jac_theta = jax.jacrev(_ilr_to_simplex)(z0)
-        inv_n = 1.0 / jnp.maximum(obs.n_eff, 1.0)
-        tiny = jnp.finfo(z0.dtype).tiny
-        b_scale0 = jnp.maximum(obs.b_hat, tiny)
-        eps_req = jnp.asarray(epsilon, dtype=z0.dtype)
-        if not w0.legacy_tv:
-            eps_eff = jnp.maximum(jnp.minimum(eps_req, 0.1 * b_scale0), tiny)
-            eps_gn = jnp.maximum(b_scale0, eps_eff)
+    if dt_days is None:
+        if t_arr is not None:
+            diffs = np.diff(t_arr[fin_idx])
+            pos = diffs[diffs > 0.0]
+            dt_val = float(np.median(pos)) if pos.size > 0 else (1.0 / 48.0)
         else:
-            f0 = w0._evaluate_lightcurve_raw(obs)
-            lag = obs.lag
-            if objective == "owl":
-                mask_c = obs.valid_cadence_mask.astype(z0.dtype)
-                cnt_c = jnp.maximum(jnp.sum(mask_c), 1.0)
-                mu_c = jnp.sum(mask_c * f0) / cnt_c
-                var_c = (
-                    jnp.sum(jnp.where(obs.valid_cadence_mask, jnp.square(f0 - mu_c), 0.0)) / cnt_c
-                )
-                scale0 = jnp.sqrt(jnp.maximum(var_c, 0.0))
-            elif objective == "tv_o2" and 2 * lag < obs.N_pad:
-                m2 = obs.valid_diff_mask[: -2 * lag] & obs.valid_diff_mask[lag:-lag]
-                d2 = jnp.where(
-                    m2, jnp.abs(2.0 * f0[lag:-lag] - f0[2 * lag :] - f0[: -2 * lag]), 0.0
-                )
-                scale0 = jnp.sum(d2) / jnp.maximum(jnp.sum(m2.astype(z0.dtype)), 1.0)
-            elif lag < obs.N_pad:
-                m1 = obs.valid_diff_mask[:-lag]
-                d1 = jnp.where(m1, jnp.abs(f0[lag:] - f0[:-lag]), 0.0)
-                scale0 = jnp.sum(d1) / jnp.maximum(jnp.sum(m1.astype(z0.dtype)), 1.0)
-            else:
-                scale0 = eps_req
-            eps_gn = jnp.maximum(scale0, eps_req)
-
-        def _simplex_loss(theta: jax.Array) -> jax.Array:
-            if not w0.legacy_tv:
-                lc_scaled = jnp.dot(theta, obs.norm_pixels)
-                mean_ratio = jnp.dot(theta, obs.norm_mean_ratio)
-                safe_ratio = jnp.where(
-                    jnp.abs(mean_ratio) > 1e-30,
-                    mean_ratio,
-                    jnp.ones_like(mean_ratio),
-                )
-                f_tilde = lc_scaled / safe_ratio
-            else:
-                safe_scale = jnp.where(
-                    jnp.abs(obs.mean_pixel_flux) > 1e-30,
-                    obs.mean_pixel_flux,
-                    1.0,
-                )
-                weighted_p = jnp.dot(theta * safe_scale, obs.norm_pixels)
-                mean_f = jnp.dot(theta, obs.mean_pixel_flux)
-                safe_denom = jnp.where(
-                    jnp.abs(mean_f) > 1e-30,
-                    mean_f,
-                    jnp.ones_like(mean_f),
-                )
-                f_tilde = weighted_p / safe_denom
-
-            b_scale = jnp.maximum(obs.b_hat, jnp.finfo(f_tilde.dtype).tiny)
-            if objective == "tv":
-                mean_val, count = _tv_charbonnier_o1(f_tilde, obs, epsilon=eps_gn)
-                data_term = (count / b_scale) * mean_val
-            elif objective == "tv_o2":
-                mean_val, count = _tv_charbonnier_o2(f_tilde, obs, epsilon=eps_gn)
-                data_term = (count / b_scale) * mean_val
-            elif objective == "tv_exp":
-                mean_val, count = _tv_exp_scan(f_tilde, obs, tau=tau, epsilon=eps_gn)
-                data_term = (count / b_scale) * mean_val
-            elif objective == "l2v":
-                mean_val, count = _l2v_gap_masked(f_tilde, obs)
-                data_term = (count / jnp.square(b_scale)) * mean_val
-            elif objective == "l3v":
-                mean_val, count = _l3v_gap_masked(f_tilde, obs, epsilon=eps_gn)
-                data_term = (count / (b_scale * jnp.square(b_scale))) * mean_val
-            else:
-                std_val, count = _owl_masked(f_tilde, obs, epsilon=eps_gn)
-                data_term = std_val if w0.legacy_tv else (count / b_scale) * std_val
-
-            total = data_term if w0.legacy_tv else (data_term + _photon_noise_penalty(theta, obs))
-            return total * inv_n
-
-        h_theta = jax.hessian(_simplex_loss)(theta0)
-        damping = jnp.maximum(obs.lambda_z * inv_n, 1e-6)
-        eye = jnp.eye(z0.shape[0], dtype=z0.dtype)
-        return jac_theta.T @ h_theta @ jac_theta + damping * eye
-
-    return _fisher
-
-
-def _compute_diag_logit_scale(
-    w0: HaloWeights,
-    obs: HaloObservation,
-    objective: str,
-) -> jax.Array:
-    """Compute O(M) diagonal log-simplex curvature scaling ``d in [1e-3, 1e3]^M``."""
-    theta0 = _ilr_to_simplex(w0.z_ilr)
-    dtype = theta0.dtype
-    n_scale = jnp.maximum(obs.n_eff, 1.0)
-    f0 = w0._evaluate_lightcurve_raw(obs)
-
-    if not w0.legacy_tv:
-        mean_ratio0 = jnp.dot(theta0, obs.norm_mean_ratio)
-        safe_ratio0 = jnp.where(jnp.abs(mean_ratio0) > 1e-30, mean_ratio0, 1.0)
-        p_eff = obs.norm_pixels / safe_ratio0
+            dt_val = 1.0 / 48.0
     else:
-        safe_scale = jnp.where(jnp.abs(obs.mean_pixel_flux) > 1e-30, obs.mean_pixel_flux, 1.0)
-        mean_f0 = jnp.dot(theta0, obs.mean_pixel_flux)
-        safe_denom0 = jnp.where(jnp.abs(mean_f0) > 1e-30, mean_f0, 1.0)
-        p_eff = (safe_scale[:, None] * obs.norm_pixels) / safe_denom0
+        dt_val = float(dt_days)
 
-    lag = obs.lag
-    if objective == "owl":
-        mask = obs.valid_cadence_mask
-        cnt = jnp.maximum(jnp.sum(mask.astype(dtype)), 1.0)
-        mu_f0 = jnp.sum(jnp.where(mask, f0, 0.0)) / cnt
-        df0 = jnp.where(mask, f0 - mu_f0, 0.0)
-        mu_p = jnp.sum(jnp.where(mask[None, :], p_eff, 0.0), axis=1, keepdims=True) / cnt
-        dp_c = jnp.where(mask[None, :], (p_eff - mu_p) - df0[None, :], 0.0)
-    elif objective == "tv_o2" and 2 * lag < obs.N_pad:
-        mask = obs.valid_diff_mask[: -2 * lag] & obs.valid_diff_mask[lag:-lag]
-        cnt = jnp.maximum(jnp.sum(mask.astype(dtype)), 1.0)
-        df0 = jnp.where(mask, 2.0 * f0[lag:-lag] - f0[2 * lag :] - f0[: -2 * lag], 0.0)
-        dp_raw = 2.0 * p_eff[:, lag:-lag] - p_eff[:, 2 * lag :] - p_eff[:, : -2 * lag]
-        dp_c = jnp.where(mask[None, :], dp_raw - df0[None, :], 0.0)
+    if not np.isfinite(dt_val) or dt_val <= 0.0:
+        raise ValueError(f"dt_days must be finite and > 0, got {dt_val!r}.")
+    if not np.isfinite(window_days) or window_days <= 0.0:
+        raise ValueError(f"window_days must be finite and > 0, got {window_days!r}.")
+
+    hw = max(3, min(15, int(round(0.5 * float(window_days) / dt_val))))
+    nbr_offsets = np.concatenate([np.arange(-hw, 0, dtype=np.intp), np.arange(1, hw + 1, dtype=np.intp)])
+
+    if t_arr is not None:
+        breaks = np.flatnonzero(np.diff(t_arr[fin_idx]) > gap_factor * dt_val) + 1
     else:
-        if lag < obs.N_pad:
-            mask_lag = obs.valid_diff_mask[:-lag]
-            has_lag = jnp.any(mask_lag)
-        else:
-            mask_lag = jnp.zeros(0, dtype=jnp.bool_)
-            has_lag = jnp.asarray(False)
+        breaks = np.flatnonzero(np.diff(fin_idx) > 1) + 1
+    segments = np.split(fin_idx, breaks)
 
-        # Fallback to lag-1 active cadence pairs when obs.lag exceeds segment lengths (e.g. tv_exp).
-        mask_1 = obs.valid_cadence_mask[:-1] & obs.valid_cadence_mask[1:]
-        cnt_1 = jnp.maximum(jnp.sum(mask_1.astype(dtype)), 1.0)
-        df0_1 = jnp.where(mask_1, f0[1:] - f0[:-1], 0.0)
-        dp_c_1 = jnp.where(mask_1[None, :], (p_eff[:, 1:] - p_eff[:, :-1]) - df0_1[None, :], 0.0)
-        mean_dp_sq_1 = jnp.sum(jnp.square(dp_c_1), axis=1) / cnt_1
-        rms_df0_1 = jnp.sqrt(jnp.sum(jnp.square(df0_1)) / cnt_1)
+    baseline = np.full(n_cad, np.nan, dtype=np.float64)
+    for seg in segments:
+        seg_len = seg.size
+        if seg_len == 0:
+            continue
+        ys = y[seg]
+        if seg_len < 5:
+            baseline[seg] = float(np.median(ys))
+            continue
 
-        if lag < obs.N_pad:
-            cnt_l = jnp.maximum(jnp.sum(mask_lag.astype(dtype)), 1.0)
-            df0_l = jnp.where(mask_lag, f0[lag:] - f0[:-lag], 0.0)
-            dp_c_l = jnp.where(
-                mask_lag[None, :], (p_eff[:, lag:] - p_eff[:, :-lag]) - df0_l[None, :], 0.0
-            )
-            mean_dp_sq_l = jnp.sum(jnp.square(dp_c_l), axis=1) / cnt_l
-            rms_df0_l = jnp.sqrt(jnp.sum(jnp.square(df0_l)) / cnt_l)
-            mean_dp_sq = jnp.where(has_lag, mean_dp_sq_l, mean_dp_sq_1)
-            rms_df0 = jnp.where(has_lag, rms_df0_l, rms_df0_1)
-        else:
-            mean_dp_sq = mean_dp_sq_1
-            rms_df0 = rms_df0_1
+        b_seg = np.empty(seg_len, dtype=np.float64)
+        hw_seg = min(hw, (seg_len - 1) // 2)
+        offsets_seg = (
+            nbr_offsets
+            if hw_seg == hw
+            else np.concatenate([np.arange(-hw_seg, 0, dtype=np.intp), np.arange(1, hw_seg + 1, dtype=np.intp)])
+        )
+        centres = np.arange(hw_seg, seg_len - hw_seg, dtype=np.intp)
+        if centres.size > 0:
+            b_seg[centres] = np.median(ys[centres[:, None] + offsets_seg[None, :]], axis=1)
 
-    if objective in ("owl", "tv_o2"):
-        mean_dp_sq = jnp.sum(jnp.square(dp_c), axis=1) / cnt
-        rms_df0 = jnp.sqrt(jnp.sum(jnp.square(df0)) / cnt)
+        # Robust local Theil-Sen linear prediction near segment boundaries.
+        ts = t_arr[seg] if t_arr is not None else np.arange(seg_len, dtype=np.float64)
+        edge_win = min(seg_len, max(7, 2 * hw_seg + 1))
+        edge_indices = list(range(hw_seg)) + list(range(seg_len - hw_seg, seg_len))
+        for j in edge_indices:
+            lo = max(0, min(j - edge_win // 2, seg_len - edge_win))
+            hi = lo + edge_win
+            others = np.array([k for k in range(lo, hi) if k != j], dtype=np.intp)
+            to = ts[others]
+            yo = ys[others]
+            dt_mat = to[:, None] - to[None, :]
+            dy_mat = yo[:, None] - yo[None, :]
+            upper = np.triu(np.abs(dt_mat) > 0.0, k=1)
+            slope = float(np.median(dy_mat[upper] / dt_mat[upper])) if np.any(upper) else 0.0
+            b_seg[j] = float(np.median(yo + slope * (ts[j] - to)))
 
-    rms_safe = jnp.maximum(rms_df0, 1e-12)
-    if w0.legacy_tv:
-        if objective == "l2v":
-            curv_data = jnp.square(theta0) * mean_dp_sq
-        elif objective == "l3v":
-            curv_data = jnp.square(theta0) * mean_dp_sq * rms_safe
-        else:
-            curv_data = jnp.square(theta0) * mean_dp_sq / rms_safe
-        curv_phot = jnp.zeros_like(theta0)
-        curv_z = jnp.asarray(1e-6, dtype=dtype)
+        baseline[seg] = b_seg
+
+    inliers = np.zeros(n_cad, dtype=bool)
+    fin_all = fin_mask & np.isfinite(baseline)
+    if np.any(fin_all):
+        clipped = sigma_clip(
+            y[fin_all] - baseline[fin_all],
+            sigma_lower=sigma_lower,
+            sigma_upper=sigma_upper,
+            stdfunc=mad_std,
+        )
+        inliers[fin_all] = ~np.ma.getmaskarray(clipped)
+    return inliers
+
+
+def _estimate_initial_scale(
+    f0: np.ndarray,
+    step_mask: np.ndarray,
+    *,
+    obj_name: str,
+    lag: int,
+) -> float:
+    """Compute characteristic scale ``b_hat = max(median(|df_init|), 1e-30)`` with no floor bias."""
+    if obj_name == "owl":
+        val = float(np.std(f0))
+    elif obj_name == "tv_o2" and 2 * lag < f0.shape[0]:
+        mask2 = step_mask[:-lag] & step_mask[lag:]
+        diffs2 = np.abs(2.0 * f0[lag:-lag] - f0[2 * lag :] - f0[: -2 * lag])
+        sel = diffs2[mask2] if np.any(mask2) else diffs2
+        val = float(np.median(sel)) if sel.size > 0 else 0.0
+    elif lag < f0.shape[0]:
+        diffs = np.abs(f0[lag:] - f0[:-lag])
+        sel = diffs[step_mask] if np.any(step_mask) else diffs
+        val = float(np.median(sel)) if sel.size > 0 else 0.0
     else:
-        b_scale = jnp.maximum(obs.b_hat, 1e-12)
-        if objective == "l2v":
-            curv_data = jnp.square(theta0) * mean_dp_sq / jnp.square(b_scale)
-        elif objective == "l3v":
-            curv_data = jnp.square(theta0) * mean_dp_sq * rms_safe / (b_scale * jnp.square(b_scale))
-        else:
-            curv_data = jnp.square(theta0) * mean_dp_sq / (b_scale * rms_safe)
-        curv_phot = (obs.lambda_phot / n_scale) * jnp.square(theta0) * obs.mean_frac_var
-        curv_z = jnp.maximum(obs.lambda_z / n_scale, 1e-6)
+        val = 0.0
+    return max(val, 1e-30) if np.isfinite(val) else 1e-30
 
-    d_raw = 1.0 / jnp.sqrt(jnp.maximum(curv_data + curv_phot + curv_z, 1e-30))
-    d_med = jnp.maximum(jnp.median(d_raw), 1e-30)
-    return jnp.clip(d_raw / d_med, 1e-3, 1e3)
+
+def _compute_diag_scale(
+    w0: np.ndarray,
+    pixels: np.ndarray,
+    step_mask: np.ndarray,
+    lag: int,
+) -> np.ndarray:
+    """Compute O(M) diagonal pixel-scale preconditioning weights on simplex logits."""
+    raw0 = w0 @ pixels
+    mean0 = float(np.mean(raw0))
+    safe0 = mean0 if abs(mean0) > 1e-30 else 1.0
+    f0 = raw0 / safe0
+    p_eff = pixels / safe0
+
+    if lag < pixels.shape[1] and np.any(step_mask):
+        df0 = f0[lag:] - f0[:-lag]
+        dp = (p_eff[:, lag:] - p_eff[:, :-lag]) - df0[None, :]
+        dp_valid = dp[:, step_mask]
+    else:
+        df0 = f0[1:] - f0[:-1]
+        dp_valid = (p_eff[:, 1:] - p_eff[:, :-1]) - df0[None, :]
+
+    mean_dp_sq = np.mean(np.square(dp_valid), axis=1)
+    curv = np.square(w0) * mean_dp_sq
+    med_curv = max(float(np.median(curv)), 1e-30)
+    d_raw = 1.0 / np.sqrt(np.maximum(curv, 1e-6 * med_curv))
+    d_med = max(float(np.median(d_raw)), 1e-30)
+    return np.clip(d_raw / d_med, 0.1, 10.0)
 
 
 def _run_optax_lbfgs_loop(
-    val_fn,
-    weights_from_xi,
+    val_fn: Callable[[jax.Array], jax.Array],
+    weights_from_xi: Callable[[jax.Array], jax.Array],
     xi0: jax.Array,
     max_steps: int,
     rtol: float,
     atol: float,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Run JIT-compatible ``optax.lbfgs`` + zoom linesearch in ``jax.lax.while_loop``."""
+    """Run ``optax.lbfgs`` + zoom linesearch inside ``jax.lax.while_loop``.
+
+    Scales the gradient convergence threshold strictly to ``max(|v0|, ||g0||_inf)``
+    (never floored at ``1.0``) so small-amplitude light curves never trigger
+    step-0 false convergence.
+    """
     opt = optax.lbfgs(
         memory_size=20,
         linesearch=optax.scale_by_zoom_linesearch(max_linesearch_steps=20, verbose=False),
@@ -382,11 +258,13 @@ def _run_optax_lbfgs_loop(
     vg_fn = jax.value_and_grad(val_fn)
     v0, g0 = vg_fn(xi0)
     opt_state0 = opt.init(xi0)
-    w0_phys = weights_from_xi(xi0)
+    w0 = weights_from_xi(xi0)
 
-    f_scale0 = jnp.maximum(jnp.abs(v0), 1.0)
+    g0_inf = jnp.max(jnp.abs(g0))
+    scale0 = jnp.maximum(jnp.abs(v0), g0_inf)
+    grad_tol = atol + rtol * scale0
     finite0 = jnp.isfinite(v0) & jnp.all(jnp.isfinite(g0))
-    conv0 = finite0 & (jnp.max(jnp.abs(g0)) <= atol + rtol * f_scale0)
+    conv0 = finite0 & (g0_inf <= grad_tol)
     failed0 = ~finite0
 
     init_carry = (
@@ -394,7 +272,7 @@ def _run_optax_lbfgs_loop(
         opt_state0,
         v0,
         g0,
-        w0_phys,
+        w0,
         xi0,
         v0,
         jnp.asarray(0, dtype=jnp.int32),
@@ -439,18 +317,24 @@ def _run_optax_lbfgs_loop(
         next_best_v = jnp.where(improved, v_next, best_v)
 
         w_next = weights_from_xi(xi_next)
-        f_scale = jnp.maximum(jnp.abs(v_next), 1.0)
-        grad_ok = finite_step & (jnp.max(jnp.abs(g_next)) <= atol + rtol * f_scale)
-        dw_max = jnp.max(jnp.abs(w_next - w_curr))
-        dv_rel = jnp.abs(v_curr - v_next) / f_scale
+        g_inf = jnp.max(jnp.abs(g_next))
+        v_scale = jnp.maximum(jnp.maximum(jnp.abs(v_curr), 1e-3 * jnp.abs(v0)), 1e-30)
+        grad_ok = (
+            finite_step
+            & (v_next <= next_best_v + 1e-12 * v_scale)
+            & (g_inf <= grad_tol)
+        )
+
+        dv_rel = jnp.abs(v_curr - v_next) / v_scale
+        dw_l1 = jnp.sum(jnp.abs(w_next - w_curr))
         step_small = (
             finite_step
-            & (v_next <= v_curr + 1e-12 * f_scale)
-            & (dw_max <= atol + rtol)
+            & (v_next <= v_curr + 1e-12 * v_scale)
             & (dv_rel <= rtol)
+            & (dw_l1 <= 1e-4)
         )
         consec_next = jnp.where(step_small, consec + 1, jnp.zeros_like(consec))
-        conv_next = grad_ok | (consec_next >= 2)
+        conv_next = grad_ok | ((step >= 5) & (consec_next >= 3))
         failed_next = ~finite_step
         return (
             xi_next,
@@ -474,359 +358,131 @@ def _run_optax_lbfgs_loop(
     return final_xi, v0, final_v, converged & jnp.isfinite(final_v), n_steps
 
 
-@functools.lru_cache(maxsize=32)
-def _get_lbfgs_proj_runner(
-    objective: str,
-    epsilon: float,
-    tau: float | None,
-    rtol: float,
-    atol: float,
-):
-    """Build and cache a Tier-1a Fisher-preconditioned ``optax.lbfgs`` zoom-LS runner."""
+def _validate_inputs(
+    pixels: np.ndarray | jax.Array,
+    times: np.ndarray | jax.Array | None,
+    lag: int,
+    obj_name: str,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    if isinstance(lag, bool) or int(lag) < 1:
+        raise ValueError(f"lag must be an integer >= 1, got {lag!r}.")
+    lag_int = int(lag)
 
-    @eqx.filter_jit
-    def _run(
-        w0: HaloWeights,
-        obs: HaloObservation,
-        proj: jax.Array,
-        max_steps: int,
-    ) -> tuple[HaloWeights, jax.Array, jax.Array, jax.Array, jax.Array]:
-        z0 = w0.z_ilr
-        legacy_tv = w0.legacy_tv
-        n_scale = jnp.maximum(obs.n_eff, 1.0)
-
-        def _val_fn(xi: jax.Array) -> jax.Array:
-            w = HaloWeights(z_ilr=z0 + jnp.dot(proj, xi), legacy_tv=legacy_tv)
-            return _halo_objective(w, obs, objective=objective, epsilon=epsilon, tau=tau) / n_scale
-
-        def _w_phys(xi: jax.Array) -> jax.Array:
-            w = HaloWeights(z_ilr=z0 + jnp.dot(proj, xi), legacy_tv=legacy_tv)
-            return w._physical_weights_raw(obs.mean_pixel_flux)
-
-        xi0 = jnp.zeros_like(z0)
-        best_xi, v0, best_v, conv, n_steps = _run_optax_lbfgs_loop(
-            _val_fn, _w_phys, xi0, max_steps, rtol, atol
+    pix_np = np.asarray(pixels, dtype=np.float64)
+    if pix_np.ndim != 2 or pix_np.shape[0] < 1 or pix_np.shape[1] < 2:
+        raise ValueError(
+            f"pixels must be 2D (M, N) with M >= 1 and N >= 2, got shape {pix_np.shape}."
         )
-        z_best = z0 + jnp.dot(proj, best_xi)
-        return (
-            HaloWeights(z_ilr=z_best, legacy_tv=legacy_tv),
-            v0 * n_scale,
-            best_v * n_scale,
-            conv,
-            n_steps,
+    if not np.all(np.isfinite(pix_np)):
+        raise ValueError("pixels contains non-finite values.")
+    n_cad = pix_np.shape[1]
+
+    min_req = 2 * lag_int + 1 if obj_name == "tv_o2" else (2 if obj_name == "owl" else lag_int + 1)
+    if n_cad < min_req:
+        raise ValueError(
+            f"Objective {obj_name!r} with lag={lag_int} requires at least {min_req} cadences, "
+            f"got {n_cad}."
         )
 
-    return _run
-
-
-@functools.lru_cache(maxsize=32)
-def _get_lbfgs_diag_runner(
-    objective: str,
-    epsilon: float,
-    tau: float | None,
-    rtol: float,
-    atol: float,
-):
-    """Build and cache a Tier-1b O(M) diagonally scaled ``optax.lbfgs`` zoom-LS runner."""
-
-    @eqx.filter_jit
-    def _run(
-        w0: HaloWeights,
-        obs: HaloObservation,
-        max_steps: int,
-    ) -> tuple[HaloWeights, jax.Array, jax.Array, jax.Array, jax.Array]:
-        z0 = w0.z_ilr
-        legacy_tv = w0.legacy_tv
-        n_scale = jnp.maximum(obs.n_eff, 1.0)
-        u0 = _ilr_to_logits(z0)
-        d_scale = _compute_diag_logit_scale(w0, obs, objective)
-
-        def _z_from_xi(xi: jax.Array) -> jax.Array:
-            u = u0 + d_scale * _ilr_to_logits(xi)
-            return _logits_to_ilr(u)
-
-        def _val_fn(xi: jax.Array) -> jax.Array:
-            w = HaloWeights(z_ilr=_z_from_xi(xi), legacy_tv=legacy_tv)
-            return _halo_objective(w, obs, objective=objective, epsilon=epsilon, tau=tau) / n_scale
-
-        def _w_phys(xi: jax.Array) -> jax.Array:
-            w = HaloWeights(z_ilr=_z_from_xi(xi), legacy_tv=legacy_tv)
-            return w._physical_weights_raw(obs.mean_pixel_flux)
-
-        xi0 = jnp.zeros_like(z0)
-        best_xi, v0, best_v, conv, n_steps = _run_optax_lbfgs_loop(
-            _val_fn, _w_phys, xi0, max_steps, rtol, atol
-        )
-        z_best = _z_from_xi(best_xi)
-        return (
-            HaloWeights(z_ilr=z_best, legacy_tv=legacy_tv),
-            v0 * n_scale,
-            best_v * n_scale,
-            conv,
-            n_steps,
-        )
-
-    return _run
-
-
-@functools.lru_cache(maxsize=16)
-def _get_zodiax_runner(
-    objective: str,
-    epsilon: float,
-    tau: float | None,
-    learning_rate: float,
-    max_steps: int,
-    rtol: float = 5e-5,
-    atol: float = 5e-5,
-):
-    """Build and cache a Tier-2 ``zodiax.optimisation`` + ``optax.adam`` runner."""
-
-    def _loss_z_norm(z_ilr: jax.Array, legacy_tv: bool, obs: HaloObservation) -> jax.Array:
-        w = HaloWeights(z_ilr=z_ilr, legacy_tv=legacy_tv)
-        n_scale = jnp.maximum(obs.n_eff, 1.0)
-        return _halo_objective(w, obs, objective=objective, epsilon=epsilon, tau=tau) / n_scale
-
-    @eqx.filter_jit
-    def _run(
-        w0: HaloWeights,
-        obs: HaloObservation,
-        proj: jax.Array,
-    ) -> tuple[HaloWeights, jax.Array, jax.Array, jax.Array, jax.Array]:
-        z0 = w0.z_ilr
-        legacy_tv = w0.legacy_tv
-        n_scale = jnp.maximum(obs.n_eff, 1.0)
-        loss0_norm = _loss_z_norm(z0, legacy_tv, obs)
-
-        params0 = {"xi": jnp.zeros_like(z0)}
-        schedule = optax.cosine_decay_schedule(
-            init_value=learning_rate,
-            decay_steps=max(max_steps, 1),
-            alpha=0.005,
-        )
-        optim, opt_state0 = zdx.optimisation.map_optimisers(
-            params0,
-            {"xi": optax.adam(schedule)},
-        )
-
-        def _xi_loss(p_dict: dict[str, jax.Array]) -> jax.Array:
-            z_curr = z0 + jnp.dot(proj, p_dict["xi"])
-            return _loss_z_norm(z_curr, legacy_tv, obs)
-
-        vg_fn = jax.value_and_grad(_xi_loss)
-
-        def _step(carry, _):
-            p_curr, st_curr, best_xi, best_val = carry
-            val, grads = vg_fn(p_curr)
-            grads = zdx.optimisation.zero_nan_check(grads)
-            updates, st_next = optim.update(grads, st_curr, p_curr)
-            p_next = optax.apply_updates(p_curr, updates)
-            improved = jnp.isfinite(val) & (val < best_val)
-            next_best_xi = jnp.where(improved, p_curr["xi"], best_xi)
-            next_best_val = jnp.where(improved, val, best_val)
-            return (p_next, st_next, next_best_xi, next_best_val), None
-
-        (p_end, _, best_xi, best_val), _ = jax.lax.scan(
-            _step,
-            (params0, opt_state0, params0["xi"], loss0_norm),
-            None,
-            length=max_steps,
-        )
-        end_val = _xi_loss(p_end)
-        use_end = jnp.isfinite(end_val) & (end_val < best_val)
-        final_xi = jnp.where(use_end, p_end["xi"], best_xi)
-        final_val_norm, final_grad = vg_fn({"xi": final_xi})
-        grad_norm = jnp.max(jnp.abs(final_grad["xi"]))
-        tol_thresh = atol + rtol * jnp.maximum(jnp.abs(final_val_norm), 1.0)
-        z_best = z0 + jnp.dot(proj, final_xi)
-        converged = (
-            jnp.isfinite(final_val_norm) & jnp.isfinite(grad_norm) & (grad_norm <= tol_thresh)
-        )
-        n_steps = jnp.asarray(max_steps, dtype=jnp.int64)
-        return (
-            HaloWeights(z_ilr=z_best, legacy_tv=legacy_tv),
-            loss0_norm * n_scale,
-            final_val_norm * n_scale,
-            converged,
-            n_steps,
-        )
-
-    return _run
-
-
-def cadence_scaled_savgol_window(dt_days: float, window_days: float = 1.0) -> int:
-    """Compute an odd Savitzky-Golay window ``max(5, int(round(window_days / dt_days)) | 1)``."""
-    if not np.isfinite(dt_days) or dt_days <= 0.0:
-        raise ValueError(f"dt_days must be finite and > 0, got {dt_days!r}.")
-    if not np.isfinite(window_days) or window_days <= 0.0:
-        raise ValueError(f"window_days must be finite and > 0, got {window_days!r}.")
-    return max(5, int(round(window_days / dt_days)) | 1)
-
-
-def cadence_scaled_sigclip_mask(
-    flux: np.ndarray,
-    times: np.ndarray | None = None,
-    *,
-    dt_days: float | None = None,
-    window_days: float = 1.0,
-    sigma_lower: float = 10.0,
-    sigma_upper: float = 3.0,
-    gap_factor: float = 3.0,
-) -> np.ndarray:
-    """Return a boolean inlier mask using a gap-aware narrow local spike detector.
-
-    Filters finite ``(flux, times)`` cadences before segmenting across gaps so
-    ``NaN``-represented downlink blocks are never interpolated across, then predicts
-    each cadence from a fixed narrow 5-point (``hw = 2``) leave-one-out local median
-    (with robust 7-point Theil-Sen linear prediction at segment boundaries). This
-    detects single-cadence cosmic-ray and thruster spikes while preserving
-    astrophysical eclipses, transits, and multi-periodic pulsations.
-
-    Notes
-    -----
-    ``window_days`` is retained for API compatibility and input validation (checked
-    via :func:`cadence_scaled_savgol_window`), while the local spike baseline uses
-    the fixed narrow 5-point window rather than a multi-hour polynomial baseline.
-    """
-    y = np.asarray(flux, dtype=np.float64)
-    n_cad = y.shape[0]
-    if times is not None:
-        t_arr: np.ndarray | None = np.asarray(times, dtype=np.float64)
-        fin_mask = np.isfinite(y) & np.isfinite(t_arr)
+    if times is None:
+        t_np = np.arange(n_cad, dtype=np.float64) * (1.0 / 48.0)
     else:
-        t_arr = None
-        fin_mask = np.isfinite(y)
+        t_np = np.asarray(times, dtype=np.float64)
+        if t_np.shape != (n_cad,):
+            raise ValueError(f"times shape {t_np.shape} does not match ({n_cad},).")
+        if not np.all(np.isfinite(t_np)):
+            raise ValueError("times contains non-finite timestamps.")
 
-    if n_cad < 3:
-        return fin_mask.copy()
-
-    fin_idx = np.flatnonzero(fin_mask)
-    if fin_idx.size == 0:
-        return np.zeros(n_cad, dtype=bool)
-
-    if dt_days is None:
-        if t_arr is not None:
-            diffs = np.diff(t_arr[fin_idx])
-            pos_diffs = diffs[diffs > 0.0]
-            dt_val = float(np.median(pos_diffs)) if pos_diffs.size > 0 else (1.0 / 48.0)
-        else:
-            dt_val = 1.0 / 48.0
-    else:
-        dt_val = float(dt_days)
-
-    cadence_scaled_savgol_window(dt_val, window_days=window_days)
-
-    if t_arr is not None:
-        breaks = np.flatnonzero(np.diff(t_arr[fin_idx]) > gap_factor * dt_val) + 1
-    else:
-        breaks = np.flatnonzero(np.diff(fin_idx) > 1) + 1
-    segments = np.split(fin_idx, breaks)
-
-    hw = 2
-    nbr_offsets = np.array([-2, -1, 1, 2], dtype=np.intp)
-    baseline = np.full(n_cad, np.nan, dtype=np.float64)
-
-    for seg in segments:
-        seg_len = seg.size
-        if seg_len == 0:
-            continue
-        ys = y[seg]
-        if seg_len < 5:
-            baseline[seg] = float(np.median(ys))
-            continue
-        if seg_len < 7:
-            b_seg = np.empty(seg_len, dtype=np.float64)
-            for j in range(seg_len):
-                others = np.delete(ys, j)
-                b_seg[j] = float(np.median(others))
-            baseline[seg] = b_seg
-            continue
-
-        b_seg = np.empty(seg_len, dtype=np.float64)
-        centres = np.arange(hw, seg_len - hw, dtype=np.intp)
-        nbr_vals = ys[centres[:, None] + nbr_offsets[None, :]]
-        b_seg[centres] = np.median(nbr_vals, axis=1)
-
-        ts = t_arr[seg] if t_arr is not None else np.arange(seg_len, dtype=np.float64)
-        edge_win = min(seg_len, 7)
-        for j in (0, 1, seg_len - 2, seg_len - 1):
-            lo = max(0, min(j - edge_win // 2, seg_len - edge_win))
-            hi = lo + edge_win
-            others = [k for k in range(lo, hi) if k != j]
-            to = ts[others]
-            yo = ys[others]
-            slopes = []
-            for a in range(len(others)):
-                for b in range(a + 1, len(others)):
-                    dt_ab = to[b] - to[a]
-                    if abs(dt_ab) > 0.0:
-                        slopes.append((yo[b] - yo[a]) / dt_ab)
-            slope = float(np.median(slopes)) if slopes else 0.0
-            b_seg[j] = float(np.median(yo + slope * (ts[j] - to)))
-
-        baseline[seg] = b_seg
-
-    inliers = np.zeros(n_cad, dtype=bool)
-    fin_all = fin_mask & np.isfinite(baseline)
-    if np.any(fin_all):
-        clipped = sigma_clip(
-            y[fin_all] - baseline[fin_all],
-            sigma_lower=sigma_lower,
-            sigma_upper=sigma_upper,
-            stdfunc=mad_std,
-        )
-        inliers[fin_all] = ~np.ma.getmaskarray(clipped)
-    return inliers
+    diffs = np.diff(t_np)
+    if np.any(diffs <= 0.0):
+        raise ValueError("times must be strictly increasing.")
+    dt_nom = float(np.median(diffs))
+    return pix_np, t_np, dt_nom
 
 
-@in_float64
 def _solve_single_pass(
-    w0: HaloWeights,
-    obs: HaloObservation,
+    pix_np: np.ndarray,
+    t_np: np.ndarray,
+    dt_nom: float,
     *,
-    objective: str,
-    epsilon: float,
+    w_init: np.ndarray | None,
+    obj_name: str,
+    obj_fn: Callable[..., jax.Array],
+    lag: int,
     tau: float | None,
-    solver: str,
+    epsilon: float,
     maxiter: int,
     rtol: float,
     atol: float,
-    learning_rate: float,
     precondition: bool,
-) -> tuple[HaloWeights, float, float, bool, int]:
-    """Run one optimization pass on ``obs`` starting from ``w0``."""
-    m_minus_1 = w0.z_ilr.shape[0]
-    if m_minus_1 == 0:
-        loss_val = float(_halo_objective(w0, obs, objective=objective, epsilon=epsilon, tau=tau))
-        return w0, loss_val, loss_val, True, 0
+    gap_tol: float,
+) -> tuple[np.ndarray, float, float, bool, int]:
+    """Run one ``optax.lbfgs`` pass in locally scoped float64 precision."""
+    m_pix = pix_np.shape[0]
+    step_mask_np = compute_step_mask(t_np, lag=lag, dt_nom=dt_nom, gap_tol=gap_tol)
+    u0 = initial_logits(np.mean(pix_np, axis=1), w_init=w_init)
+    w0_np = np.asarray(logits_to_weights(u0), dtype=np.float64)
 
-    if solver == "lbfgs":
-        if precondition and m_minus_1 <= 256:
-            fisher_fn = _get_fisher_fn(objective, tau, epsilon)
-            f_mat = fisher_fn(w0, obs)
-            proj = safe_eigen_projection(fmat=f_mat, rcond=1e-8)
-            runner_proj = _get_lbfgs_proj_runner(objective, epsilon, tau, rtol, atol)
-            w_best, loss0, loss_end, conv, n_steps = runner_proj(w0, obs, proj, maxiter)
-            return w_best, float(loss0), float(loss_end), bool(conv), int(n_steps)
+    raw0 = w0_np @ pix_np
+    mean0 = float(np.mean(raw0))
+    f0_np = raw0 / (mean0 if abs(mean0) > 1e-30 else 1.0)
+    b_hat = _estimate_initial_scale(f0_np, step_mask_np, obj_name=obj_name, lag=lag)
+    eps_eff = max(float(epsilon) * b_hat, float(np.finfo(np.float64).tiny))
 
-        runner_diag = _get_lbfgs_diag_runner(objective, epsilon, tau, rtol, atol)
-        w_best, loss0, loss_end, conv, n_steps = runner_diag(w0, obs, maxiter)
-        return w_best, float(loss0), float(loss_end), bool(conv), int(n_steps)
+    pix_j = jnp.asarray(pix_np, dtype=jnp.float64)
+    t_j = jnp.asarray(t_np, dtype=jnp.float64)
+    mask_j = jnp.asarray(step_mask_np, dtype=jnp.bool_)
+    dt_j = jnp.asarray(dt_nom, dtype=jnp.float64)
+    eps_j = jnp.asarray(eps_eff, dtype=jnp.float64)
 
-    if solver in ("zodiax", "adam"):
-        if precondition and m_minus_1 <= 256:
-            fisher_fn = _get_fisher_fn(objective, tau, epsilon)
-            f_mat = fisher_fn(w0, obs)
-            proj = safe_eigen_projection(fmat=f_mat, rcond=1e-4)
-            eff_lr = float(learning_rate) / math.sqrt(max(m_minus_1, 1))
-        else:
-            proj = jnp.eye(m_minus_1, dtype=jnp.float64)
-            eff_lr = float(learning_rate)
+    def _eval_weights(w: jax.Array) -> jax.Array:
+        flux = normalized_flux(w, pix_j)
+        return obj_fn(
+            flux=flux,
+            step_mask=mask_j,
+            weights=w,
+            pixels=pix_j,
+            times=t_j,
+            dt_nom=dt_j,
+            lag=lag,
+            eps=eps_j,
+            tau=tau,
+            gap_tol=gap_tol,
+        )
 
-        runner_zdx = _get_zodiax_runner(objective, epsilon, tau, eff_lr, maxiter, rtol, atol)
-        w_best, loss0, loss_end, conv, n_steps = runner_zdx(w0, obs, proj)
-        return w_best, float(loss0), float(loss_end), bool(conv), int(n_steps)
+    if m_pix == 1:
+        w_one = jnp.ones(1, dtype=jnp.float64)
+        loss_val = float(_eval_weights(w_one))
+        return np.ones(1, dtype=np.float64), loss_val, loss_val, True, 0
 
-    raise ValueError(f"Unknown solver {solver!r}; expected 'lbfgs', 'zodiax', or 'adam'.")
+    d_scale = (
+        jnp.asarray(_compute_diag_scale(w0_np, pix_np, step_mask_np, lag), dtype=jnp.float64)
+        if precondition
+        else jnp.ones(m_pix, dtype=jnp.float64)
+    )
+
+    @jax.jit
+    def _run_jit(u_start: jax.Array, scale: jax.Array):
+        def _w_from_xi(xi: jax.Array) -> jax.Array:
+            return logits_to_weights(u_start + scale * xi)
+
+        def _val_fn(xi: jax.Array) -> jax.Array:
+            return _eval_weights(_w_from_xi(xi))
+
+        xi0 = jnp.zeros_like(u_start)
+        best_xi, v0, best_v, conv, n_steps = _run_optax_lbfgs_loop(
+            _val_fn, _w_from_xi, xi0, maxiter, rtol, atol
+        )
+        return _w_from_xi(best_xi), v0, best_v, conv, n_steps
+
+    w_opt, v0, v_final, conv, n_steps = _run_jit(u0, d_scale)
+    return (
+        np.asarray(w_opt, dtype=np.float64),
+        float(v0),
+        float(v_final),
+        bool(conv),
+        int(n_steps),
+    )
 
 
 def _partition_orbit_blocks(
@@ -835,7 +491,7 @@ def _partition_orbit_blocks(
     k_eff: int,
     min_req: int,
 ) -> list[np.ndarray]:
-    """Split active cadence indices into ``k_eff`` blocks respecting major orbit/downlink gaps."""
+    """Split active cadence indices into ``k_eff`` blocks respecting major orbit gaps."""
     n_valid = times_valid.shape[0]
     gap_thresh = max(10.0 * dt_nom, 0.25)
     breaks = np.flatnonzero(np.diff(times_valid) > gap_thresh) + 1
@@ -852,15 +508,14 @@ def _partition_orbit_blocks(
             extra = np.floor(raw_extra).astype(int)
             leftover = rem - int(np.sum(extra))
             if leftover > 0:
-                order = np.argsort(-(raw_extra - extra))
-                extra[order[:leftover]] += 1
+                extra[np.argsort(-(raw_extra - extra))[:leftover]] += 1
             counts += extra
-        blocks: list[np.ndarray] = []
-        for seg, cnt in zip(segs, counts, strict=True):
-            c_use = min(int(cnt), seg.size)
-            for sub_blk in np.array_split(seg, c_use):
-                if sub_blk.size > 0:
-                    blocks.append(sub_blk)
+        blocks = [
+            sub_blk
+            for seg, cnt in zip(segs, counts, strict=True)
+            for sub_blk in np.array_split(seg, min(int(cnt), seg.size))
+            if sub_blk.size > 0
+        ]
         if len(blocks) == k_eff and all((n_valid - b.size) >= min_req for b in blocks):
             return blocks
 
@@ -869,38 +524,35 @@ def _partition_orbit_blocks(
 
 @in_float64
 def orbit_block_jackknife(
-    obs: HaloObservation,
+    pixels: np.ndarray | jax.Array,
+    times: np.ndarray | jax.Array | None,
     w_hat: np.ndarray | jax.Array,
     *,
     n_blocks: int = 4,
-    legacy_tv: bool = False,
-    objective: str = "tv",
-    epsilon: float = 1e-5,
+    objective: str | Callable[..., Any] = "tv",
+    lag: int = 1,
     tau: float | None = None,
-    solver: str = "lbfgs",
+    epsilon: float = 1e-2,
     maxiter: int = 500,
     rtol: float = 1e-7,
-    atol: float = 1e-7,
-    learning_rate: float = 0.2,
+    atol: float = 1e-12,
     precondition: bool = True,
+    gap_tol: float = 0.25,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Estimate physical weight uncertainties ``sigma_w`` via ``K``-block orbit jackknife.
+    """Estimate physical weight uncertainties via delete-``m_k`` orbit block jackknife.
 
-    Splits active cadences along major orbit/downlink gaps when present, leaves out
-    each block ``B_k`` in turn while retaining ``obs.N_pad`` unchanged for zero XLA
-    recompilation, and combines leave-out folds using Busing-Meijer-van der Leeden
-    delete-``m_k`` constraint weighting. Returns ``(weight_std, jackknife_weights)``
-    where ``jackknife_weights`` has shape ``(k_eff, M)`` whenever ``k_eff >= 2`` folds
-    succeed (or ``(n_blocks, M)`` of ``NaN`` when fewer than 2 valid folds exist).
+    Uses Busing-Meijer-van der Leeden delete-``m_k`` variance weighting on
+    warm-started leave-one-block-out fits respecting major orbit/downlink gaps.
     """
     if isinstance(n_blocks, bool) or int(n_blocks) < 2:
         raise ValueError(f"n_blocks must be an integer >= 2, got {n_blocks!r}.")
     k_req = int(n_blocks)
 
+    obj_name, obj_fn = resolve_objective(objective)
+    pix_np, t_np, dt_nom = _validate_inputs(pixels, times, lag, obj_name)
     w_full = np.asarray(w_hat, dtype=np.float64)
-    m_pix = w_full.shape[0]
-    n_valid = int(obs.n_valid)
-    min_req = 2 * obs.lag + 1 if objective == "tv_o2" else (2 if objective == "owl" else obs.lag + 1)
+    m_pix, n_valid = pix_np.shape
+    min_req = 2 * lag + 1 if obj_name == "tv_o2" else (2 if obj_name == "owl" else lag + 1)
 
     if m_pix <= 1:
         return np.zeros(m_pix, dtype=np.float64), np.tile(w_full, (k_req, 1))
@@ -911,9 +563,8 @@ def orbit_block_jackknife(
         )
 
     k_eff = min(k_req, n_valid // 2)
-    t_valid = np.asarray(obs.times_padded[:n_valid], dtype=np.float64)
-    blocks = _partition_orbit_blocks(t_valid, float(obs.dt_nom), k_eff, min_req)
-    n_eff_full = max(obs.effective_constraint_count(objective=objective, tau=tau), 1)
+    blocks = _partition_orbit_blocks(t_np, dt_nom, k_eff, min_req)
+    full_steps = max(int(np.sum(compute_step_mask(t_np, lag=lag, dt_nom=dt_nom, gap_tol=gap_tol))), 1)
 
     jk_weights: list[np.ndarray] = []
     dropped_counts: list[float] = []
@@ -923,38 +574,28 @@ def orbit_block_jackknife(
         keep[blk] = False
         if int(np.sum(keep)) < min_req:
             continue
-        obs_k = obs.with_cadence_subset(
-            keep,
-            legacy_tv=legacy_tv,
-            preserve_regularization=True,
-            objective=objective,
+        t_k = t_np[keep]
+        w_k, _, _, conv_k, _ = _solve_single_pass(
+            pix_np[:, keep],
+            t_k,
+            dt_nom,
+            w_init=w_full,
+            obj_name=obj_name,
+            obj_fn=obj_fn,
+            lag=lag,
             tau=tau,
-        )
-        w0_k = HaloWeights.from_physical_weights(
-            w_full,
-            obs_k.mean_pixel_flux,
-            legacy_tv=legacy_tv,
-        )
-        w_tree_k, _, _, conv_k, _ = _solve_single_pass(
-            w0_k,
-            obs_k,
-            objective=objective,
             epsilon=epsilon,
-            tau=tau,
-            solver=solver,
             maxiter=maxiter,
             rtol=rtol,
             atol=atol,
-            learning_rate=learning_rate,
             precondition=precondition,
+            gap_tol=gap_tol,
         )
-        if solver == "lbfgs" and not conv_k:
+        if not conv_k:
             n_unconverged += 1
-        jk_weights.append(
-            np.asarray(w_tree_k._physical_weights_raw(obs_k.mean_pixel_flux), dtype=np.float64)
-        )
-        n_eff_k = obs_k.effective_constraint_count(objective=objective, tau=tau)
-        dropped_counts.append(float(max(n_eff_full - n_eff_k, 1)))
+        jk_weights.append(w_k)
+        steps_k = int(np.sum(compute_step_mask(t_k, lag=lag, dt_nom=dt_nom, gap_tol=gap_tol)))
+        dropped_counts.append(float(max(full_steps - steps_k, 1)))
 
     if len(jk_weights) < 2:
         return (
@@ -986,252 +627,185 @@ def orbit_block_jackknife(
     return np.sqrt(np.maximum(var_jk, 0.0)), w_jk
 
 
-def _default_initial_weights(obs: HaloObservation, *, legacy_tv: bool) -> HaloWeights:
-    """Build default starting weights (gain-covariant inverse-variance start when heteroscedastic)."""
-    if legacy_tv:
-        return HaloWeights.from_uniform(obs.mean_pixel_flux, legacy_tv=True)
-    fv = np.asarray(obs.mean_frac_var, dtype=np.float64)
-    p_bar = np.asarray(obs.mean_pixel_flux, dtype=np.float64)
-    safe_fv = _safe_minvar_frac_var(p_bar, fv)
-    if safe_fv.size > 1 and np.all(np.isfinite(safe_fv)) and np.all(safe_fv > 0.0) and np.all(p_bar > 0.0):
-        inv_fv = 1.0 / safe_fv
-        th_mv = inv_fv / np.sum(inv_fv)
-        w_mv = th_mv / p_bar
-        w_mv_sum = float(np.sum(w_mv))
-        if np.isfinite(w_mv_sum) and w_mv_sum > 0.0:
-            return HaloWeights.from_physical_weights(
-                w_mv / w_mv_sum,
-                obs.mean_pixel_flux,
-                legacy_tv=False,
-            )
-    return HaloWeights.from_uniform(obs.mean_pixel_flux, legacy_tv=False)
-
-
 @in_float64
 def optimise_halo(
     pixels: np.ndarray | jax.Array,
     times: np.ndarray | jax.Array | None = None,
     *,
-    pixel_var: np.ndarray | jax.Array | None = None,
     w_init: np.ndarray | jax.Array | None = None,
-    objective: str = "tv",
-    lag: int = 1,
+    config: OptimConfig | None = None,
+    objective: str | Callable[..., Any] | None = None,
+    lag: int | None = None,
     tau: float | None = None,
-    epsilon: float = 1e-5,
-    legacy_tv: bool = False,
-    lambda_phot: float | None = None,
-    lambda_z: float | None = None,
-    solver: str = "lbfgs",
-    maxiter: int = 500,
-    rtol: float = 5e-5,
-    atol: float = 5e-5,
-    learning_rate: float = 0.2,
-    precondition: bool = True,
-    sigclip: bool = False,
-    window_days: float = 1.0,
-    sigma_lower: float = 10.0,
-    sigma_upper: float = 3.0,
-    compute_uncertainty: bool = False,
-    jackknife_blocks: int = 4,
-    n_pad: int | None = None,
-    gap_tol: float = 0.25,
+    epsilon: float | None = None,
+    maxiter: int | None = None,
+    rtol: float | None = None,
+    atol: float | None = None,
+    precondition: bool | None = None,
+    sigclip: bool | None = None,
+    window_days: float | None = None,
+    sigma_lower: float | None = None,
+    sigma_upper: float | None = None,
+    compute_uncertainty: bool | None = None,
+    jackknife_blocks: int | None = None,
+    gap_tol: float | None = None,
+    legacy_tv: bool | None = None,
 ) -> HaloFitResult:
-    """Optimize halo aperture weights in locally scoped float64 precision.
+    """Optimize physical simplex halo weights in locally scoped float64 precision.
 
-    Notes
-    -----
-    * When ``pixel_var=None`` and ``legacy_tv=False``, the automatic Poisson
-      shot-noise floor assumes ``pixels`` is in physical ``e-/s`` units. Supply
-      ``pixel_var`` explicitly for exact unit-gain invariance on rescaled fluxes.
-    * When ``sigclip=True``, narrow local spike clipping excludes outlier cadences
-      strictly during weight optimization; ``raw_flux`` and ``norm_flux`` are always
-      evaluated across all finite input cadences at the optimal weights ``w_opt``.
+    Parameters
+    ----------
+    pixels : array-like, shape ``(M, N)``
+        Active halo pixel fluxes over valid cadences.
+    times : array-like, shape ``(N,)``, optional
+        Strictly increasing timestamps in days. Defaults to uniform 30-min cadence.
+    w_init : array-like, shape ``(M,)``, optional
+        Starting physical simplex weights (default uniform ``1 / M``).
+    config : OptimConfig, optional
+        Structured optimization settings; explicit keyword arguments override fields.
+    objective : str or callable, default ``'tv'``
+        Registered objective name in :data:`~halophot.OBJECTIVES` or any custom
+        JAX callable (``def fn(flux): ...``, ``def fn(flux, step_mask): ...``, or
+        keyword-aware ``(flux, *, step_mask, weights, pixels, times, dt_nom, lag)``).
+    sigclip : bool, default False
+        When ``True``, excludes local flux outliers strictly during weight
+        optimization and baseline normalization while evaluating ``raw_flux`` and
+        ``norm_flux`` on all input cadences and recording ``inlier_mask``.
+    legacy_tv : bool, optional
+        Deprecated compatibility no-op (physical simplex weights are always used).
     """
-    if isinstance(maxiter, bool) or int(maxiter) < 1:
-        raise ValueError(f"maxiter must be an integer >= 1, got {maxiter!r}.")
-    maxiter_int = int(maxiter)
-
-    pix_np = np.asarray(pixels, dtype=np.float64)
-    obs = HaloObservation.from_arrays(
-        pix_np,
-        times,
-        pixel_var=pixel_var,
-        lag=lag,
-        objective=objective,
-        tau=tau,
-        legacy_tv=legacy_tv,
-        lambda_phot=lambda_phot,
-        lambda_z=lambda_z,
-        n_pad=n_pad,
-        gap_tol=gap_tol,
-    )
-
-    n_valid = int(obs.n_valid)
-    min_req = 2 * obs.lag + 1 if objective == "tv_o2" else (2 if objective == "owl" else obs.lag + 1)
-    if n_valid < min_req:
-        raise ValueError(
-            f"Objective {objective!r} with lag={obs.lag} requires at least {min_req} cadences, "
-            f"got {n_valid}."
+    if legacy_tv is not None:
+        warnings.warn(
+            "legacy_tv is deprecated and has no effect; halophot now optimizes "
+            "physical simplex weights directly.",
+            DeprecationWarning,
+            stacklevel=3,
         )
 
-    m_pix = pix_np.shape[0]
-    n_valid_diffs = obs.effective_constraint_count(objective=objective, tau=tau)
-    if m_pix > 1 and m_pix >= 0.5 * n_valid_diffs:
+    cfg = config if config is not None else OptimConfig()
+    eff_obj = cfg.objective if objective is None else objective
+    eff_lag = cfg.lag if lag is None else int(lag)
+    eff_tau = cfg.tau if tau is None else tau
+    eff_eps = cfg.epsilon if epsilon is None else float(epsilon)
+    eff_maxiter = cfg.maxiter if maxiter is None else int(maxiter)
+    eff_rtol = cfg.rtol if rtol is None else float(rtol)
+    eff_atol = cfg.atol if atol is None else float(atol)
+    eff_precond = cfg.precondition if precondition is None else bool(precondition)
+    eff_sigclip = cfg.sigclip if sigclip is None else bool(sigclip)
+    eff_win = cfg.window_days if window_days is None else float(window_days)
+    eff_sig_lo = cfg.sigma_lower if sigma_lower is None else float(sigma_lower)
+    eff_sig_hi = cfg.sigma_upper if sigma_upper is None else float(sigma_upper)
+    eff_unc = cfg.compute_uncertainty if compute_uncertainty is None else bool(compute_uncertainty)
+    eff_jk = cfg.jackknife_blocks if jackknife_blocks is None else int(jackknife_blocks)
+    eff_gap = cfg.gap_tol if gap_tol is None else float(gap_tol)
+
+    if isinstance(eff_maxiter, bool) or eff_maxiter < 1:
+        raise ValueError(f"maxiter must be an integer >= 1, got {eff_maxiter!r}.")
+    if eff_eps <= 0.0:
+        raise ValueError(f"epsilon must be > 0, got {eff_eps!r}.")
+
+    obj_name, obj_fn = resolve_objective(eff_obj)
+    pix_np, t_np, dt_nom = _validate_inputs(pixels, times, eff_lag, obj_name)
+    m_pix, n_valid = pix_np.shape
+    min_req = 2 * eff_lag + 1 if obj_name == "tv_o2" else (2 if obj_name == "owl" else eff_lag + 1)
+
+    n_valid_steps = int(np.sum(compute_step_mask(t_np, lag=eff_lag, dt_nom=dt_nom, gap_tol=eff_gap)))
+    if m_pix > 1 and n_valid_steps > 0 and m_pix >= 0.5 * n_valid_steps:
         warnings.warn(
             f"Active halo pixel count M={m_pix} approaches or exceeds valid cadence "
-            f"constraints N_valid={n_valid_diffs} (M >= 0.5 * N_valid); simplex weights "
-            "have elevated degrees of freedom relative to cadence constraints.",
+            f"constraints N_valid={n_valid_steps} (M >= 0.5 * N_valid).",
             UserWarning,
             stacklevel=3,
         )
 
-    if w_init is None:
-        w0 = _default_initial_weights(obs, legacy_tv=legacy_tv)
-    else:
-        w_arr = np.asarray(w_init, dtype=np.float64)
-        if w_arr.shape != (pix_np.shape[0],):
-            raise ValueError(
-                f"w_init shape {w_arr.shape} does not match (M,) = ({pix_np.shape[0]},)."
-            )
-        if not np.all(np.isfinite(w_arr)) or np.any(w_arr < 0.0) or float(np.sum(w_arr)) <= 0.0:
-            raise ValueError("w_init simplex weights must be finite, non-negative, and sum > 0.")
-        w0 = HaloWeights.from_physical_weights(w_arr, obs.mean_pixel_flux, legacy_tv=legacy_tv)
-
-    w_tree, loss0, loss_final, converged, n_steps = _solve_single_pass(
-        w0,
-        obs,
-        objective=objective,
-        epsilon=epsilon,
-        tau=tau,
-        solver=solver,
-        maxiter=maxiter_int,
-        rtol=rtol,
-        atol=atol,
-        learning_rate=learning_rate,
-        precondition=precondition,
+    w_init_np = None if w_init is None else np.asarray(w_init, dtype=np.float64)
+    w_opt, loss0, loss_final, converged, n_steps = _solve_single_pass(
+        pix_np,
+        t_np,
+        dt_nom,
+        w_init=w_init_np,
+        obj_name=obj_name,
+        obj_fn=obj_fn,
+        lag=eff_lag,
+        tau=eff_tau,
+        epsilon=eff_eps,
+        maxiter=eff_maxiter,
+        rtol=eff_rtol,
+        atol=eff_atol,
+        precondition=eff_precond,
+        gap_tol=eff_gap,
     )
 
-    w_phys = np.asarray(w_tree._physical_weights_raw(obs.mean_pixel_flux), dtype=np.float64)
-    raw_lc = w_phys @ pix_np
+    raw_lc = w_opt @ pix_np
     inliers = np.ones(n_valid, dtype=bool)
-    active_obs = obs
+    fit_pix = pix_np
+    fit_times = t_np
 
-    if sigclip:
-        t_valid = np.asarray(obs.times_padded[:n_valid], dtype=np.float64)
+    if eff_sigclip:
         inliers = cadence_scaled_sigclip_mask(
             raw_lc,
-            t_valid,
-            dt_days=float(obs.dt_nom),
-            window_days=window_days,
-            sigma_lower=sigma_lower,
-            sigma_upper=sigma_upper,
+            t_np,
+            dt_days=dt_nom,
+            window_days=eff_win,
+            sigma_lower=eff_sig_lo,
+            sigma_upper=eff_sig_hi,
         )
         if np.any(~inliers) and int(np.sum(inliers)) >= min_req:
-            obs_sub = obs.with_cadence_subset(
-                inliers,
-                legacy_tv=legacy_tv,
-                preserve_regularization=False,
-                objective=objective,
-                tau=tau,
+            fit_pix = pix_np[:, inliers]
+            fit_times = t_np[inliers]
+            w_opt, loss0, loss_final, converged, n_steps = _solve_single_pass(
+                fit_pix,
+                fit_times,
+                dt_nom,
+                w_init=w_opt,
+                obj_name=obj_name,
+                obj_fn=obj_fn,
+                lag=eff_lag,
+                tau=eff_tau,
+                epsilon=eff_eps,
+                maxiter=eff_maxiter,
+                rtol=eff_rtol,
+                atol=eff_atol,
+                precondition=eff_precond,
+                gap_tol=eff_gap,
             )
-            w0_init_sub = (
-                _default_initial_weights(obs_sub, legacy_tv=legacy_tv)
-                if w_init is None
-                else HaloWeights.from_physical_weights(
-                    np.asarray(w_init, dtype=np.float64),
-                    obs_sub.mean_pixel_flux,
-                    legacy_tv=legacy_tv,
-                )
-            )
-            loss0_sub = float(
-                _halo_objective(
-                    w0_init_sub,
-                    obs_sub,
-                    objective=objective,
-                    epsilon=epsilon,
-                    tau=tau,
-                )
-            )
-            w0_refit = HaloWeights.from_physical_weights(
-                w_phys,
-                obs_sub.mean_pixel_flux,
-                legacy_tv=legacy_tv,
-            )
-            w_tree, _, loss_final, converged, n_steps = _solve_single_pass(
-                w0_refit,
-                obs_sub,
-                objective=objective,
-                epsilon=epsilon,
-                tau=tau,
-                solver=solver,
-                maxiter=maxiter_int,
-                rtol=rtol,
-                atol=atol,
-                learning_rate=learning_rate,
-                precondition=precondition,
-            )
-            if not np.isfinite(loss_final) or loss_final > loss0_sub:
-                w_tree, _, loss_final, converged, n_steps = _solve_single_pass(
-                    w0_init_sub,
-                    obs_sub,
-                    objective=objective,
-                    epsilon=epsilon,
-                    tau=tau,
-                    solver=solver,
-                    maxiter=maxiter_int,
-                    rtol=rtol,
-                    atol=atol,
-                    learning_rate=learning_rate,
-                    precondition=precondition,
-                )
-            loss0 = loss0_sub
-            w_phys = np.asarray(
-                w_tree._physical_weights_raw(obs_sub.mean_pixel_flux),
-                dtype=np.float64,
-            )
-            raw_lc = w_phys @ pix_np
-            active_obs = obs_sub
+            raw_lc = w_opt @ pix_np
         elif np.any(~inliers):
             inliers = np.ones(n_valid, dtype=bool)
 
-    if solver == "lbfgs" and m_pix > 1 and not converged:
+    if m_pix > 1 and not converged:
         warnings.warn(
-            f"L-BFGS solver did not converge within maxiter={maxiter_int} steps "
+            f"L-BFGS solver did not converge within maxiter={eff_maxiter} steps "
             f"(completed {n_steps} steps); consider increasing maxiter.",
             RuntimeWarning,
             stacklevel=3,
         )
 
-    flux_shares = np.asarray(w_tree._flux_shares_raw(), dtype=np.float64)
-    denom = float(np.dot(w_phys, np.mean(pix_np[:, inliers], axis=1)))
+    denom = float(np.mean(raw_lc[inliers]))
     safe_denom = denom if abs(denom) > 1e-30 else 1.0
     norm_lc = raw_lc / safe_denom
 
     weight_std: np.ndarray | None = None
     jk_weights: np.ndarray | None = None
-    if compute_uncertainty:
-        jk_rtol = min(float(rtol), 1e-7)
-        jk_atol = min(float(atol), 1e-7)
+    if eff_unc:
         weight_std, jk_weights = orbit_block_jackknife(
-            active_obs,
-            w_phys,
-            n_blocks=jackknife_blocks,
-            legacy_tv=legacy_tv,
-            objective=objective,
-            epsilon=epsilon,
-            tau=tau,
-            solver=solver,
-            maxiter=maxiter_int,
-            rtol=jk_rtol,
-            atol=jk_atol,
-            learning_rate=learning_rate,
-            precondition=precondition,
+            fit_pix,
+            fit_times,
+            w_opt,
+            n_blocks=eff_jk,
+            objective=eff_obj,
+            lag=eff_lag,
+            tau=eff_tau,
+            epsilon=eff_eps,
+            maxiter=eff_maxiter,
+            rtol=eff_rtol,
+            atol=eff_atol,
+            precondition=eff_precond,
+            gap_tol=eff_gap,
         )
 
     return HaloFitResult(
-        weights_tree=w_tree,
-        physical_weights=w_phys,
-        flux_shares=flux_shares,
+        weights=w_opt,
         norm_flux=norm_lc,
         raw_flux=raw_lc,
         inlier_mask=inliers,

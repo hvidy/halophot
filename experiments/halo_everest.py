@@ -31,7 +31,7 @@ mpl.rcParams['ytick.labelsize'] = 12
 
 fname = '../data/ktwo211309989-c05_lpd-targ.fits.gz' # point this path to your favourite K2SC light curve
 
-print 'Running everest'
+print('Running everest')
 # try:
 # 	pass
 # except:
@@ -41,7 +41,7 @@ star = everest.Everest(211309989, clobber=True, mission='k2',
                     pld_order=2, get_hires=False, get_nearby=False)
 	# star.publish()
 
-print 'Running halophot'
+print('Running halophot')
 
 tpf, ts = read_tpf(fname)
 

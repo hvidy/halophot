@@ -1,148 +1,102 @@
-"""halophot: Kepler/K2 and TESS halo photometry in JAX and Zodiax."""
+"""halophot: Kepler/K2 and TESS halo photometry in JAX."""
 
-from . import (
-    halo_objectives,
-    halo_tools,
-    lightcurve,
-    masking,
-    models,
-    objectives,
-    optimise,
-    simplex,
-)
-from ._contract import (
-    HALOCVER,
-    BkgCovariance,
-    PixelQuality,
-    infer_bkg_poly_order,
-    pack_bkg_chol,
-    read_bkg_covariance,
-    read_bkgsub_state,
-    read_pixel_quality,
-    read_smear_err,
-    read_split_times,
-    read_weightmap,
-    read_weightmap_err,
-    resolve_cache_dir,
-    write_lightcurve_fits,
-)
-from ._precision import cast_tree, in_float64, run_in
-from .halo_tools import halo_tpf, halo_tpf_tess
-from .lightcurve import (
-    column_orthogonal_smear_weights,
-    compute_coherent_flux_err,
-    extract_halo_lightcurve,
-)
-from .masking import (
-    DEFAULT_EXCLUDE_QUALITY,
-    KEPLER_SAT_RATE_E_PER_S,
-    TESS_SAT_RATE_E_PER_S,
-    HaloMaskResult,
-    build_halo_masks,
-    mask_background_stars,
-    remove_stars,
-)
-from .models import (
-    HaloObservation,
-    HaloWeights,
-    bucket_pad_length,
-    compute_effective_constraints,
-    compute_gap_diff_mask,
-)
-from .objectives import (
-    AVAILABLE_OBJECTIVES,
-    charbonnier_penalty,
-    halo_objective,
-    tv_charbonnier_o1,
-    tv_charbonnier_o2,
-    tv_exp_scan,
-)
-from .optimise import (
-    HaloFitResult,
-    build_value_and_grad,
-    cadence_scaled_savgol_window,
-    cadence_scaled_sigclip_mask,
-    optimise_halo,
-    orbit_block_jackknife,
-    safe_eigen_projection,
-)
-from .simplex import (
-    flux_share_to_weights,
-    ilr_to_simplex,
-    simplex_to_ilr,
-    uniform_weights_ilr,
-    weights_to_flux_share,
-    weights_to_ilr,
-)
+from __future__ import annotations
+
+import importlib
+from typing import Any
 
 name = "halophot"
 __version__ = "2.0.1"
 
-write_fits = write_lightcurve_fits
-
 __all__ = [
-    "AVAILABLE_OBJECTIVES",
-    "BkgCovariance",
-    "DEFAULT_EXCLUDE_QUALITY",
-    "HALOCVER",
     "HaloFitResult",
-    "HaloMaskResult",
-    "HaloObservation",
-    "HaloWeights",
-    "KEPLER_SAT_RATE_E_PER_S",
+    "HaloLightCurve",
+    "MaskConfig",
+    "OBJECTIVES",
+    "OptimConfig",
     "PixelQuality",
-    "TESS_SAT_RATE_E_PER_S",
     "__version__",
-    "bucket_pad_length",
-    "build_halo_masks",
-    "build_value_and_grad",
-    "cadence_scaled_savgol_window",
-    "cadence_scaled_sigclip_mask",
-    "cast_tree",
-    "charbonnier_penalty",
-    "column_orthogonal_smear_weights",
-    "compute_coherent_flux_err",
-    "compute_effective_constraints",
-    "compute_gap_diff_mask",
     "extract_halo_lightcurve",
-    "flux_share_to_weights",
-    "halo_objective",
-    "halo_objectives",
-    "halo_tools",
     "halo_tpf",
     "halo_tpf_tess",
-    "ilr_to_simplex",
-    "in_float64",
-    "infer_bkg_poly_order",
-    "lightcurve",
-    "mask_background_stars",
-    "masking",
-    "models",
-    "name",
-    "objectives",
-    "optimise",
     "optimise_halo",
-    "orbit_block_jackknife",
-    "pack_bkg_chol",
-    "read_bkg_covariance",
-    "read_bkgsub_state",
-    "read_pixel_quality",
-    "read_smear_err",
-    "read_split_times",
+    "plot_diagnostics",
     "read_weightmap",
     "read_weightmap_err",
-    "remove_stars",
-    "resolve_cache_dir",
-    "run_in",
-    "safe_eigen_projection",
-    "simplex",
-    "simplex_to_ilr",
-    "tv_charbonnier_o1",
-    "tv_charbonnier_o2",
-    "tv_exp_scan",
-    "uniform_weights_ilr",
-    "weights_to_flux_share",
-    "weights_to_ilr",
+    "register_objective",
     "write_fits",
-    "write_lightcurve_fits",
 ]
+
+_LAZY_SUBMODULES: frozenset[str] = frozenset(
+    {
+        "_contract",
+        "_precision",
+        "cli",
+        "halo_objectives",
+        "halo_tools",
+        "lightcurve",
+        "masking",
+        "objectives",
+        "optimise",
+        "simplex",
+    }
+)
+
+_LAZY_ATTRS: dict[str, tuple[str, str]] = {
+    # Public __all__ symbols
+    "HaloFitResult": (".optimise", "HaloFitResult"),
+    "HaloLightCurve": (".lightcurve", "HaloLightCurve"),
+    "MaskConfig": (".masking", "MaskConfig"),
+    "OBJECTIVES": (".objectives", "OBJECTIVES"),
+    "OptimConfig": (".optimise", "OptimConfig"),
+    "PixelQuality": ("._contract", "PixelQuality"),
+    "extract_halo_lightcurve": (".lightcurve", "extract_halo_lightcurve"),
+    "halo_tpf": (".halo_tools", "halo_tpf"),
+    "halo_tpf_tess": (".halo_tools", "halo_tpf_tess"),
+    "optimise_halo": (".optimise", "optimise_halo"),
+    "plot_diagnostics": (".lightcurve", "plot_diagnostics"),
+    "read_weightmap": ("._contract", "read_weightmap"),
+    "read_weightmap_err": ("._contract", "read_weightmap_err"),
+    "register_objective": (".objectives", "register_objective"),
+    "write_fits": ("._contract", "write_lightcurve_fits"),
+    # Backwards-compatible contract / precision / helper attributes (not in __all__)
+    "BkgCovariance": ("._contract", "BkgCovariance"),
+    "HALOCVER": ("._contract", "HALOCVER"),
+    "HaloMaskResult": (".masking", "HaloMaskResult"),
+    "build_halo_masks": (".masking", "build_halo_masks"),
+    "cadence_scaled_savgol_window": (".optimise", "cadence_scaled_savgol_window"),
+    "cadence_scaled_sigclip_mask": (".optimise", "cadence_scaled_sigclip_mask"),
+    "cast_tree": ("._precision", "cast_tree"),
+    "charbonnier_abs": (".objectives", "charbonnier_abs"),
+    "column_orthogonal_smear_weights": (".lightcurve", "column_orthogonal_smear_weights"),
+    "compute_coherent_flux_err": (".lightcurve", "compute_coherent_flux_err"),
+    "in_float64": ("._precision", "in_float64"),
+    "infer_bkg_poly_order": ("._contract", "infer_bkg_poly_order"),
+    "mask_background_stars": (".masking", "mask_background_stars"),
+    "orbit_block_jackknife": (".optimise", "orbit_block_jackknife"),
+    "pack_bkg_chol": ("._contract", "pack_bkg_chol"),
+    "read_bkg_covariance": ("._contract", "read_bkg_covariance"),
+    "read_bkgsub_state": ("._contract", "read_bkgsub_state"),
+    "read_pixel_quality": ("._contract", "read_pixel_quality"),
+    "read_segment_scales": ("._contract", "read_segment_scales"),
+    "read_smear_err": ("._contract", "read_smear_err"),
+    "read_split_times": ("._contract", "read_split_times"),
+    "remove_stars": (".masking", "remove_stars"),
+    "resolve_cache_dir": ("._contract", "resolve_cache_dir"),
+    "run_in": ("._precision", "run_in"),
+    "write_lightcurve_fits": ("._contract", "write_lightcurve_fits"),
+}
+
+
+def __getattr__(attr: str) -> Any:
+    if attr in _LAZY_ATTRS:
+        mod_name, obj_name = _LAZY_ATTRS[attr]
+        mod = importlib.import_module(mod_name, __name__)
+        return getattr(mod, obj_name)
+    if attr in _LAZY_SUBMODULES:
+        return importlib.import_module(f".{attr}", __name__)
+    raise AttributeError(f"module {__name__!r} has no attribute {attr!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(__all__)

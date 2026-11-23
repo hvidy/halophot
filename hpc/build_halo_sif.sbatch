@@ -88,7 +88,7 @@ for cuda_pkg in ("jaxlib", "jax-cuda12-plugin", "jax-cuda12-pjrt"):
             f"JAX/CUDA ABI version mismatch: jax={md.version('jax')} vs {cuda_pkg}={pkg_ver}"
         )
 
-for pkg in ("equinox", "optimistix", "optax", "zodiax", "lightkurve", "mundey", "tessbkgd", "halophot"):
+for pkg in ("optax", "lightkurve", "mundey", "tessbkgd", "halophot"):
     print(pkg, md.version(pkg))
 PY
 JAX_PLATFORMS=cpu apptainer exec "$PART" halo --help >/dev/null

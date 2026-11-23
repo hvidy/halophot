@@ -88,8 +88,8 @@ for jj, snr in enumerate(log_snrs):
 
 
 finish = clock()
-print 'Done'
-print 'Time elapsed:',finish-start
+print('Done')
+print('Time elapsed:', finish - start)
 
 plt.figure(0)
 plt.clf()
